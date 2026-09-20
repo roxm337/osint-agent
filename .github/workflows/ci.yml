@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        # Lean test deps. GUI tests (PySide6) are excluded below as they need a display.
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml aiohttp beautifulsoup4 dnspython lxml python-dotenv litellm
+          pip install pytest pytest-asyncio
+
+      - name: Run test suite (non-GUI)
+        run: |
+          python -m pytest -q \
+            --ignore=tests/test_gui_app.py \
+            --ignore=tests/test_gui_graph.py

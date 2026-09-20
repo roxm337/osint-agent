@@ -1,0 +1,816 @@
+# OSINT Agent Configuration
+
+target:
+  domain: ""  # Set via CLI or prompt
+  scope:
+    - ""  # allowed domains/patterns
+  authorization: "confirmed"  # pending | confirmed | denied
+  mode: "deep"  # passive | active | deep
+
+paths:
+  output_dir: "reports"
+  wordlists: "wordlists"
+  state_dir: "reports/{target}/state"
+
+hibp_api_key: ""  # Set via env HIBP_API_KEY or here
+shodan_api_key: ""  # Set via env SHODAN_API_KEY
+urlscan_api_key: ""  # Set via env URLSCAN_API_KEY
+
+api_keys:
+  virustotal: ""       # VIRUSTOTAL_API_KEY or VT_API_KEY
+  greynoise: ""        # GREYNOISE_API_KEY
+  abuseipdb: ""        # ABUSEIPDB_API_KEY
+  chaos: ""            # CHAOS_API_KEY or PDCP_API_KEY
+  hunter_io: ""        # HUNTER_API_KEY or HUNTER_IO_API_KEY
+  securitytrails: ""   # SECURITYTRAILS_API_KEY
+  vulners: ""          # VULNERS_API_KEY
+  urlscan: ""          # URLSCAN_API_KEY
+  hibp: ""             # HIBP_API_KEY
+  shodan: ""           # SHODAN_API_KEY
+
+auth:
+  # Optional authenticated testing context. These values are applied to HTTP
+  # wrapper requests and browser-rendered crawl pages.
+  headers: ""
+  cookies: ""
+  cookie: ""
+  bearer_token: ""
+  probe_backoff_seconds: 10
+
+llm:
+  model: ""
+  api_key: ""
+  temperature: 0.1
+  max_tokens: 2000
+
+rate_limits:
+  default:
+    concurrent: 5
+    per_minute: 60
+  dns:
+    concurrent: 10
+    per_minute: 120
+  http:
+    concurrent: 5
+    per_minute: 60
+  scan:
+    concurrent: 1
+    per_minute: 10
+
+detectability:
+  default: "high"  # low | medium | high
+  allow_high: true  # requires explicit auth
+
+waf:
+  max_bypass_attempts: 10
+  backoff_seconds: 60
+  block_codes: [503, 429]
+  honeypot_codes: [500]
+
+modules:
+  auto_run: true
+  skip_on_waf: true
+  max_consecutive_empty: 5  # stop module after N empty probes
+  record_http_evidence: true
+
+misconfig:
+  concurrency: 12
+  timeout: 5
+  max_paths: 160
+  max_consecutive_empty: 60
+  progress_every: 25
+
+fast_scan:
+  # Lightweight replacement for heavyweight consolidated scanners.
+  # Focuses on high-signal headers, CORS, and sensitive path exposure.
+  timeout: 4
+  concurrency: 8
+  max_paths: 20
+  paths:
+    - "/.env"
+    - "/.git/config"
+    - "/.git/HEAD"
+    - "/wp-config.php"
+    - "/wp-content/debug.log"
+    - "/phpinfo.php"
+    - "/info.php"
+    - "/server-status"
+    - "/actuator/env"
+    - "/actuator/heapdump"
+    - "/swagger.json"
+    - "/swagger/v1/swagger.json"
+    - "/v2/api-docs"
+    - "/v3/api-docs"
+    - "/graphql"
+    - "/graphiql"
+    - "/api/graphql"
+    - "/phpmyadmin/"
+    - "/adminer.php"
+    - "/backup.sql"
+
+nuclei:
+  full_cve_on_confirmed_apex: true
+
+oob:
+  # Configure real callback infrastructure for blind SSRF/XXE/SQLi/RCE checks.
+  # callback_domain example: "oob.your-bounty-box.example"
+  # server_url/poll_url can point at an interactsh-compatible HTTP wrapper.
+  callback_domain: ""
+  server_url: ""
+  poll_url: ""
+  token: ""
+  poll_interval: 2
+  poll_timeout: 30
+
+xss:
+  max_points: 80
+  browser_confirm: true
+  dalfox_timeout: 600
+
+scoring:
+  weights:
+    cvss: 0.4
+    epss: 0.3
+    kev: 0.2
+    exposure: 0.1
+
+wordlists:
+  subdomains:
+    # Core infrastructure
+    - "www"
+    - "www2"
+    - "www3"
+    - "mail"
+    - "webmail"
+    - "smtp"
+    - "imap"
+    - "pop"
+    - "mx"
+    - "mx1"
+    - "mx2"
+    - "ns"
+    - "ns1"
+    - "ns2"
+    - "ns3"
+    - "dns"
+    - "dns1"
+    - "dns2"
+    - "ftp"
+    - "sftp"
+    - "vpn"
+    - "remote"
+    - "citrix"
+    - "sso"
+    - "auth"
+    - "login"
+    - "portal"
+    - "intranet"
+    - "extranet"
+    - "autodiscover"
+    - "lyncdiscover"
+    # Developer/DevOps
+    - "dev"
+    - "dev2"
+    - "development"
+    - "test"
+    - "testing"
+    - "qa"
+    - "staging"
+    - "stage"
+    - "uat"
+    - "preprod"
+    - "sandbox"
+    - "demo"
+    - "beta"
+    - "alpha"
+    - "preview"
+    - "git"
+    - "gitlab"
+    - "github"
+    - "bitbucket"
+    - "jenkins"
+    - "ci"
+    - "cd"
+    - "build"
+    - "deploy"
+    - "k8s"
+    - "kubernetes"
+    - "docker"
+    - "registry"
+    - "nexus"
+    - "artifactory"
+    - "sonar"
+    - "jira"
+    - "confluence"
+    - "wiki"
+    - "ticket"
+    - "bugtracker"
+    # Applications
+    - "admin"
+    - "backend"
+    - "dashboard"
+    - "panel"
+    - "manage"
+    - "management"
+    - "cpanel"
+    - "whm"
+    - "plesk"
+    - "webadmin"
+    - "api"
+    - "api2"
+    - "apis"
+    - "gateway"
+    - "microservice"
+    - "services"
+    - "graphql"
+    - "grpc"
+    - "ws"
+    - "websocket"
+    - "wss"
+    # Content
+    - "blog"
+    - "shop"
+    - "store"
+    - "ecommerce"
+    - "app"
+    - "mobile"
+    - "m"
+    - "help"
+    - "support"
+    - "docs"
+    - "documentation"
+    - "kb"
+    - "community"
+    - "forum"
+    - "live"
+    # Infrastructure
+    - "monitor"
+    - "monitoring"
+    - "grafana"
+    - "prometheus"
+    - "kibana"
+    - "elastic"
+    - "elasticsearch"
+    - "logstash"
+    - "influx"
+    - "status"
+    - "health"
+    - "cdn"
+    - "static"
+    - "assets"
+    - "img"
+    - "images"
+    - "media"
+    - "files"
+    - "upload"
+    - "uploads"
+    - "backup"
+    - "backups"
+    - "db"
+    - "database"
+    - "mysql"
+    - "postgres"
+    - "redis"
+    - "mongo"
+    - "cloud"
+    - "internal"
+    - "private"
+    - "old"
+    - "new"
+    - "legacy"
+    - "v2"
+    - "v3"
+    - "uat"
+
+  misconfig_paths:
+    # Core secrets
+    - "/.git/config"
+    - "/.git/HEAD"
+    - "/.git/COMMIT_EDITMSG"
+    - "/.git/index"
+    - "/.git/logs/HEAD"
+    - "/.gitignore"
+    - "/.env"
+    - "/.env.local"
+    - "/.env.production"
+    - "/.env.staging"
+    - "/.env.backup"
+    - "/.env.old"
+    - "/.env.example"
+    - "/.env.bak"
+    - "/.htpasswd"
+    - "/.htaccess"
+    - "/.ssh/id_rsa"
+    - "/.ssh/known_hosts"
+    - "/id_rsa"
+    - "/id_rsa.pub"
+    - "/server.key"
+    - "/private.key"
+    - "/private.pem"
+    - "/cert.pem"
+    # WordPress
+    - "/wp-config.php"
+    - "/wp-config.bak"
+    - "/wp-config.txt"
+    - "/wp-config.php.bak"
+    - "/wp-config.php~"
+    - "/wp-content/debug.log"
+    - "/wp-content/error_log"
+    # PHP info
+    - "/phpinfo.php"
+    - "/info.php"
+    - "/test.php"
+    - "/php.php"
+    - "/i.php"
+    - "/0.php"
+    # Debug/logs
+    - "/debug.log"
+    - "/error.log"
+    - "/error_log"
+    - "/access.log"
+    - "/app.log"
+    - "/application.log"
+    - "/server.log"
+    - "/laravel.log"
+    - "/storage/logs/laravel.log"
+    # Backup files
+    - "/backup.sql"
+    - "/backup.zip"
+    - "/backup.tar.gz"
+    - "/db_backup.sql"
+    - "/database.sql"
+    - "/dump.sql"
+    - "/old.zip"
+    - "/site.zip"
+    - "/www.zip"
+    - "/admin.zip"
+    # XML/Policy
+    - "/crossdomain.xml"
+    - "/clientaccesspolicy.xml"
+    - "/sitemap.xml"
+    - "/robots.txt"
+    - "/.well-known/security.txt"
+    - "/.well-known/openid-configuration"
+    - "/.well-known/oauth-authorization-server"
+    - "/.well-known/acme-challenge/"
+    # Admin panels
+    - "/phpmyadmin/"
+    - "/phpmyadmin/index.php"
+    - "/pma/"
+    - "/pma/index.php"
+    - "/admin/"
+    - "/admin/login"
+    - "/administrator/"
+    - "/wp-admin/"
+    - "/manager/html"
+    - "/manager/"
+    - "/jmx-console/"
+    - "/web-console/"
+    - "/console/"
+    - "/rails/info/properties"
+    - "/adminer.php"
+    - "/dbadmin/"
+    # Config files
+    - "/config.php"
+    - "/config.json"
+    - "/config.yml"
+    - "/config.yaml"
+    - "/config.xml"
+    - "/configuration.php"
+    - "/settings.php"
+    - "/settings.py"
+    - "/app/config/parameters.yml"
+    - "/app/config/database.yml"
+    - "/config/database.yml"
+    - "/config/secrets.yml"
+    - "/application.properties"
+    - "/application.yml"
+    - "/web.config"
+    # Source/Dev artifacts
+    - "/Makefile"
+    - "/Dockerfile"
+    - "/docker-compose.yml"
+    - "/docker-compose.yaml"
+    - "/.dockerignore"
+    - "/package.json"
+    - "/yarn.lock"
+    - "/package-lock.json"
+    - "/composer.json"
+    - "/composer.lock"
+    - "/Gemfile"
+    - "/Gemfile.lock"
+    - "/requirements.txt"
+    - "/Pipfile"
+    - "/Pipfile.lock"
+    - "/go.mod"
+    - "/.DS_Store"
+    - "/thumbs.db"
+    # CI/CD
+    - "/.gitlab-ci.yml"
+    - "/.travis.yml"
+    - "/.circleci/config.yml"
+    - "/Jenkinsfile"
+    - "/azure-pipelines.yml"
+    - "/bitbucket-pipelines.yml"
+    - "/.github/workflows/ci.yml"
+    - "/.github/workflows/deploy.yml"
+
+  wp_paths:
+    - "/readme.html"
+    - "/license.txt"
+    - "/wp-cron.php"
+    - "/wp-admin/install.php"
+    - "/wp-admin/upgrade.php"
+    - "/xmlrpc.php"
+    - "/wp-json/"
+    - "/wp-login.php"
+    - "/wp-admin/"
+    - "/sitemap_index.xml"
+    - "/wp-sitemap.xml"
+    - "/wp-content/plugins/"
+    - "/wp-content/themes/"
+    - "/wp-content/uploads/"
+    - "/wp-includes/version.php"
+
+  wp_plugins:
+    - "wordpress-seo"
+    - "contact-form-7"
+    - "elementor"
+    - "js_composer"
+    - "revslider"
+    - "LayerSlider"
+    - "woocommerce"
+    - "wp-super-cache"
+    - "akismet"
+    - "wordfence"
+    - "wp-statistics"
+    - "all-in-one-wp-migration"
+    - "duplicator"
+    - "updraftplus"
+    - "wp-file-manager"
+    - "wp-fastest-cache"
+    - "wpforms-lite"
+    - "advanced-custom-fields"
+    - "tablepress"
+    - "gravityforms"
+    - "wpdatatables"
+    - "ninja-forms"
+    - "mailchimp-for-wp"
+    - "wp-migrate-db"
+
+  content_discovery:
+    # Auth/Admin
+    - "admin"
+    - "administrator"
+    - "login"
+    - "signin"
+    - "dashboard"
+    - "panel"
+    - "backend"
+    - "console"
+    - "manage"
+    - "management"
+    - "cp"
+    - "cpanel"
+    # API
+    - "api"
+    - "api/v1"
+    - "api/v2"
+    - "api/v3"
+    - "rest"
+    - "graphql"
+    - "graphiql"
+    - "swagger"
+    - "swagger-ui.html"
+    - "swagger.json"
+    - "openapi.json"
+    - "openapi.yaml"
+    - "api-docs"
+    - "redoc"
+    - "docs"
+    - "spec"
+    # Dev/Debug
+    - "debug"
+    - "test"
+    - "dev"
+    - "staging"
+    - "status"
+    - "health"
+    - "healthz"
+    - "metrics"
+    - "info"
+    - "version"
+    # Config/Secrets
+    - "config"
+    - "configuration"
+    - "setup"
+    - "install"
+    - "backup"
+    - "backups"
+    - ".env"
+    - ".git/config"
+    - "phpinfo.php"
+    - "server-status"
+    - "server-info"
+    # Files
+    - "uploads"
+    - "files"
+    - "media"
+    - "assets"
+    - "static"
+    - "download"
+    - "downloads"
+    - "archive"
+    - "old"
+    # Other common
+    - "robots.txt"
+    - "sitemap.xml"
+    - "crossdomain.xml"
+    - ".htaccess"
+    - "web.config"
+
+  swagger_paths:
+    - "/swagger.json"
+    - "/swagger.yaml"
+    - "/swagger.yml"
+    - "/swagger/v1/swagger.json"
+    - "/swagger/v2/swagger.json"
+    - "/swagger/v3/swagger.json"
+    - "/api-docs"
+    - "/api-docs.json"
+    - "/api/swagger.json"
+    - "/api/swagger.yaml"
+    - "/openapi.json"
+    - "/openapi.yaml"
+    - "/openapi.yml"
+    - "/api/openapi.json"
+    - "/api/openapi.yaml"
+    - "/v1/swagger.json"
+    - "/v2/swagger.json"
+    - "/v3/swagger.json"
+    - "/swagger-ui.html"
+    - "/swagger-ui/"
+    - "/swagger-ui/index.html"
+    - "/redoc"
+    - "/redoc/"
+    - "/docs"
+    - "/api/docs"
+    - "/api/schema"
+    - "/api/schema.json"
+    - "/spec"
+    - "/api/spec"
+    - "/.well-known/openapi"
+    - "/api/api-docs"
+    - "/api/v1/api-docs"
+    - "/api/v2/api-docs"
+    - "/v1/api-docs"
+    - "/v2/api-docs"
+    - "/api/swagger-ui.html"
+    - "/internal/swagger.json"
+    - "/rest/swagger.json"
+    - "/apidocs"
+    - "/apidocs.json"
+
+  graphql_paths:
+    - "/graphql"
+    - "/graphiql"
+    - "/api/graphql"
+    - "/graphql/console"
+    - "/graphql/v1"
+    - "/graphql/v2"
+    - "/gql"
+    - "/query"
+    - "/playground"
+    - "/api/query"
+    - "/graphql/playground"
+    - "/__graphql"
+    - "/v1/graphql"
+    - "/graph"
+    - "/graph/v1"
+
+  spring_actuator_paths:
+    - "/actuator"
+    - "/actuator/health"
+    - "/actuator/info"
+    - "/actuator/env"
+    - "/actuator/beans"
+    - "/actuator/conditions"
+    - "/actuator/configprops"
+    - "/actuator/heapdump"
+    - "/actuator/httptrace"
+    - "/actuator/jolokia"
+    - "/actuator/logfile"
+    - "/actuator/loggers"
+    - "/actuator/mappings"
+    - "/actuator/metrics"
+    - "/actuator/prometheus"
+    - "/actuator/scheduledtasks"
+    - "/actuator/shutdown"
+    - "/actuator/threaddump"
+    - "/actuator/trace"
+    - "/manage/health"
+    - "/manage/info"
+    - "/manage/metrics"
+    - "/health"
+    - "/info"
+    - "/debug/vars"
+    - "/debug/pprof/"
+
+  vendor_paths:
+    # Citrix/NetScaler
+    - "/vpn/index.html"
+    - "/logon/LogonPoint/index.html"
+    # F5 BIG-IP
+    - "/my.policy"
+    - "/tmui/login.jsp"
+    - "/tmui/tmui/login/welcome.jsp"
+    # Fortinet/FortiGate
+    - "/remote/login"
+    - "/remote/fgt_lang?lang=en"
+    # VMware Horizon/vSphere
+    - "/ui/#/login"
+    - "/vsphere-client/"
+    - "/portal/"
+    # Microsoft Exchange/OWA
+    - "/owa/"
+    - "/owa/auth/logon.aspx"
+    - "/ews/Exchange.asmx"
+    - "/autodiscover/autodiscover.xml"
+    - "/ecp/"
+    - "/ecp/default.aspx"
+    # Jenkins
+    - "/jenkins"
+    - "/jenkins/login"
+    - "/j_spring_security_check"
+    - "/jenkins/script"
+    # GitLab
+    - "/users/sign_in"
+    - "/explore"
+    - "/gitlab/users/sign_in"
+    # Kibana
+    - "/app/kibana"
+    - "/app/dashboards"
+    - "/app/home"
+    # Grafana
+    - "/grafana"
+    - "/grafana/login"
+    # Prometheus
+    - "/prometheus"
+    - "/prometheus/graph"
+    # Kubernetes API
+    - "/api/v1/namespaces"
+    - "/api/v1/pods"
+    - "/api/v1/services"
+    # Docker API
+    - "/v1.24/info"
+    - "/v1.24/containers/json"
+    # Jupyter
+    - "/tree"
+    - "/api/kernels"
+    # PAN-OS (Palo Alto)
+    - "/php/login.php"
+    - "/global-protect/login.esp"
+    # Pulse Secure
+    - "/dana-na/auth/url_default/welcome.cgi"
+    # SolarWinds
+    - "/Orion/Login.aspx"
+    # Confluence
+    - "/confluence"
+    - "/confluence/login.action"
+
+  high_risk_ports:
+    - 21     # FTP
+    - 22     # SSH
+    - 23     # Telnet
+    - 25     # SMTP
+    - 53     # DNS
+    - 80     # HTTP
+    - 443    # HTTPS
+    - 445    # SMB
+    - 1433   # MSSQL
+    - 1521   # Oracle DB
+    - 2049   # NFS
+    - 2375   # Docker API (unauth)
+    - 2376   # Docker TLS
+    - 2379   # etcd
+    - 3000   # Grafana/Node dev
+    - 3306   # MySQL
+    - 3389   # RDP
+    - 4848   # GlassFish
+    - 5432   # PostgreSQL
+    - 5601   # Kibana
+    - 5900   # VNC
+    - 5984   # CouchDB
+    - 6379   # Redis
+    - 6443   # K8s API
+    - 7001   # WebLogic
+    - 7002   # WebLogic TLS
+    - 8009   # AJP (CVE-2020-1938 Ghostcat)
+    - 8080   # HTTP Alt / Jenkins
+    - 8443   # HTTPS Alt
+    - 8888   # Jupyter Notebook
+    - 9000   # PHP-FPM / MinIO
+    - 9090   # Prometheus / Cockpit
+    - 9200   # Elasticsearch
+    - 9300   # Elasticsearch Transport
+    - 10250  # Kubelet API
+    - 11211  # Memcached
+    - 15672  # RabbitMQ Management
+    - 27017  # MongoDB
+    - 27018  # MongoDB
+    - 50000  # Jenkins Agent
+    - 50070  # Hadoop NameNode
+
+  bucket_prefixes:
+    - ""
+    - "www"
+    - "dev"
+    - "test"
+    - "prod"
+    - "staging"
+    - "uat"
+    - "media"
+    - "static"
+    - "assets"
+    - "uploads"
+    - "files"
+    - "data"
+    - "backup"
+    - "backups"
+    - "public"
+    - "private"
+    - "internal"
+    - "api"
+    - "app"
+    - "archive"
+    - "logs"
+    - "reports"
+
+  bucket_suffixes:
+    - ""
+    - "-assets"
+    - "-media"
+    - "-static"
+    - "-uploads"
+    - "-files"
+    - "-data"
+    - "-backup"
+    - "-backups"
+    - "-public"
+    - "-private"
+    - "-storage"
+    - "-bucket"
+    - "-prod"
+    - "-dev"
+    - "-test"
+    - "-staging"
+    - "-cdn"
+    - "-images"
+    - "-img"
+    - ".cdn"
+
+  cloud_providers:
+    s3: "https://{name}.s3.amazonaws.com"
+    gcs: "https://storage.googleapis.com/{name}"
+    azure: "https://{name}.blob.core.windows.net"
+    do_spaces: "https://{name}.nyc3.digitaloceanspaces.com"
+    do_spaces_ams3: "https://{name}.ams3.digitaloceanspaces.com"
+    do_spaces_sgp1: "https://{name}.sgp1.digitaloceanspaces.com"
+
+  js_secret_patterns:
+    # API Keys
+    - "api[_-]?key[\\s\"'`]?[:=][\\s\"'`]?[\\w-]{16,64}"
+    - "apikey[\\s\"'`]?[:=][\\s\"'`]?[\\w-]{16,64}"
+    - "access[_-]?token[\\s\"'`]?[:=][\\s\"'`]?[\\w-]{16,64}"
+    - "secret[_-]?key[\\s\"'`]?[:=][\\s\"'`]?[\\w-]{16,64}"
+    - "auth[_-]?token[\\s\"'`]?[:=][\\s\"'`]?[\\w-]{16,64}"
+    # AWS
+    - "AKIA[0-9A-Z]{16}"
+    - "aws[_-]?secret[_-]?access[_-]?key[\\s\"'`]?[:=][\\s\"'`]?[\\w/+]{40}"
+    # GitHub
+    - "ghp_[a-zA-Z0-9]{36}"
+    - "ghs_[a-zA-Z0-9]{36}"
+    - "github[_-]?token[\\s\"'`]?[:=][\\s\"'`]?[a-zA-Z0-9_]{40}"
+    # Google
+    - "AIza[0-9A-Za-z-_]{35}"
+    # Anthropic
+    - "sk-ant-[a-zA-Z0-9_-]{48,}"
+    # OpenAI
+    - "sk-[a-zA-Z0-9]{48}"
+    - "sk-proj-[a-zA-Z0-9-_]{48,}"
+    # Stripe
+    - "sk_live_[0-9a-zA-Z]{24}"
+    - "rk_live_[0-9a-zA-Z]{24}"
+    # Twilio
+    - "SK[0-9a-fA-F]{32}"
+    # Slack
+    - "xox[abp]-[0-9]{12}-[0-9]{12}-[0-9]{12}-[a-f0-9]{32}"
+    - "xoxr-[0-9]{12}-[a-zA-Z0-9]{24}"
+    # JWT
+    - "eyJ[a-zA-Z0-9_-]+\\.[a-zA-Z0-9_-]+\\.[a-zA-Z0-9_-]+"
+    # Private keys
+    - "-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----"
+    # Passwords in config
+    - "password[\\s\"'`]?[:=][\\s\"'`]?[^\\s\"'`]{8,}"
+    - "passwd[\\s\"'`]?[:=][\\s\"'`]?[^\\s\"'`]{8,}"
+    - "db_password[\\s\"'`]?[:=][\\s\"'`]?[^\\s\"'`]{8,}"

@@ -1,0 +1,200 @@
+# OSINT Agent Tool Requirements
+#
+# The platform degrades when tools are missing. That is useful for passive OSINT,
+# but it is bad if you expect real bug detection. For high-signal bug bounty
+# results, install the "minimum real scanner" set first, then the full set.
+
+
+## 1. Python Runtime
+
+python>=3.10
+pipx
+go>=1.22
+git
+curl
+openssl
+dig
+whois
+
+Install Python dependencies:
+    python3 -m pip install -r requirements.txt
+
+Install the full package extras when using setup.py:
+    python3 -m pip install -e ".[full]"
+
+
+## 2. Browser Runtime
+
+# Required for browser-rendered crawling and CONFIRMED reflected/DOM XSS checks.
+playwright>=1.45
+chromium-for-playwright
+
+Install:
+    python3 -m pip install playwright
+    python3 -m playwright install chromium
+
+
+## 3. Minimum Real Web Scanner Set
+
+# Without these, the platform still runs, but coverage is shallow.
+
+nuclei
+httpx
+katana
+gau
+ffuf
+dalfox
+sqlmap
+arjun
+paramspider
+whatweb
+interactsh-client
+
+macOS / Homebrew where available:
+    brew install nuclei httpx ffuf sqlmap whatweb
+
+Go tools:
+    go install github.com/projectdiscovery/katana/cmd/katana@latest
+    go install github.com/lc/gau/v2/cmd/gau@latest
+    go install github.com/hahwul/dalfox/v2@latest
+    go install github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
+
+Python CLI tools:
+    pipx install arjun
+    pipx install paramspider
+
+Nuclei templates:
+    nuclei -update
+    nuclei -update-templates
+
+
+## 4. Crawling, Discovery, and Content Fuzzing
+
+hakrawler
+gobuster
+feroxbuster
+
+Install:
+    go install github.com/hakluke/hakrawler@latest
+    brew install gobuster feroxbuster
+
+
+## 5. Network and Infrastructure Testing
+
+nmap
+naabu
+masscan
+dnsx
+subfinder
+amass
+
+Install:
+    brew install nmap naabu masscan subfinder amass
+    go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+
+
+## 6. Web Vulnerability Specialists
+
+nikto
+wpscan
+corsy
+smuggler
+openredirex
+commix
+testssl.sh
+
+Install:
+    brew install nikto wpscan testssl
+    pipx install corsy
+    pipx install smuggler
+    pipx install commix
+    go install github.com/theblackturtle/openredirex@latest
+
+
+## 7. CMS and Technology Fingerprinting
+
+droopescan
+cmseek
+joomscan
+
+Install:
+    pipx install droopescan
+    pipx install cmseek
+    git clone https://github.com/OWASP/joomscan.git ~/tools/joomscan
+
+
+## 8. Secrets, Repos, and OSINT
+
+gitleaks
+trufflehog
+theHarvester
+maigret
+holehe
+searchsploit
+gowitness
+
+Install:
+    brew install gitleaks trufflehog exploit-db gowitness
+    pipx install theHarvester
+    pipx install maigret
+    pipx install holehe
+
+
+## 9. Optional API Keys
+
+# These are not command-line tools, but they materially improve results.
+# Put them in config.yaml or environment variables.
+
+VIRUSTOTAL_API_KEY
+SHODAN_API_KEY
+HIBP_API_KEY
+CHAOS_API_KEY
+PDCP_API_KEY
+HUNTER_API_KEY
+HUNTER_IO_API_KEY
+SECURITYTRAILS_API_KEY
+VULNERS_API_KEY
+URLSCAN_API_KEY
+GREYNOISE_API_KEY
+ABUSEIPDB_API_KEY
+WPVULNDB_API_TOKEN
+
+
+## 10. OOB / Blind Vulnerability Infrastructure
+
+# Required for blind SSRF, blind XSS, blind SQLi, XXE, and command-injection
+# callback confirmation.
+
+interactsh-client
+custom-callback-domain
+
+Install:
+    go install github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
+
+Configure one of these in config.yaml:
+    oob.callback_domain
+    oob.server_url
+    oob.poll_url
+    oob.token
+
+
+## 11. Quick Health Check
+
+Run:
+    python3 orchestrator.py -t example.com --tools
+
+Minimum tools that should show as available for serious web testing:
+    nuclei
+    httpx
+    katana
+    gau
+    ffuf
+    dalfox
+    sqlmap
+    arjun
+    paramspider
+    whatweb
+
+For confirmed browser XSS:
+    python3 -c "import playwright.async_api"
+    python3 -m playwright install chromium
