@@ -85,7 +85,7 @@ Requires **Python 3.10+**.
 
 ```bash
 # 1. Clone
-git clone <your-repo-url> osint-agent && cd osint-agent
+git clone https://github.com/roxm337/osint-agent.git osint-agent && cd osint-agent
 
 # 2. Virtual environment
 python3 -m venv .venv

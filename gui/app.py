@@ -385,6 +385,8 @@ class MainWindow(QMainWindow):
         self.llm_model_combo.setEditable(True)
         self.llm_model_combo.addItems([
             "",
+            "deepseek/deepseek-chat",
+            "deepseek/deepseek-reasoner",
             "openai/gpt-4o",
             "openai/gpt-4.1",
             "openai/o4-mini",

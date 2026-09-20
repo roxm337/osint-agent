@@ -8,6 +8,8 @@ load_dotenv()
 
 # Shortcuts: config provider name -> litellm model string
 MODEL_SHORTCUTS = {
+    "deepseek": "deepseek/deepseek-chat",
+    "deepseek-reasoner": "deepseek/deepseek-reasoner",
     "openai": "openai/gpt-4o",
     "anthropic": "anthropic/claude-sonnet-4-20250514",
     "groq": "groq/llama-3.3-70b-versatile",
@@ -53,6 +55,7 @@ def get_llm_config(config: dict) -> dict:
     model = resolve_model(raw_model)
     api_key = (
         llm.get("api_key")
+        or (os.environ.get("DEEPSEEK_API_KEY") if model.startswith("deepseek/") else "")
         or os.environ.get("OSINT_AGENT_LLM_API_KEY")
         or os.environ.get("LITELLM_API_KEY")
         or os.environ.get("OPENAI_API_KEY")
