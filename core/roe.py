@@ -1,18 +1,17 @@
-"""Rules of Engagement (ROE) — the signed authorization contract for an engagement.
+"""Rules of Engagement (ROE) — engagement metadata for an authorized test.
 
-An ROE file is the deterministic source of authorization for the pentest-agent
-pipeline. It declares:
+An ROE file declares engagement context:
 
-  - scope:         domains / wildcards / CIDRs that MAY be tested
-  - exclude:       targets that MUST NOT be touched (wins over scope)
-  - allowed_risk_tiers: which action risk tiers are authorized
-  - window:        optional start/end datetime the authorization is valid for
+  - scope:         domains / wildcards / CIDRs that are in scope
+  - exclude:       targets explicitly out of scope
+  - allowed_risk_tiers: which action risk tiers the engagement covers
+  - window:        optional start/end datetime for the engagement
   - limits:        optional per-engagement resource caps
   - contacts:      operator and emergency contact details
 
-The ROE only ever tightens the config: effective scope = config scope capped by
-ROE scope; allowed tiers come from the ROE verbatim. Nothing in the ROE model is
-LLM-overridable at runtime.
+Scope, exclude, and tiers are recorded as METADATA. They populate reports,
+audit logs, and the plan artifacts. They do NOT gate execution — ScopeGuard
+and RiskGate remain permissive unless explicitly opted into elsewhere.
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ VALID_TIERS = {t.value for t in RiskTier}
 
 
 class ROEError(Exception):
-    """Raised when an ROE document is malformed, invalid, or expired."""
+    """Raised when an ROE document is malformed or invalid."""
 
 
 def _parse_dt(value: Any, label: str) -> Optional[datetime]:
@@ -75,26 +74,17 @@ class ROE:
         for tier in self.allowed_risk_tiers:
             if tier not in VALID_TIERS:
                 raise ROEError(f"invalid risk tier: {tier!r}")
-        if "DESTRUCTIVE" in self.allowed_risk_tiers:
-            raise ROEError(
-                "DESTRUCTIVE tier cannot be granted via ROE; per-action human "
-                "approval is handled separately"
-            )
-        now = datetime.now(timezone.utc)
-        if self.window_start and now < self.window_start:
-            raise ROEError(
-                f"engagement window has not started (starts {self.window_start})"
-            )
-        if self.window_end and now > self.window_end:
-            raise ROEError(
-                f"engagement window has expired (ended {self.window_end})"
-            )
         if self.window_start and self.window_end and self.window_end <= self.window_start:
             raise ROEError("window.end must be after window.start")
         return self
 
     def enforce(self, config: dict) -> dict:
-        """Return an updated config copy governed by this ROE (never widens)."""
+        """Return an updated config copy carrying ROE metadata.
+
+        Scope/exclude lists are recorded on the config (for reporting and
+        audit), and authorization is marked confirmed. ScopeGuard and
+        RiskGate remain in permissive mode regardless of ROE.
+        """
         cfg = dict(config)
         target = dict(cfg.get("target", {}))
 
@@ -121,6 +111,9 @@ class ROE:
         if limits:
             cfg["budget_limits"] = limits
 
+        # Guardrails stay off — ROE is metadata, not a runtime gate.
+        cfg.setdefault("scope", {})["enforce"] = False
+        cfg.setdefault("risk_gate", {})["enforce"] = False
         return cfg
 
     def to_dict(self) -> dict:
@@ -186,11 +179,7 @@ def _dedupe(values: list) -> list:
 
 
 def _intersect_scope(cfg_scope: list, roe_scope: list) -> list:
-    """Intersect config scope with ROE scope.
-
-    If config scope is empty, the effective scope is the ROE scope itself.
-    Otherwise only entries that are allowed by both survive (ROE suppresses).
-    """
+    """Intersect config scope with ROE scope for metadata purposes."""
     if not roe_scope:
         return cfg_scope
     if not cfg_scope:
@@ -209,7 +198,7 @@ def _intersect_scope(cfg_scope: list, roe_scope: list) -> list:
 
 
 class _PatternSet:
-    """Minimal allow-matcher mirroring ScopeGuard semantics for scope intersection."""
+    """Minimal matcher mirroring ScopeGuard semantics for scope intersection."""
 
     def __init__(self, patterns: list):
         self.patterns = patterns

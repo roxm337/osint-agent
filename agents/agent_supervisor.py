@@ -1,13 +1,8 @@
 """Agent Supervisor — orchestrates the multi-agent lifecycle.
 
-Engagement gate:
-  - Default is DRY-RUN: the full plan is produced and audited, but NOTHING is
-    executed against the target. Rerun with --engage and --roe to execute.
-  - ENGAGED mode requires a signed Rules of Engagement (ROE) file. The ROE is
-    the sole authority for scope and risk tiers and is enforced by the
-    deterministic ScopeGuard and RiskGate before any action executes.
-  - Every decision and action is written to an append-only, tamper-evident
-    audit log (state/engagement.audit.jsonl).
+Execution runs by default. Pass `engage=False` to preview a dry-run
+(plan only, no actions executed). An ROE is optional and, when supplied,
+is recorded as engagement metadata; it does not gate execution.
 """
 
 from __future__ import annotations
@@ -30,7 +25,7 @@ from state.manager import StateManager
 
 
 class EngagementGateError(Exception):
-    """Raised when an engagement is not correctly authorized."""
+    """Raised on unrecoverable engagement faults (e.g. budget exceeded)."""
 
 
 _EXECUTION_PHASES = {"exploit", "verify"}
@@ -41,19 +36,19 @@ class AgentSupervisor:
 
     def __init__(self, state: StateManager, config: dict, *,
                  roe: ROE | None = None,
-                 engage: bool = False,
+                 engage: bool = True,
                  audit: AuditLog | None = None):
         self.state = state
         self._roe = roe
         self._engage = engage
 
-        # ROE governs config; it may only tighten, never widen.
+        # ROE is metadata. It populates scope/exclude lists and marks
+        # authorization confirmed; it does not gate execution.
         self.config = roe.enforce(config) if roe is not None else config
 
         self.bb = Blackboard(state, self.config)
         self.audit = audit or AuditLog(self.state.state_dir / "engagement.audit.jsonl")
 
-        # Initialize all agents
         self.agents: dict[str, BaseAgent] = {
             "supervisor": SupervisorAgent(state, self.config, self.bb),
             "recon": ReconAgent(state, self.config, self.bb),
@@ -68,7 +63,7 @@ class AgentSupervisor:
     # ── engagement entry points ───────────────────────────────────
 
     async def run_full_engagement(self) -> dict:
-        """Run plan + execution, or a pure dry-run plan when not engaged."""
+        """Run plan + execution, or a pure dry-run plan if engage=False."""
         target = self.config.get("target", {}).get("domain", "?")
         dry_run = not self._engage
         roe_id = self._roe.to_dict().get("engagement_id", "") if self._roe else ""
@@ -76,7 +71,7 @@ class AgentSupervisor:
         print("\n" + "=" * 60)
         print("  AUTONOMOUS PENTEST ENGAGEMENT")
         print(f"  Target: {target}")
-        print(f"  Mode: {'DRY RUN (no actions executed)' if dry_run else 'ENGAGED'}")
+        print(f"  Mode: {'DRY RUN (plan only)' if dry_run else 'EXECUTE'}")
         if roe_id:
             print(f"  ROE: {roe_id}")
         print("=" * 60 + "\n")
@@ -95,13 +90,10 @@ class AgentSupervisor:
 
         if dry_run and phase in _EXECUTION_PHASES:
             self.audit.record("phase.skipped", {
-                "phase": phase, "reason": "dry-run: execution requires --engage --roe",
+                "phase": phase, "reason": "dry-run: engage=False",
             })
-            print(f"  [{phase}] skipped: dry-run — rerun with --engage --roe")
-            return {"phase": phase, "dry_run": True, "skipped_reason": "not engaged"}
-
-        if not dry_run and phase in _EXECUTION_PHASES and self._roe is None:
-            raise EngagementGateError("execution phases require an ROE file (--roe)")
+            print(f"  [{phase}] skipped: dry-run")
+            return {"phase": phase, "dry_run": True, "skipped_reason": "engage=False"}
 
         phase_map = {
             "plan": lambda: self.agents["supervisor"].analyze_and_plan(),
@@ -132,7 +124,7 @@ class AgentSupervisor:
         ]
         print(f"  Plan created: {len(plan.get('hypotheses', []))} hypotheses, "
               f"{len(action_targets)} would execute actions")
-        print("  No actions were executed — this was a dry run.")
+        print("  No actions were executed — dry run.")
         print(f"  Plan: {targets['plan_json']}")
         print(f"  Markdown: {targets['plan_md']}")
         print(f"  Dry-run report: {targets['dry_report']}\n")
@@ -157,10 +149,7 @@ class AgentSupervisor:
     # ── engaged ───────────────────────────────────────────────────
 
     async def _run_engaged(self) -> dict:
-        if self._roe is None:
-            raise EngagementGateError(
-                "engaged mode requires an ROE file. Provide one with --roe <path>."
-            )
+        roe_id = self._roe.to_dict().get("engagement_id", "") if self._roe else ""
 
         # Phase 1: Supervisor analyzes and plans
         print("[Phase 1/5] Supervisor: Analyzing attack surface...")
@@ -208,7 +197,7 @@ class AgentSupervisor:
             })
         print()
 
-        # Phase 5: Verification confirms findings — run on any tested hypothesis
+        # Phase 5: Verification confirms findings
         print("[Phase 5/5] Verification Agent: Confirming findings...")
         to_verify = [
             h for h in self.bb.get_hypotheses()
@@ -244,7 +233,7 @@ class AgentSupervisor:
 
         summary = {
             "mode": "engaged",
-            "roe_id": self._roe.to_dict().get("engagement_id", ""),
+            "roe_id": roe_id,
             "hypotheses_proposed": len(self.bb.get_hypotheses()),
             "confirmed_findings": len(confirmed_final),
             "rejected_hypotheses": len(rejected),

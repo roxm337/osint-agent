@@ -1,4 +1,4 @@
-"""Tests for Rules of Engagement (ROE) parsing, validation, and config enforcement."""
+"""Tests for Rules of Engagement (ROE) parsing, validation, and metadata."""
 
 import sys
 from pathlib import Path
@@ -63,21 +63,23 @@ def test_roe_rejects_invalid_tier():
         parse_roe(data, data)
 
 
-def test_roe_rejects_destructive_grant():
+def test_roe_accepts_destructive_grant():
+    """DESTRUCTIVE tier is a valid grant — ROE is metadata, not a policy wall."""
     data = _minimal()
-    data["allowed_risk_tiers"] = ["DESTRUCTIVE"]
-    with pytest.raises(ROEError):
-        parse_roe(data, data)
+    data["allowed_risk_tiers"] = ["SAFE", "LOW", "MEDIUM", "HIGH", "DESTRUCTIVE"]
+    roe = parse_roe(data, data)
+    assert "DESTRUCTIVE" in roe.allowed_risk_tiers
 
 
-def test_roe_rejects_expired_window():
+def test_roe_accepts_expired_window():
+    """Expired engagement windows are still loadable — recorded, not refused."""
     data = _minimal()
     data["authorization"]["window"] = {
         "start": "2020-01-01T00:00:00Z",
         "end": "2021-01-01T00:00:00Z",
     }
-    with pytest.raises(ROEError):
-        parse_roe(data, data)
+    roe = parse_roe(data, data)
+    assert roe.window_end is not None
 
 
 def test_roe_rejects_inverted_window():
@@ -90,7 +92,7 @@ def test_roe_rejects_inverted_window():
         parse_roe(data, data)
 
 
-def test_roe_enforce_caps_scope_and_sets_authorization():
+def test_roe_enforce_records_metadata_and_marks_authorization():
     roe = parse_roe(_minimal(), _minimal())
     config = {
         "target": {
@@ -104,9 +106,13 @@ def test_roe_enforce_caps_scope_and_sets_authorization():
     assert enforced["target"]["authorization"] == "confirmed"
     assert "evil.com" not in enforced["target"]["scope"]
     assert enforced["target"]["allowed_risk_tiers"] == ["SAFE", "LOW", "MEDIUM"]
+    # Guardrails remain off — ROE is metadata only.
+    assert enforced["scope"]["enforce"] is False
+    assert enforced["risk_gate"]["enforce"] is False
 
 
-def test_roe_effective_scope_allows_only_roe_targets():
+def test_roe_scope_does_not_block_by_default():
+    """ROE populates scope, but ScopeGuard stays permissive."""
     roe = parse_roe(_minimal(), _minimal())
     config = {"target": {"domain": "example.com", "scope": []}}
     enforced = roe.enforce(config)
@@ -114,22 +120,26 @@ def test_roe_effective_scope_allows_only_roe_targets():
 
     assert guard.check("example.com").allowed
     assert guard.check("www.example.com").allowed
-    assert not guard.check("evil.com").allowed
+    # Off-scope host also allowed — enforcement is off.
+    assert guard.check("evil.com").allowed
 
 
-def test_roe_exclusions_win():
+def test_roe_exclusions_are_recorded_but_not_blocked():
+    """Exclusions land in target.deny but are not enforced at runtime."""
     data = _minimal()
     data["scope"]["exclude"] = ["prod.example.com"]
     roe = parse_roe(data, data)
     enforced = roe.enforce({"target": {"domain": "example.com", "scope": []}})
     guard = ScopeGuard("example.com", enforced)
 
+    # Recorded as metadata.
+    assert "prod.example.com" in enforced["target"]["deny"]
+    # Not blocked at runtime.
     assert guard.check("www.example.com").allowed
-    assert not guard.check("prod.example.com").allowed
+    assert guard.check("prod.example.com").allowed
 
 
 def test_roe_enforce_merges_limit_overrides():
-    roe = parse_roe(_minimal(), _minimal())
     data = dict(_minimal())
     data["limits"] = {"max_requests": 50}
     roe = parse_roe(data, data)

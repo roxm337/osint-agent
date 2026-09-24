@@ -1,4 +1,4 @@
-"""Tests for the engagement gate: dry-run default, ROE requirement, audit trail."""
+"""Tests for the engagement gate: execution default, dry-run opt-in, audit trail."""
 
 import asyncio
 import json
@@ -48,14 +48,15 @@ def _roe():
     }, {})
 
 
-def _make(tmp_path, config=None):
+def _make(tmp_path, config=None, *, engage=False):
+    """Helper for dry-run tests — engage=False is explicitly opt-in."""
     state = StateManager(str(tmp_path))
-    return AgentSupervisor(state, config or _config(), roe=_roe(), engage=False)
+    return AgentSupervisor(state, config or _config(), roe=_roe(), engage=engage)
 
 
 def test_dry_run_produces_plan_and_executes_nothing(tmp_path, monkeypatch):
     _make_llm_fail(monkeypatch)
-    result = asyncio.run(_make(tmp_path).run_full_engagement())
+    result = asyncio.run(_make(tmp_path, engage=False).run_full_engagement())
 
     assert result["dry_run"] is True
     assert result["plan"]["hypotheses"]
@@ -77,17 +78,19 @@ def test_dry_run_produces_plan_and_executes_nothing(tmp_path, monkeypatch):
     assert "engagement.end" not in events
 
 
-def test_engaged_requires_roe(tmp_path):
+def test_engaged_runs_without_roe(tmp_path, monkeypatch):
+    """Execution is the default; ROE is optional."""
+    _make_llm_fail(monkeypatch)
     state = StateManager(str(tmp_path))
     supervisor = AgentSupervisor(state, _config(), engage=True, roe=None)
-
-    with pytest.raises(EngagementGateError):
-        asyncio.run(supervisor.run_full_engagement())
+    result = asyncio.run(supervisor.run_full_engagement())
+    # Ran to completion without ROE.
+    assert result.get("summary", {}).get("mode") == "engaged"
 
 
 def test_dry_run_of_execution_phase_is_skipped(tmp_path, monkeypatch):
     _make_llm_fail(monkeypatch)
-    supervisor = _make(tmp_path)
+    supervisor = _make(tmp_path, engage=False)
 
     result = asyncio.run(supervisor.run_single_phase("exploit"))
     assert result["dry_run"] is True
@@ -97,12 +100,18 @@ def test_dry_run_of_execution_phase_is_skipped(tmp_path, monkeypatch):
     assert "result" in plan
 
 
-def test_roe_scope_rejects_outside_target(tmp_path):
+def test_roe_scope_does_not_block_outside_target(tmp_path):
+    """ROE populates metadata; ScopeGuard stays permissive."""
     state = StateManager(str(tmp_path))
     config = _config()
     supervisor = AgentSupervisor(state, config, roe=_roe(), engage=True)
     enforced = supervisor.config
 
-    guard = __import__("core.scope", fromlist=["ScopeGuard"]).ScopeGuard("example.com", enforced)
+    guard = __import__("core.scope", fromlist=["ScopeGuard"]).ScopeGuard(
+        "example.com", enforced,
+    )
     assert guard.check("example.com").allowed
-    assert not guard.check("evil.com").allowed
+    # Off-scope host also allowed — enforcement off.
+    assert guard.check("evil.com").allowed
+    assert enforced.get("scope", {}).get("enforce", False) is False
+    assert enforced.get("risk_gate", {}).get("enforce", False) is False

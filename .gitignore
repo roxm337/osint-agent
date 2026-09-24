@@ -61,3 +61,4 @@ Thumbs.db
 *.swo
 *.tmp
 digest.txt
+config copy.yaml

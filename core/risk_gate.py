@@ -1,7 +1,16 @@
 """Risk Gate — tiered action approval system.
 
-Approval is OPT-IN. Default is disabled — every tier passes.
-Enable with `risk_gate: {enforce: true}` in config.yaml.
+Approval is OPT-IN.
+
+Default (risk_gate.enforce unset / false): fully permissive. Every tier
+passes, no authorization check, no mode check.
+
+With risk_gate.enforce = true, the deterministic tier logic applies:
+  SAFE        — always allowed
+  LOW         — allowed only in active mode
+  MEDIUM      — allowed only when detectability.allow_high = true
+  HIGH        — allowed only when detectability.allow_high = true, flagged
+  DESTRUCTIVE — always blocked, flagged for approval
 """
 
 from __future__ import annotations
@@ -28,7 +37,7 @@ class RiskDecision:
 
 
 class RiskGate:
-    """Deterministic risk approval. Permissive by default."""
+    """Tiered approval. Permissive by default; strict when enforce=true."""
 
     def __init__(self, config: Optional[dict] = None):
         cfg = config or {}
@@ -36,14 +45,22 @@ class RiskGate:
         detectability = cfg.get("detectability", {})
 
         self.enforce = bool(cfg.get("risk_gate", {}).get("enforce", False))
-        self.allow_high = detectability.get("allow_high", True)
-        self.target_mode = target_cfg.get("mode", "active")
-        self.authorization = target_cfg.get("authorization", "confirmed")
+        self.allow_high = bool(detectability.get("allow_high", False))
+        self.target_mode = target_cfg.get("mode", "passive")
+        self.authorization = target_cfg.get("authorization", "pending")
 
-        self.allowed_tiers: set[RiskTier] = {
-            RiskTier.SAFE, RiskTier.LOW, RiskTier.MEDIUM,
-            RiskTier.HIGH, RiskTier.DESTRUCTIVE,
-        }
+        # In enforcement mode, active tiers come from allow_high.
+        if self.enforce:
+            self.allowed_tiers: set[RiskTier] = {RiskTier.SAFE, RiskTier.LOW}
+            if self.allow_high:
+                self.allowed_tiers.add(RiskTier.MEDIUM)
+                self.allowed_tiers.add(RiskTier.HIGH)
+        else:
+            # Permissive: every tier in the allowlist so nothing is refused.
+            self.allowed_tiers = {
+                RiskTier.SAFE, RiskTier.LOW, RiskTier.MEDIUM,
+                RiskTier.HIGH, RiskTier.DESTRUCTIVE,
+            }
 
     def approve(self, tier: RiskTier, action_id: str = "",
                 target: str = "") -> RiskDecision:
@@ -53,10 +70,34 @@ class RiskGate:
         if self.authorization not in ("confirmed", "active"):
             return RiskDecision(False, tier, "no authorization confirmed")
 
-        if tier in self.allowed_tiers:
-            return RiskDecision(True, tier, f"{tier.value} actions allowed")
+        if tier == RiskTier.SAFE:
+            return RiskDecision(True, tier, "SAFE actions always allowed")
 
-        return RiskDecision(False, tier, f"{tier.value} blocked by policy")
+        if tier == RiskTier.LOW:
+            if self.target_mode == "passive":
+                return RiskDecision(False, tier,
+                                    "LOW actions not allowed in passive mode")
+            return RiskDecision(True, tier, "LOW actions allowed")
+
+        if tier == RiskTier.MEDIUM:
+            if RiskTier.MEDIUM not in self.allowed_tiers:
+                return RiskDecision(False, tier,
+                                    "MEDIUM actions require active mode")
+            return RiskDecision(True, tier, "MEDIUM actions allowed")
+
+        if tier == RiskTier.HIGH:
+            if RiskTier.HIGH not in self.allowed_tiers:
+                return RiskDecision(False, tier,
+                                    "HIGH actions require ROE opt-in")
+            return RiskDecision(True, tier, "HIGH actions allowed",
+                                requires_approval=True)
+
+        if tier == RiskTier.DESTRUCTIVE:
+            return RiskDecision(False, tier,
+                                "DESTRUCTIVE actions blocked by default",
+                                requires_approval=True)
+
+        return RiskDecision(False, tier, f"unknown tier: {tier}")
 
     def require(self, tier: RiskTier, action_id: str = "",
                 target: str = "") -> str:
