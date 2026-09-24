@@ -61,6 +61,14 @@ detectability:
   default: "high"  # low | medium | high
   allow_high: true  # requires explicit auth
 
+# Per-engagement resource caps for the pentest-agent pipeline (dry-run plans
+# and engaged runs both enforce these).
+budget_limits:
+  max_requests: 5000
+  max_wall_clock_seconds: 1800
+  max_llm_calls: 100
+  max_concurrent_actions: 2
+
 waf:
   max_bypass_attempts: 10
   backoff_seconds: 60

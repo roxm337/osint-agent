@@ -1,0 +1,40 @@
+# Rules of Engagement — signed authorization for a pentest-agent engagement.
+#
+# Load with:  python orchestrator.py -t example.com --agent --roe roe/example_roe.yaml
+# Execute with:  (same) --engage
+#
+# Without --engage the agent pipeline runs a DRY RUN: it plans, audits, and
+# writes artifacts but executes no action against the target.
+#
+# The ROE only tightens config. DESTRUCTIVE tier can never be granted here.
+
+engagement_id: "ENG-2026-001"
+
+authorization:
+  operator: "Recon Team"
+  contact: "sec@example-org.com"
+  emergency_contact: "oncall@example-org.com"
+  window:            # optional — omit for no time restriction
+    start: "2026-09-24T00:00:00Z"
+    end: "2026-12-31T23:59:59Z"
+
+scope:
+  allow:
+    - "example.com"
+    - "*.example.com"
+    - "192.0.2.0/24"      # CIDRs supported
+  exclude:
+    - "prod.example.com"   # excluded hosts win over scope.allow
+    - "203.0.113.5"
+
+allowed_risk_tiers:
+  - SAFE
+  - LOW
+  - MEDIUM    # HIGH requires explicit listing below and config allow_high
+# - HIGH      # only grant when the program explicitly authorizes high-detectability testing
+
+limits:                  # per-engagement resource caps (optional)
+  max_requests: 2000
+  max_wall_clock_seconds: 1800
+  max_llm_calls: 75
+  max_concurrent_actions: 2

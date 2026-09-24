@@ -53,6 +53,7 @@ class ActionContext:
     risk_gate: RiskGate
     timeout: int = 120
     meta: Optional[ActionMeta] = None
+    audit: Optional[Any] = None
     _start_time: float = 0.0
 
     @property
@@ -112,12 +113,28 @@ class ActionRegistry:
         tier = RISK_TO_TIER.get(meta.risk, RiskTier.SAFE)
         decision = ctx.risk_gate.approve(tier, action_id, ctx.target)
         if not decision.allowed:
+            if ctx.audit:
+                ctx.audit.gate("risk", action_id, ctx.target,
+                               allowed=False, reason=decision.reason,
+                               risk=meta.risk.value)
             return ActionResult(False, error=f"risk gate blocked: {decision.reason}")
+        if ctx.audit:
+            ctx.audit.gate("risk", action_id, ctx.target,
+                           allowed=True, reason=decision.reason,
+                           risk=meta.risk.value)
 
         # Scope check
         scope_decision = ctx.scope.check(ctx.target)
         if not scope_decision.allowed:
+            if ctx.audit:
+                ctx.audit.gate("scope", action_id, ctx.target,
+                               allowed=False, reason=scope_decision.reason,
+                               risk=meta.risk.value)
             return ActionResult(False, error=f"out of scope: {scope_decision.reason}")
+        if ctx.audit:
+            ctx.audit.gate("scope", action_id, ctx.target,
+                           allowed=True, reason=scope_decision.reason,
+                           risk=meta.risk.value)
 
         # Validate required params
         for req in meta.requires:
@@ -134,11 +151,22 @@ class ActionRegistry:
             if not isinstance(result, ActionResult):
                 result = ActionResult(True, data=result)
             result.elapsed_ms = (time.time() - ctx._start_time) * 1000
+            if ctx.audit:
+                ctx.audit.action(action_id, ctx.target, ctx.params,
+                                 risk=meta.risk.value, result=_result_brief(result))
             return result
         except asyncio.TimeoutError:
-            return ActionResult(False, error=f"timeout after {meta.timeout}s")
+            failed = ActionResult(False, error=f"timeout after {meta.timeout}s")
+            if ctx.audit:
+                ctx.audit.action(action_id, ctx.target, ctx.params,
+                                 risk=meta.risk.value, result=_result_brief(failed))
+            return failed
         except Exception as e:
-            return ActionResult(False, error=str(e))
+            failed = ActionResult(False, error=str(e))
+            if ctx.audit:
+                ctx.audit.action(action_id, ctx.target, ctx.params,
+                                 risk=meta.risk.value, result=_result_brief(failed))
+            return failed
 
     @classmethod
     def size(cls) -> int:
@@ -215,3 +243,13 @@ def list_actions_by_risk(risk: str) -> list[ActionMeta]:
 
 def list_actions_by_category(category: str) -> list[ActionMeta]:
     return ActionRegistry.list_by_category(category)
+
+
+def _result_brief(result: ActionResult) -> dict:
+    """Compact, JSON-safe action result for the audit trail."""
+    return {
+        "success": result.success,
+        "confidence": result.confidence,
+        "error": (result.error or "")[:400],
+        "elapsed_ms": round(result.elapsed_ms, 1),
+    }

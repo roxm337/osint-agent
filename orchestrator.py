@@ -369,6 +369,11 @@ Examples:
                         help="Autonomous multi-agent pentesting engagement")
     parser.add_argument("--phase", choices=["plan", "recon", "vuln", "exploit", "verify", "report"],
                         help="Run a single agent phase")
+    parser.add_argument("--roe", metavar="PATH",
+                        help="Rules of Engagement YAML file — required for --engage")
+    parser.add_argument("--engage", action="store_true",
+                        help="Execute the engagement. Without this the agent mode "
+                             "runs a dry-run (plan only, no actions executed)")
     parser.add_argument("--tools", action="store_true",
                         help="List available external tools")
     parser.add_argument("--install-tools", nargs="*",
@@ -433,7 +438,29 @@ Examples:
     )
 
     if args.agent or args.phase:
-        from agents.agent_supervisor import AgentSupervisor
+        from agents.agent_supervisor import AgentSupervisor, EngagementGateError
+        from core.roe import load_roe, ROEError
+
+        roe = None
+        if args.roe:
+            try:
+                roe = load_roe(args.roe)
+            except ROEError as exc:
+                print(f"\n✗ Invalid ROE: {exc}\n")
+                sys.exit(1)
+            # The ROE is the authoritative boundary — the CLI target must be inside it.
+            try:
+                from core.scope import ScopeGuard
+                scope_check = ScopeGuard(orchestrator.domain, roe.enforce(orchestrator.config))
+                scope_check.require(orchestrator.domain)
+            except ValueError as exc:
+                print(f"\n✗ Target {orchestrator.domain} is outside the ROE scope: {exc}\n")
+                sys.exit(1)
+
+        if args.engage and roe is None:
+            print("\n✗ Engaged mode requires an ROE file. Provide one with --roe <path>.\n")
+            sys.exit(1)
+
         # Inject the raw target URL so agents can target specific paths
         orchestrator.config["target"]["raw_url"] = args.target
         if mode == "active" or args.skip_auth_check:
@@ -461,13 +488,22 @@ Examples:
                 confidence="CONFIRMED", sources=["user_target"],
             )
 
-        supervisor = AgentSupervisor(orchestrator.state, orchestrator.config)
+        supervisor = AgentSupervisor(orchestrator.state, orchestrator.config,
+                                     roe=roe, engage=args.engage)
 
         if args.phase:
-            result = await supervisor.run_single_phase(args.phase)
+            try:
+                result = await supervisor.run_single_phase(args.phase)
+            except EngagementGateError as exc:
+                print(f"\n✗ {exc}\n")
+                sys.exit(1)
             print(f"\nPhase '{args.phase}' complete.")
         else:
-            result = await supervisor.run_full_engagement()
+            try:
+                result = await supervisor.run_full_engagement()
+            except EngagementGateError as exc:
+                print(f"\n✗ Engagement aborted: {exc}\n")
+                sys.exit(1)
         return
 
     if args.pentest:

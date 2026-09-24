@@ -43,11 +43,22 @@ class RiskGate:
         self.target_mode = target_cfg.get("mode", "passive")
         self.authorization = target_cfg.get("authorization", "pending")
 
-        # ROE-level overrides
-        self.allowed_tiers: set[RiskTier] = {RiskTier.SAFE, RiskTier.LOW}
-        if self.allow_high:
-            self.allowed_tiers.add(RiskTier.MEDIUM)
-            self.allowed_tiers.add(RiskTier.HIGH)
+        # Explicit tier grant (e.g. from an ROE file) is authoritative when
+        # present. Otherwise fall back to the legacy allow_high binary.
+        explicit = target_cfg.get("allowed_risk_tiers")
+        if explicit:
+            self.allowed_tiers: set[RiskTier] = {
+                RiskTier(str(t).upper()) for t in explicit
+                if RiskTier(str(t).upper()) != RiskTier.DESTRUCTIVE
+            }
+        else:
+            self.allowed_tiers: set[RiskTier] = {RiskTier.SAFE, RiskTier.LOW}
+            if self.allow_high:
+                self.allowed_tiers.add(RiskTier.MEDIUM)
+                self.allowed_tiers.add(RiskTier.HIGH)
+
+        # SAFE actions are never blocked by tier policy.
+        self.allowed_tiers.add(RiskTier.SAFE)
 
     def approve(self, tier: RiskTier, action_id: str = "",
                 target: str = "") -> RiskDecision:
@@ -58,23 +69,20 @@ class RiskGate:
             return RiskDecision(True, tier, "SAFE actions always allowed")
 
         if tier == RiskTier.LOW:
+            if tier not in self.allowed_tiers:
+                return RiskDecision(False, tier, "LOW actions not authorized")
             if self.target_mode == "passive":
                 return RiskDecision(False, tier,
                                     "LOW actions not allowed in passive mode")
             return RiskDecision(True, tier, "LOW actions allowed")
 
-        if tier == RiskTier.MEDIUM:
-            if RiskTier.MEDIUM not in self.allowed_tiers:
+        if tier in (RiskTier.MEDIUM, RiskTier.HIGH):
+            if tier not in self.allowed_tiers:
+                label = "MEDIUM" if tier == RiskTier.MEDIUM else "HIGH"
                 return RiskDecision(False, tier,
-                                    "MEDIUM actions require active mode")
-            return RiskDecision(True, tier, "MEDIUM actions allowed")
-
-        if tier == RiskTier.HIGH:
-            if RiskTier.HIGH not in self.allowed_tiers:
-                return RiskDecision(False, tier,
-                                    "HIGH actions require ROE opt-in")
-            return RiskDecision(True, tier, "HIGH actions allowed",
-                                requires_approval=True)
+                                    f"{label} actions require authorization (ROE opt-in)")
+            return RiskDecision(True, tier, f"{tier.value} actions allowed",
+                                requires_approval=(tier == RiskTier.HIGH))
 
         if tier == RiskTier.DESTRUCTIVE:
             return RiskDecision(False, tier,

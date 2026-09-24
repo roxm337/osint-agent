@@ -31,6 +31,7 @@ class BaseAgent:
         self.risk_gate = RiskGate(config)
         self.budget = BudgetManager(config)
         self.attack_graph: Optional[AttackGraph] = None
+        self.audit = None  # core.audit_log.AuditLog, set by the engagement runner
 
     # ── LLM helpers ───────────────────────────────────────────────
 
@@ -121,6 +122,7 @@ class BaseAgent:
             risk_gate=self.risk_gate,
             timeout=meta.timeout,
             meta=meta,
+            audit=self.audit,
         )
 
         self.budget.record_action()
