@@ -126,20 +126,47 @@ class StateManager:
         return [n for n in self.assets["nodes"] if n["confidence"] == confidence]
 
     # ── Finding Management ────────────────────────────────────────
+    def prune_module_findings(self, module_id: str) -> int:
+        """Remove findings previously emitted by this module.
 
+        Called at the start of a re-run so stale findings from the last code
+        version don't survive alongside fresh ones. Evidence files are left
+        alone — they're historical, and evidence_refs are resolved per run.
+        Returns the number of findings removed.
+        """
+        if not module_id:
+            return 0
+        before = len(self.findings["findings"])
+        self.findings["findings"] = [
+            f for f in self.findings["findings"]
+            if f.get("module_id") != module_id
+        ]
+        removed = before - len(self.findings["findings"])
+        if removed:
+            self.module["stats"]["total_findings"] = len(self.findings["findings"])
+            self._dirty = True
+        return removed
     def add_finding(self, title: str, severity: str, confidence: str,
                     category: str, description: str,
                     evidence: Optional[list] = None,
                     remediation: str = "",
                     asset_keys: Optional[list] = None,
                     evidence_refs: Optional[list] = None,
-                    risk_score: Optional[int] = None) -> str:
+                    risk_score: Optional[int] = None,
+                    verified: bool = False,
+                    verification: Optional[dict] = None) -> str:
         fid = f"FINDING-{len(self.findings['findings']) + 1:04d}"
         if risk_score is None:
             from core.scoring import score_finding
-            risk_score = score_finding(severity, confidence, asset_keys, category)
+            risk_score = score_finding(
+                severity, confidence, asset_keys, category,
+                verified=verified,
+            )
+        # Tag with the module currently running so future re-runs can replace it.
+        current_module = self.module.get("current") or ""
         finding = {
             "id": fid,
+            "module_id": current_module,
             "title": title,
             "severity": severity,
             "confidence": confidence,
@@ -151,6 +178,8 @@ class StateManager:
             "remediation": remediation,
             "asset_keys": asset_keys or [],
             "created_at": self._now(),
+            "verified": bool(verified),
+            "verification": verification or {},
         }
         self.findings["findings"].append(finding)
         self.module["stats"]["total_findings"] = len(self.findings["findings"])
@@ -168,6 +197,11 @@ class StateManager:
 
     def begin_module_run(self, module_id: str, detectability: str = "",
                          stage: int = 0) -> str:
+        # Findings from a previous run of this module are stale — the fresh
+        # run will regenerate them. Drop them before the new run starts so
+        # the state reflects the current code, not the last code.
+        self.prune_module_findings(module_id)
+
         run_id = f"RUN-{len(self.module.get('runs', [])) + 1:04d}"
         run = {
             "id": run_id,

@@ -111,6 +111,10 @@ def render_markdown(bundle: dict) -> str:
     metadata = bundle["metadata"]
     summary = bundle["summary"]
     risk = bundle["risk"]
+    findings_all = bundle["findings"]
+    verified_count = sum(1 for f in findings_all if f.get("verified"))
+    unverified_count = len(findings_all) - verified_count
+
     lines = [
         f"# OSINT Investigation Report: {metadata['target']}",
         "",
@@ -129,6 +133,8 @@ def render_markdown(bundle: dict) -> str:
         f"| Assets | {summary['assets']} |",
         f"| Relations | {summary['relations']} |",
         f"| Findings | {summary['findings']} |",
+        f"| └ Verified | {verified_count} |",
+        f"| └ Unverified | {unverified_count} |",
         f"| Evidence Items | {summary['evidence']} |",
         f"| Requests Made | {summary['requests']} |",
         f"| WAF Detected | {_yes_no(summary['waf_detected'])} |",
@@ -146,17 +152,35 @@ def render_markdown(bundle: dict) -> str:
 
     lines.extend([
         "",
+        "## Signal Quality",
+        "",
+        f"- **Verified findings:** {verified_count} — active confirmation ran; "
+        f"the method is recorded per finding.",
+        f"- **Unverified findings:** {unverified_count} — signal only; "
+        f"validate manually before submitting to a bounty program.",
+        "",
+        "Verified findings passed at least one active check: response-body match, "
+        "differential response diff, real DNS zone-transfer records returned, "
+        "HTTP 200 with content, platform-specific signature match, or similar. "
+        "Unverified findings are strong heuristics that warrant manual triage.",
+        "",
+    ])
+
+    lines.extend([
+        "",
         "## Top Findings",
         "",
     ])
     if risk["top_findings"]:
         lines.extend([
-            "| ID | Severity | Score | Title | Category |",
-            "|---|---|---:|---|---|",
+            "| ID | Verified | Severity | Score | Title | Category |",
+            "|---|---|---|---:|---|---|",
         ])
         for item in risk["top_findings"]:
+            verified = bool(item.get("verified", False))
+            tag = "✔" if verified else "○"
             lines.append(
-                f"| {_cell(item['id'])} | {_cell(item['severity'])} | "
+                f"| {_cell(item['id'])} | {tag} | {_cell(item['severity'])} | "
                 f"{item['risk_score']} | {_cell(item['title'])} | "
                 f"{_cell(item['category'])} |"
             )
@@ -196,6 +220,8 @@ def render_markdown(bundle: dict) -> str:
             if not findings:
                 continue
             lines.extend([f"### {severity}", ""])
+            # Verified findings first within each severity bucket.
+            findings.sort(key=lambda f: bool(f.get("verified")), reverse=True)
             for finding in findings:
                 lines.extend(_render_finding(finding, bundle["evidence"]["items"]))
     else:
@@ -248,15 +274,23 @@ def render_executive_summary(bundle: dict) -> str:
 def _render_finding(finding: dict, evidence_items: list[dict]) -> list[str]:
     evidence_by_id = {item.get("id"): item for item in evidence_items}
     risk_score = int(finding.get("risk_score") or 0)
+    verified = bool(finding.get("verified", False))
+    tag = "✔ VERIFIED" if verified else "○ UNVERIFIED"
     lines = [
-        f"#### {_escape_text(finding.get('id', 'FINDING'))}: "
+        f"#### [{tag}] {_escape_text(finding.get('id', 'FINDING'))}: "
         f"{_escape_text(finding.get('title', 'Untitled Finding'))}",
         "",
+        f"- **Verification:** {tag}",
         f"- **Risk Score:** {risk_score}/100 ({score_label(risk_score)})",
         f"- **Confidence:** {_escape_text(finding.get('confidence', ''))}",
         f"- **Category:** {_escape_text(finding.get('category', ''))}",
         f"- **Description:** {_escape_text(finding.get('description', ''))}",
     ]
+    if finding.get("verification"):
+        v = finding["verification"]
+        method = v.get("method", "")
+        if method:
+            lines.append(f"- **Verification Method:** `{_escape_text(method)}`")
     if finding.get("asset_keys"):
         lines.append("- **Affected Assets:**")
         for asset_key in finding["asset_keys"]:
@@ -461,6 +495,7 @@ def _finding_digest(finding: dict) -> dict:
         "confidence": finding.get("confidence", ""),
         "risk_score": int(finding.get("risk_score") or 0),
         "category": finding.get("category", ""),
+        "verified": bool(finding.get("verified", False)),
         "asset_keys": list(finding.get("asset_keys", [])),
         "evidence_refs": list(finding.get("evidence_refs", [])),
     }

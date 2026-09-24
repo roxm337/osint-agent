@@ -5,21 +5,26 @@ from modules.base import BaseModule
 from tools.wrappers import curl
 
 
-# Core providers checked by default.  S3 multi-region variants are resolved by
-# the global S3 endpoint so we only probe the canonical URL.
 PROVIDER_TEMPLATES = {
-    "s3":              "https://{name}.s3.amazonaws.com",
-    "gcs":             "https://storage.googleapis.com/{name}",
-    "azure":           "https://{name}.blob.core.windows.net",
-    "do_nyc3":         "https://{name}.nyc3.digitaloceanspaces.com",
-    "do_ams3":         "https://{name}.ams3.digitaloceanspaces.com",
-    "firebase":        "https://{name}.firebaseio.com/.json",
-    "firebase_storage":"https://firebasestorage.googleapis.com/v0/b/{name}.appspot.com/o",
+    "s3":               "https://{name}.s3.amazonaws.com",
+    "gcs":              "https://storage.googleapis.com/{name}",
+    "azure":            "https://{name}.blob.core.windows.net",
+    "do_nyc3":          "https://{name}.nyc3.digitaloceanspaces.com",
+    "do_ams3":          "https://{name}.ams3.digitaloceanspaces.com",
+    "firebase":         "https://{name}.firebaseio.com/.json",
+    "firebase_storage": "https://firebasestorage.googleapis.com/v0/b/{name}.appspot.com/o",
 }
 
-# Per-bucket request timeout.  These are third-party storage endpoints; a
-# non-existent bucket 404s in <1s.  Anything slower is a real hit.
 _BUCKET_TIMEOUT = 5
+
+# File/word markers that upgrade a public bucket from MEDIUM to CRITICAL.
+_SENSITIVE_MARKERS = (
+    ".env", ".sql", ".bak", ".backup", ".old", ".tar", ".zip",
+    "backup", "dump", "secret", "password", "credential", "private_key",
+    "id_rsa", ".pem", ".key", "config.json", "settings.py",
+    "connectionstring", "database_url", "apikey", "api_key",
+    ".git/", ".ssh/",
+)
 
 
 class CloudEnum(BaseModule):
@@ -33,16 +38,14 @@ class CloudEnum(BaseModule):
         self.log("Enumerating cloud buckets...")
 
         candidates = self._generate_candidates()
-        self.log(f"  Testing {len(candidates)} name candidates across {len(PROVIDER_TEMPLATES)} providers...")
+        self.log(f"  Testing {len(candidates)} name candidates across "
+                 f"{len(PROVIDER_TEMPLATES)} providers...")
 
         results = {p: [] for p in PROVIDER_TEMPLATES}
         public_count = 0
+        critical_count = 0
         exists_count = 0
 
-        # Use a dedicated semaphore — bucket probes hit third-party CDN endpoints,
-        # not the target, so they bypass the global HTTP rate limiter intentionally.
-        # 20 concurrent × 5s timeout → 200 cands × 7 providers ≈ 70 requests/slot
-        # worst-case wall time ~35s.
         semaphore = asyncio.Semaphore(20)
         total_tasks = len(candidates) * len(PROVIDER_TEMPLATES)
         completed = 0
@@ -50,13 +53,11 @@ class CloudEnum(BaseModule):
         async def test_bucket(name, provider, url_template):
             url = url_template.format(name=name)
             async with semaphore:
-                # status-only first pass; cheap and fast
                 r = await curl(url, output="status", follow_redirects=False,
                                timeout=_BUCKET_TIMEOUT)
             status = r.get("status", 0)
             body = ""
             if status == 200:
-                # Fetch body only for confirmed hits to detect directory listings
                 rb = await curl(url, output="body", follow_redirects=False,
                                 timeout=_BUCKET_TIMEOUT)
                 body = rb.get("body", "")
@@ -68,7 +69,6 @@ class CloudEnum(BaseModule):
             for provider, template in PROVIDER_TEMPLATES.items()
         ]
 
-        # Process in batches of 200 so progress is visible and memory stays flat
         batch_size = 200
         task_results = []
         for i in range(0, len(tasks), batch_size):
@@ -86,16 +86,27 @@ class CloudEnum(BaseModule):
             if status == 0:
                 continue
 
-            # Public bucket (directory listing or direct access)
             if status == 200:
-                is_listing = (
-                    "ListBucketResult" in body
-                    or "<?xml" in body
-                    or '"items"' in body  # GCS JSON
-                    or "Contents" in body
-                )
-                severity = "CRITICAL" if is_listing else "HIGH"
+                listing = self._classify_listing(provider, body)
+                keys = self._extract_keys(provider, body)
+                sensitive = self._find_sensitive_markers(keys, body)
+
+                if sensitive:
+                    severity = "CRITICAL"
+                    critical_count += 1
+                    classification = "Sensitive data exposed"
+                elif listing:
+                    severity = "MEDIUM"
+                    classification = "Public directory listing"
+                else:
+                    severity = "LOW"
+                    classification = "Public object, not listable"
+
                 public_count += 1
+                public_note = (
+                    f"{classification}. {len(keys)} object(s) visible."
+                    if keys else classification
+                )
 
                 self.state.add_finding(
                     title=f"Public Cloud Bucket: {name} ({provider.upper().split('_')[0]})",
@@ -103,80 +114,79 @@ class CloudEnum(BaseModule):
                     confidence="CONFIRMED",
                     category="Cloud Exposure",
                     description=(
-                        f"Cloud bucket '{name}' on {provider} is publicly accessible. "
-                        + ("Directory listing enabled — all contents enumerable."
-                           if is_listing else "Direct access allowed.")
+                        f"Bucket '{name}' on {provider} returns HTTP 200 for "
+                        f"unauthenticated requests. {public_note}"
                     ),
                     evidence=[
                         f"URL: {url}",
                         f"Status: {status}",
-                        f"Listing: {is_listing}",
-                        f"Preview: {body[:300]}" if body else "",
+                        f"Listing: {listing}",
+                        f"Objects visible: {len(keys)}",
+                        f"Sample keys: {keys[:15]}",
+                        f"Sensitive markers: {sensitive[:10]}" if sensitive else "",
+                        f"Preview: {body[:200]}",
                     ],
-                    remediation="Apply bucket ACL to block public access. Enable Block Public Access settings.",
+                    remediation=(
+                        "Apply bucket ACL to block public access. Enable Block "
+                        "Public Access settings. Rotate any credentials present "
+                        "in exposed files." if sensitive else
+                        "Apply bucket ACL to block public access. Enable Block "
+                        "Public Access settings."
+                    ),
+                    verified=True,
+                    verification={
+                        "method": "http_200_unauthenticated",
+                        "listing_detected": listing,
+                        "keys_visible": len(keys),
+                        "sensitive_markers": sensitive,
+                    },
                 )
                 results[provider].append({
                     "name": name, "url": url, "status": status,
-                    "listing": is_listing,
+                    "listing": listing, "keys": len(keys),
+                    "sensitive": sensitive,
                 })
 
             elif status == 403:
-                # Bucket exists but is private
                 exists_count += 1
                 results[provider].append({
-                    "name": name, "url": url, "status": 403, "private": True
+                    "name": name, "url": url, "status": 403, "private": True,
                 })
                 self.state.add_asset(
-                    "bucket",
-                    f"bucket:{provider}:{name}",
-                    name,
-                    confidence="FIRM",
-                    sources=["cloud enumeration"],
-                    attrs={
-                        "provider": provider,
-                        "url": url,
-                        "status": 403,
-                        "private": True,
-                    },
+                    "bucket", f"bucket:{provider}:{name}", name,
+                    confidence="FIRM", sources=["cloud enumeration"],
+                    attrs={"provider": provider, "url": url, "status": 403, "private": True},
                 )
 
-            elif status == 301 or status == 302:
-                # Redirect — may indicate bucket exists in another region
+            elif status in (301, 302):
                 exists_count += 1
                 self.state.add_asset(
-                    "bucket",
-                    f"bucket:{provider}:{name}",
-                    name,
-                    confidence="TENTATIVE",
-                    sources=["cloud enumeration"],
+                    "bucket", f"bucket:{provider}:{name}", name,
+                    confidence="TENTATIVE", sources=["cloud enumeration"],
                     attrs={"provider": provider, "url": url, "status": status},
                 )
 
-            # Firebase-specific: open database
             if "firebase" in provider and status == 200 and '"rules"' not in body:
                 self.state.add_finding(
                     title=f"Firebase Database Publicly Readable: {name}",
                     severity="CRITICAL",
                     confidence="CONFIRMED",
                     category="Cloud Exposure",
-                    description=(
-                        f"Firebase Realtime Database at {url} is publicly readable. "
-                        f"All database contents may be accessible."
-                    ),
+                    description=f"Firebase Realtime Database at {url} is publicly readable.",
                     evidence=[f"URL: {url}", f"Response preview: {body[:300]}"],
                     remediation="Set Firebase security rules to deny read/write by default.",
+                    verified=True,
+                    verification={"method": "firebase_open_read"},
                 )
 
         total = sum(len(v) for v in results.values())
         self.state.add_asset(
-            "cloud_enum",
-            f"cloud_enum:{self.domain}",
-            self.domain,
-            confidence="CONFIRMED",
-            sources=["cloud enumeration"],
+            "cloud_enum", f"cloud_enum:{self.domain}", self.domain,
+            confidence="CONFIRMED", sources=["cloud enumeration"],
             attrs={
                 "total_found": total,
                 "public": public_count,
+                "public_critical": critical_count,
                 "private": exists_count - public_count,
                 "providers_checked": list(PROVIDER_TEMPLATES.keys()),
                 "candidates_tested": len(candidates),
@@ -184,26 +194,56 @@ class CloudEnum(BaseModule):
         )
 
         self.state.complete_module(self.id)
-        self.log(f"Cloud: {total} buckets found ({public_count} public, "
-                 f"{exists_count} total exists)")
+        self.log(
+            f"Cloud: {total} buckets found ({public_count} public, "
+            f"{critical_count} critical content, {exists_count} total exists)"
+        )
         return "done"
 
+    def _classify_listing(self, provider: str, body: str) -> bool:
+        if not body:
+            return False
+        if provider.startswith("s3") or provider.startswith("do_"):
+            return "<ListBucketResult" in body and "<Contents>" in body
+        if provider == "gcs":
+            return (
+                "<ListBucketResult" in body
+                or '"items"' in body
+                or ("<Contents>" in body and "<Key>" in body)
+            )
+        if provider == "azure":
+            return "<EnumerationResults" in body
+        if provider.startswith("firebase"):
+            return body.strip() not in ("", "null", "{}")
+        return "<Contents>" in body or "<Key>" in body
+
+    def _extract_keys(self, provider: str, body: str) -> list:
+        import re
+        keys = re.findall(r"<Key>([^<]+)</Key>", body)
+        if not keys:
+            # GCS JSON: {"items": [{"name": "..."}]}
+            keys = re.findall(r'"name"\s*:\s*"([^"]+)"', body)
+        return keys[:200]
+
+    def _find_sensitive_markers(self, keys: list, body: str) -> list:
+        found = []
+        haystack = (" ".join(keys) + " " + body[:5000]).lower()
+        for marker in _SENSITIVE_MARKERS:
+            if marker in haystack:
+                found.append(marker)
+        return found
+
     def _generate_candidates(self) -> list:
-        """Generate bucket name candidates from domain + wordlist permutations."""
         prefixes = self.config.get("wordlists", {}).get("bucket_prefixes", [""])
         suffixes = self.config.get("wordlists", {}).get("bucket_suffixes", [""])
 
-        # Base names from domain
         domain_parts = self.domain.replace("-", ".").split(".")
         base_names = []
         for i in range(len(domain_parts) - 1):
-            # "example" from "example.com"
             part = domain_parts[i]
             if len(part) > 2:
                 base_names.append(part)
-        # Also try full domain without TLD: "example-co" from "example.co.uk"
         base_names.append("-".join(domain_parts[:-1]))
-        # Full domain slug
         base_names.append(self.domain.replace(".", "-"))
         base_names = list(dict.fromkeys(b for b in base_names if b))
 

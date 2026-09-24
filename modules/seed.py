@@ -75,7 +75,6 @@ class SeedDiscovery(BaseModule):
                                 sources=["SPF include"],
                                 attrs={"spf_included": True},
                             )
-                    # Extract redirect:
                     redirects = re.findall(r'redirect=([\w.-]+)', txt)
                     for redir in redirects:
                         self.state.add_asset(
@@ -83,15 +82,13 @@ class SeedDiscovery(BaseModule):
                             confidence="FIRM",
                             sources=["SPF redirect"],
                         )
-                elif "v=DKIM1" in txt or "p=" in txt:
-                    pass  # DKIM key — handled in email_security module
 
         # 3. WHOIS
         self.log("Fetching WHOIS...")
         whois = await whois_lookup(self.domain)
         whois_fields = whois.get("fields", {})
 
-        # 4. RDAP (structured JSON alternative)
+        # 4. RDAP
         self.log("Fetching RDAP...")
         rdap = await rdap_lookup(self.domain)
 
@@ -112,7 +109,7 @@ class SeedDiscovery(BaseModule):
             },
         )
 
-        # 5. ASN lookup for all discovered IPs
+        # 5. ASN lookup
         ipv4s = dns.get("A", [])
         if ipv4s:
             primary_ip = ipv4s[0]
@@ -133,7 +130,7 @@ class SeedDiscovery(BaseModule):
                 )
                 self.state.add_edge(f"ip:{primary_ip}", f"asn:{asn}", "BELONGS_TO_ASN")
 
-        # 6. Certificate Transparency (crt.sh)
+        # 6. Certificate Transparency
         self.log("Checking crt.sh...")
         certs = await crtsh(self.domain)
         if certs:
@@ -149,12 +146,11 @@ class SeedDiscovery(BaseModule):
                                 "subdomain", f"sub:{name}", name,
                                 confidence="TENTATIVE",
                                 sources=["crt.sh"],
-                                attrs={"cert_issued": True,
-                                       "cert_id": cert.get("id", "")},
+                                attrs={"cert_issued": True, "cert_id": cert.get("id", "")},
                             )
             self.log(f"  CT logs: {len(seen_names)} unique names")
 
-        # 7. Reverse DNS for discovered IPs
+        # 7. Reverse DNS
         for ip in ipv4s[:5]:
             ptr_result = await bash(f"dig +short -x {ip} 2>/dev/null")
             ptr = ptr_result["stdout"].strip().rstrip(".")
@@ -167,23 +163,66 @@ class SeedDiscovery(BaseModule):
                 )
                 self.state.add_edge(f"ip:{ip}", f"ptr:{ip}", "HAS_PTR")
 
-        # 8. Zone transfer attempt (passive detectability)
+        # 8. Zone transfer — real success requires actual records returned
         ns_servers = dns.get("NS", [])
         if ns_servers:
             ns = ns_servers[0].rstrip(".")
             zt_result = await bash(f"dig AXFR {self.domain} @{ns} 2>/dev/null")
             zt_output = zt_result["stdout"]
-            if "Transfer failed" not in zt_output and len(zt_output) > 200:
+            zt_lower = zt_output.lower()
+
+            record_lines = [
+                ln for ln in zt_output.splitlines()
+                if ln and not ln.startswith(";") and " IN " in ln
+            ]
+            failed = any(marker in zt_lower for marker in (
+                "transfer failed",
+                "no servers could be reached",
+                "communications error",
+                "connection refused",
+                "connection timed out",
+                "end of file",
+            ))
+            successful = not failed and len(record_lines) >= 3
+
+            if successful:
+                # Real AXFR — extract every record type returned
+                subdomain_set = set()
+                for ln in record_lines:
+                    parts = ln.split()
+                    if len(parts) >= 5:
+                        name = parts[0].rstrip(".").lower()
+                        if name.endswith(self.domain) and name != self.domain:
+                            subdomain_set.add(name)
+
                 self.state.add_finding(
                     title=f"DNS Zone Transfer Allowed: {ns}",
                     severity="HIGH",
                     confidence="CONFIRMED",
                     category="DNS Exposure",
-                    description=f"DNS zone transfer succeeded from {ns}. "
-                                f"All DNS records are publicly enumerable.",
-                    evidence=[f"NS: {ns}", f"AXFR output: {zt_output[:500]}"],
-                    remediation="Disable AXFR on public-facing name servers.",
+                    description=(
+                        f"AXFR succeeded against {ns}. {len(record_lines)} records "
+                        f"leaked, including {len(subdomain_set)} subdomains. "
+                        f"All DNS records are publicly enumerable."
+                    ),
+                    evidence=[
+                        f"NS: {ns}",
+                        f"Records leaked: {len(record_lines)}",
+                        f"Subdomains leaked: {sorted(subdomain_set)[:20]}",
+                        f"Raw preview: {zt_output[:400]}",
+                    ],
+                    remediation="Restrict AXFR to authorized secondary nameservers only.",
+                    verified=True,
+                    verification={"method": "axfr_records_returned",
+                                  "record_count": len(record_lines),
+                                  "subdomain_count": len(subdomain_set)},
                 )
+                for name in subdomain_set:
+                    self.state.add_asset(
+                        "subdomain", f"sub:{name}", name,
+                        confidence="CONFIRMED",
+                        sources=["AXFR"],
+                    )
 
         self.log("Seed discovery complete.")
         self.state.complete_module(self.id)

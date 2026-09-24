@@ -17,8 +17,9 @@ CONFIDENCE_MULTIPLIER = {
 }
 
 
-def score_finding(severity: str, confidence: str, asset_keys: Optional[List[str]] = None,
-                  category: str = "") -> int:
+def score_finding(severity: str, confidence: str,
+                  asset_keys: Optional[List[str]] = None,
+                  category: str = "", verified: bool = False) -> int:
     """Return a stable 0-100 risk score from severity, confidence, and context."""
     sev = str(severity or "INFO").upper()
     conf = str(confidence or "TENTATIVE").upper()
@@ -34,8 +35,11 @@ def score_finding(severity: str, confidence: str, asset_keys: Optional[List[str]
     if any(term in category_l for term in ("credential", "exposure", "network")):
         score += 5
 
-    return max(0, min(100, round(score)))
+    # Verified findings get a modest boost — signal has been confirmed.
+    if verified:
+        score += 5
 
+    return max(0, min(100, round(score)))
 
 def score_label(score: int) -> str:
     if score >= 95:
