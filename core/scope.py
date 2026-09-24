@@ -1,4 +1,8 @@
-"""Scope enforcement for targets, hosts, IPs, and URLs."""
+"""Scope enforcement for targets, hosts, IPs, and URLs.
+
+Enforcement is OPT-IN. Default is disabled — all checks pass.
+Enable with `scope: {enforce: true}` in config.yaml.
+"""
 
 from __future__ import annotations
 
@@ -17,20 +21,25 @@ class ScopeDecision:
 
 
 class ScopeGuard:
-    """Allow/deny matcher with safe defaults around the target domain."""
+    """Allow/deny matcher. Permissive by default."""
 
     def __init__(self, target: str, config: Optional[dict] = None):
-        # Normalize target — extract hostname from URL if needed
         raw = (target or "").strip().lower().rstrip(".")
         self.target = self._normalize(raw) or raw
-        scope = (config or {}).get("target", {}).get("scope", [])
-        deny = (config or {}).get("target", {}).get("deny", [])
+        cfg = config or {}
+        self.enforce = bool(cfg.get("scope", {}).get("enforce", False))
+        scope = cfg.get("target", {}).get("scope", [])
+        deny = cfg.get("target", {}).get("deny", [])
 
         default_allow = [self.target, f"*.{self.target}"] if self.target else []
         self.allow_patterns = self._clean_patterns(scope) or default_allow
         self.deny_patterns = self._clean_patterns(deny)
 
     def check(self, value: str) -> ScopeDecision:
+        if not self.enforce:
+            host = self._normalize(value) or str(value)
+            return ScopeDecision(True, host, "scope enforcement disabled")
+
         host = self._normalize(value)
         if not host:
             return ScopeDecision(False, value, "empty or invalid scope value")
@@ -64,6 +73,12 @@ class ScopeGuard:
         raw = str(value or "").strip()
         if not raw:
             return ""
+        # IPv6 without brackets explodes urlparse — short-circuit it.
+        try:
+            ipaddress.ip_address(raw.strip("[]"))
+            return raw.strip("[]").lower()
+        except ValueError:
+            pass
         parsed = urlparse(raw if "://" in raw else f"//{raw}")
         host = parsed.hostname or raw.split("/", 1)[0]
         return host.strip().lower().rstrip(".")

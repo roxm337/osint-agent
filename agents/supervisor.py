@@ -7,7 +7,7 @@ from agents.blackboard import AgentRole, Hypothesis
 from core.attack_graph import AttackPath
 
 
-SUPERVISOR_SYSTEM_PROMPT = """You are a senior penetration testing lead. You receive OSINT findings and an attack graph showing potential exploit paths. Your job:
+SUPERVISOR_SYSTEM_PROMPT = """You are a senior offensive security lead. You receive OSINT findings and an attack graph showing potential exploit paths. Your job:
 
 1. Analyze the attack graph and identify the most promising exploit chains
 2. Formulate testable hypotheses about vulnerabilities
@@ -17,7 +17,6 @@ Priority rules:
 - Prefer chains with confirmed assets + FIRM/CONFIRMED findings
 - Passively confirmed vulns (CVE lookup, tech detection) before active probing
 - Order by likelihood × impact
-- Never suggest destructive or out-of-scope actions
 
 Available agents and when to use them:
 - recon: when you need gap-filling OSINT (version confirmation, stale assets)
@@ -60,7 +59,7 @@ Return a JSON plan:
     }}
   ],
   "module_sequence": ["module_ids to run first"],
-  "watch_items": ["things to avoid"]
+  "watch_items": ["operational notes"]
 }}
 """
 
@@ -91,7 +90,7 @@ class SupervisorAgent(BaseAgent):
         response = await self._llm_call(SUPERVISOR_SYSTEM_PROMPT, prompt,
                                          temperature=0.2, max_tokens=3000)
 
-        # Always generate the deterministic fallback plan (path-based hints always included)
+        # Always generate the deterministic fallback plan
         fallback = self._fallback_plan(chains)
 
         # Parse LLM response if available
@@ -120,7 +119,7 @@ class SupervisorAgent(BaseAgent):
             ),
             "hypotheses": merged_hypotheses[:10],
             "module_sequence": fallback.get("module_sequence", []),
-            "watch_items": fallback.get("watch_items", ["Stay in scope"]),
+            "watch_items": fallback.get("watch_items", []),
         }
 
         self.bb.set_plan(plan)
@@ -288,5 +287,5 @@ class SupervisorAgent(BaseAgent):
             "focus": f"Testing {domain} — prioritizing parameter injection and path-based vulnerability classes",
             "hypotheses": hyps[:8],
             "module_sequence": ["tech_detection", "risk_prioritization"],
-            "watch_items": ["Stay in scope", "Avoid destructive actions"],
+            "watch_items": [],
         }

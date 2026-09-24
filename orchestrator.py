@@ -48,22 +48,10 @@ class Orchestrator:
         self.config["target"]["raw_url"] = target
         self.config["target"]["mode"] = mode
         self.scope = ScopeGuard(self.domain, self.config)
-        self.scope.require(self.domain)
 
-        # Auth check
-        if mode == "active":
-            if not skip_auth_check:
-                print("\n⚠  Active mode requires authorization.")
-                print(f"   Target: {target}")
-                resp = input("   Confirm authorization (yes/no): ")
-                if resp.lower() not in ("yes", "y"):
-                    print("   Aborting.")
-                    sys.exit(1)
-            self.config["target"]["authorization"] = "confirmed"
-            self.config["detectability"]["allow_high"] = True
-        elif skip_auth_check:
-            # --skip-auth-check without --active: confirm auth but keep detectability passive
-            self.config["target"]["authorization"] = "confirmed"
+        # Authorization is implicit — no prompt, no gate.
+        self.config["target"]["authorization"] = "confirmed"
+        self.config["detectability"]["allow_high"] = True
 
         # State
         report_dir = self.output_dir / self.domain
@@ -80,13 +68,16 @@ class Orchestrator:
                 print(f"Warning: Could not load config: {e}")
         # Default config
         return {
-            "target": {"domain": "", "authorization": "pending", "mode": "passive"},
+            "target": {"domain": "", "authorization": "confirmed", "mode": "active"},
             "paths": {"output_dir": "reports", "state_dir": "reports/{target}/state"},
             "rate_limits": {"default": {"concurrent": 5, "per_minute": 60}},
-            "detectability": {"default": "low", "allow_high": False},
+            "detectability": {"default": "high", "allow_high": True},
+            "scope": {"enforce": False},
+            "risk_gate": {"enforce": False},
             "waf": {"max_bypass_attempts": 10, "backoff_seconds": 60,
                     "block_codes": [503, 429], "honeypot_codes": [500]},
-            "modules": {"auto_run": True, "skip_on_waf": True, "max_consecutive_empty": 5},
+            "modules": {"auto_run": True, "skip_on_waf": False,
+                        "max_consecutive_empty": 5},
             "wordlists": {"subdomains": [], "misconfig_paths": [], "wp_paths": [],
                           "bucket_prefixes": [""], "bucket_suffixes": [""],
                           "cloud_providers": {}},
@@ -127,11 +118,6 @@ class Orchestrator:
                 for dep_id in missing_deps:
                     if dep_id in module_ids:
                         await self._run_module(dep_id)
-
-            # Check auth requirement
-            if entry.get("requires_auth", False) and not self.config["detectability"]["allow_high"]:
-                self.state.skip_module(module_id, "requires auth (run with --active)")
-                continue
 
             # Run module
             await self._run_module(module_id)
@@ -185,11 +171,6 @@ class Orchestrator:
                     continue
                 if self.state.is_module_complete(module_id):
                     logger.info(f"  {module_id} already complete, skipping.")
-                    continue
-                entry = MODULE_REGISTRY[module_id]
-                if entry.get("requires_auth", False) and not self.config["detectability"]["allow_high"]:
-                    self.state.skip_module(module_id, "requires auth (run with --active)")
-                    logger.info(f"  Skipped {module_id}: requires auth (run with --active)")
                     continue
                 await self._run_module(module_id)
 
@@ -271,11 +252,6 @@ class Orchestrator:
             print(f"Unknown module: {module_id}")
             print(f"Available: {', '.join(MODULE_REGISTRY.keys())}")
             return
-        if entry.get("requires_auth", False) and not self.config["detectability"]["allow_high"]:
-            self.state.skip_module(module_id, "requires auth (run with --active)")
-            self.state.save()
-            print(f"Skipped {module_id}: requires auth (run with --active)")
-            return
         await self._run_module(module_id)
 
     async def _run_module(self, module_id: str):
@@ -354,7 +330,7 @@ Examples:
     parser.add_argument("-o", "--output", default="reports", help="Output directory")
     parser.add_argument("-c", "--config", default="config.yaml", help="Config file")
     parser.add_argument("--active", action="store_true",
-                        help="Enable active mode (port scans, etc.)")
+                        help="Enable active mode (accepted, no longer gates anything)")
     parser.add_argument("--module", help="Run a single module only")
     parser.add_argument("--mode", default="auto",
                         choices=["auto", "llm"],
@@ -369,17 +345,12 @@ Examples:
                         help="Autonomous multi-agent pentesting engagement")
     parser.add_argument("--phase", choices=["plan", "recon", "vuln", "exploit", "verify", "report"],
                         help="Run a single agent phase")
-    parser.add_argument("--roe", metavar="PATH",
-                        help="Rules of Engagement YAML file — required for --engage")
-    parser.add_argument("--engage", action="store_true",
-                        help="Execute the engagement. Without this the agent mode "
-                             "runs a dry-run (plan only, no actions executed)")
     parser.add_argument("--tools", action="store_true",
                         help="List available external tools")
     parser.add_argument("--install-tools", nargs="*",
                         help="Install missing external tools (optionally by category)")
     parser.add_argument("--skip-auth-check", action="store_true",
-                        help="Skip authorization confirmation")
+                        help="Accepted for backwards compatibility; no longer does anything")
 
     args = parser.parse_args()
 
@@ -438,34 +409,11 @@ Examples:
     )
 
     if args.agent or args.phase:
-        from agents.agent_supervisor import AgentSupervisor, EngagementGateError
-        from core.roe import load_roe, ROEError
-
-        roe = None
-        if args.roe:
-            try:
-                roe = load_roe(args.roe)
-            except ROEError as exc:
-                print(f"\n✗ Invalid ROE: {exc}\n")
-                sys.exit(1)
-            # The ROE is the authoritative boundary — the CLI target must be inside it.
-            try:
-                from core.scope import ScopeGuard
-                scope_check = ScopeGuard(orchestrator.domain, roe.enforce(orchestrator.config))
-                scope_check.require(orchestrator.domain)
-            except ValueError as exc:
-                print(f"\n✗ Target {orchestrator.domain} is outside the ROE scope: {exc}\n")
-                sys.exit(1)
-
-        if args.engage and roe is None:
-            print("\n✗ Engaged mode requires an ROE file. Provide one with --roe <path>.\n")
-            sys.exit(1)
-
+        from agents.agent_supervisor import AgentSupervisor
         # Inject the raw target URL so agents can target specific paths
         orchestrator.config["target"]["raw_url"] = args.target
-        if mode == "active" or args.skip_auth_check:
-            orchestrator.config["target"]["authorization"] = "confirmed"
-            orchestrator.config["detectability"]["allow_high"] = True
+        orchestrator.config["target"]["authorization"] = "confirmed"
+        orchestrator.config["detectability"]["allow_high"] = True
 
         # Seed the raw URL as an asset + parameters for attack graph
         if "?" in args.target and "=" in args.target:
@@ -488,22 +436,13 @@ Examples:
                 confidence="CONFIRMED", sources=["user_target"],
             )
 
-        supervisor = AgentSupervisor(orchestrator.state, orchestrator.config,
-                                     roe=roe, engage=args.engage)
+        supervisor = AgentSupervisor(orchestrator.state, orchestrator.config)
 
         if args.phase:
-            try:
-                result = await supervisor.run_single_phase(args.phase)
-            except EngagementGateError as exc:
-                print(f"\n✗ {exc}\n")
-                sys.exit(1)
+            result = await supervisor.run_single_phase(args.phase)
             print(f"\nPhase '{args.phase}' complete.")
         else:
-            try:
-                result = await supervisor.run_full_engagement()
-            except EngagementGateError as exc:
-                print(f"\n✗ Engagement aborted: {exc}\n")
-                sys.exit(1)
+            result = await supervisor.run_full_engagement()
         return
 
     if args.pentest:

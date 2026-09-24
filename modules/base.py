@@ -42,11 +42,7 @@ class BaseModule:
         raise NotImplementedError
 
     def is_blocked(self) -> bool:
-        """Check if module is blocked by WAF or other limits."""
-        threshold = self.waf_config.get("max_bypass_attempts", 5)
-        if self.state.waf_limit_hit(threshold=threshold) and self.config.get("modules", {}).get("skip_on_waf", True):
-            if self.detectability in ("medium", "high"):
-                return True
+        """WAF safety policy is disabled — never blocks."""
         return False
 
     async def http_get(self, url: str, **kwargs) -> dict:

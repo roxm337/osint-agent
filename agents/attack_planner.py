@@ -1,4 +1,4 @@
-"""LLM-assisted authorized testing plan generation."""
+"""LLM-assisted offensive testing plan generation."""
 
 from __future__ import annotations
 
@@ -13,25 +13,21 @@ from agents import get_llm_config
 logger = logging.getLogger("osint-agent")
 
 
-SYSTEM_PROMPT = """You are an authorized bug bounty testing planner.
+SYSTEM_PROMPT = """You are an authorized offensive security planner.
 
-You receive an OSINT report bundle for a target that the operator is authorized
-to assess. Produce a ranked, practical testing plan that helps find valid bugs
-while staying inside scope.
+You receive an OSINT report bundle for a target. Produce a ranked, practical
+testing plan that maps the most promising paths to impact.
 
 Rules:
-- Keep recommendations scoped to the target assets and evidence provided.
-- Prefer non-destructive validation and proof-of-concept checks.
-- Do not suggest credential theft, persistence, destructive actions, malware,
-  data exfiltration, denial-of-service, phishing, or bypassing authorization.
-- Do not provide exploit payloads or step-by-step abuse instructions.
-- Focus on hypotheses, why they are likely, what module or safe validation
-  should run next, what evidence would confirm it, and what risk it might prove.
+- Base every recommendation on the assets and evidence provided.
+- Prefer hypotheses that lead to the highest-impact finding in the fewest steps.
+- For each hypothesis, state why it is likely, what action or module runs next,
+  what evidence confirms it, and what impact it proves.
 - Return valid JSON only.
 """
 
 
-USER_PROMPT = """Build an authorized testing plan from this OSINT bundle.
+USER_PROMPT = """Build an offensive testing plan from this OSINT bundle.
 
 Return JSON with this shape:
 {
@@ -44,13 +40,12 @@ Return JSON with this shape:
       "impact": "critical|high|medium|low|info",
       "why": "evidence-based reasoning",
       "recommended_module": "module_id or manual_review",
-      "safe_validation": "bounded validation approach without exploit payloads",
-      "confirming_evidence": "what would prove it",
-      "scope_guardrails": "scope and safety limits"
+      "validation": "validation approach",
+      "confirming_evidence": "what would prove it"
     }
   ],
   "module_sequence": ["module_id", "module_id"],
-  "watch_items": ["thing to monitor or avoid"]
+  "watch_items": ["operational note"]
 }
 
 OSINT bundle:
@@ -59,7 +54,7 @@ OSINT bundle:
 
 
 class AttackPlanner:
-    """Generate a ranked authorized testing plan from report/state context."""
+    """Generate a ranked offensive testing plan from report/state context."""
 
     def __init__(self, config: dict):
         self.config = config
@@ -110,9 +105,8 @@ def fallback_plan(bundle: dict) -> dict:
                 f"{finding.get('risk_score', 0)} and category {finding.get('category', '')}."
             ),
             "recommended_module": _module_for_category(str(finding.get("category", ""))),
-            "safe_validation": "Reproduce the observation with rate-limited, in-scope checks and capture minimal proof.",
-            "confirming_evidence": "Fresh evidence showing the same condition on an in-scope asset.",
-            "scope_guardrails": "Do not access third-party systems, user data, or destructive functionality.",
+            "validation": "Reproduce the observation with rate-limited checks and capture minimal proof.",
+            "confirming_evidence": "Fresh evidence showing the same condition on a live asset.",
         })
 
     if counts.get("api_endpoint") or counts.get("url"):
@@ -123,9 +117,8 @@ def fallback_plan(bundle: dict) -> dict:
             "impact": "high",
             "why": "OSINT discovered API-like URLs or historical endpoints worth structured review.",
             "recommended_module": "parameter_discovery",
-            "safe_validation": "Map parameters and compare unauthenticated responses without modifying data.",
+            "validation": "Map parameters and compare unauthenticated responses.",
             "confirming_evidence": "Endpoints with sensitive metadata, weak auth boundaries, or reflected parameters.",
-            "scope_guardrails": "Avoid brute force, data mutation, account takeover attempts, or high-volume probing.",
         })
 
     if counts.get("webapp") or counts.get("js_file"):
@@ -136,9 +129,8 @@ def fallback_plan(bundle: dict) -> dict:
             "impact": "high",
             "why": "Web applications and JavaScript assets often expose route maps, keys, and feature flags.",
             "recommended_module": "js_analysis",
-            "safe_validation": "Review discovered scripts and validate only non-sensitive metadata or disabled keys.",
-            "confirming_evidence": "In-scope routes, tokens, or references that can be responsibly reported.",
-            "scope_guardrails": "Do not use discovered secrets against live services unless the program explicitly allows validation.",
+            "validation": "Review discovered scripts and validate any non-sensitive metadata or disabled keys.",
+            "confirming_evidence": "Live routes, tokens, or references that can be responsibly reported.",
         })
 
     if not hypotheses:
@@ -149,9 +141,8 @@ def fallback_plan(bundle: dict) -> dict:
             "impact": "medium",
             "why": "No strong high-risk signal exists yet, so coverage gaps are the best next opportunity.",
             "recommended_module": "deep_crawl",
-            "safe_validation": "Expand in-scope URL coverage with conservative crawl limits.",
+            "validation": "Expand URL coverage with conservative crawl limits.",
             "confirming_evidence": "New endpoints, parameters, technologies, or misconfiguration candidates.",
-            "scope_guardrails": "Keep request rate low and stop on WAF or block signals.",
         })
 
     sequence = []
@@ -162,7 +153,7 @@ def fallback_plan(bundle: dict) -> dict:
     if "risk_prioritization" not in sequence:
         sequence.append("risk_prioritization")
 
-    focus = "Prioritize existing high-confidence findings first, then expand API, JavaScript, and webapp coverage with bounded validation."
+    focus = "Prioritize existing high-confidence findings first, then expand API, JavaScript, and webapp coverage."
     if patterns:
         focus += f" Notable pattern: {patterns[0].get('title', 'cross-asset signal')}."
 
@@ -171,9 +162,7 @@ def fallback_plan(bundle: dict) -> dict:
         "top_hypotheses": hypotheses[:8],
         "module_sequence": sequence[:8],
         "watch_items": [
-            "Stay inside the configured target scope.",
-            "Avoid destructive tests, data modification, and high-volume probes unless explicitly authorized.",
-            "Capture minimal reproducible evidence for each confirmed issue.",
+            "Capture reproducible evidence for each confirmed issue.",
         ],
     }
 
@@ -196,9 +185,8 @@ def render_attack_plan(plan: dict, target: str) -> str:
             f"- **Impact:** {item.get('impact', '-')}",
             f"- **Why:** {item.get('why', '-')}",
             f"- **Recommended Module:** `{item.get('recommended_module', 'manual_review')}`",
-            f"- **Safe Validation:** {item.get('safe_validation', '-')}",
+            f"- **Validation:** {item.get('validation', '-')}",
             f"- **Confirming Evidence:** {item.get('confirming_evidence', '-')}",
-            f"- **Scope Guardrails:** {item.get('scope_guardrails', '-')}",
             "",
         ])
 
