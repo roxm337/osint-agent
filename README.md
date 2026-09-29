@@ -2,10 +2,10 @@
 
 **LLM-orchestrated OSINT & bug-bounty reconnaissance pipeline** — maps a target's
 external attack surface, enriches discovered assets, records evidence, prioritizes
-findings, and generates reports or authorized testing plans.
+findings, and generates reports or attack plans.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
-![Tests](https://img.shields.io/badge/tests-98%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-101%20passing-brightgreen)
 ![Status](https://img.shields.io/badge/status-active%20development-orange)
 
 ---
@@ -16,17 +16,9 @@ This is an **offensive security tool**. Reconnaissance, scanning, and active tes
 against systems you do not own or lack **explicit written authorization** to test may
 be illegal in your jurisdiction.
 
-The framework is built to enforce this rather than assume it:
-
-- **Scope enforcement** — every host/URL is checked against an allow/deny scope before
-  any request (`core/scope.py`).
-- **Authorization gate** — active and high-detectability modules refuse to run unless
-  authorization is explicitly confirmed (`--active`).
-- **Risk tiers** — actions are classified `SAFE → LOW → MEDIUM → HIGH → DESTRUCTIVE`;
-  destructive actions are blocked by default (`core/risk_gate.py`).
-
-You are responsible for operating within the law and within the rules of engagement of
-your target's bug-bounty program or pentest contract.
+The framework ships **no scope enforcement, authorization gate, or risk-tier blocking**.
+You are solely responsible for operating within the law and within the rules of
+engagement of your target's bug-bounty program or pentest contract.
 
 ---
 
@@ -35,9 +27,9 @@ your target's bug-bounty program or pentest contract.
 - **45+ modules** across a 6-stage pipeline: seed → asset expansion → enrichment →
   exposure analysis → active vulnerability testing → prioritization & reporting.
 - **Passive by default.** Active/high-detectability modules (port scan, nuclei, XSS/SQLi
-  validation, content discovery) only run with explicit authorization.
+  validation, content discovery) run with `--active`.
 - **LLM orchestration mode** — an LLM chooses which module to run next and generates a
-  structured, authorized testing plan (with deterministic fallback when no key is set).
+  structured testing plan (with deterministic fallback when no key is set).
 - **Multi-agent autonomous layer** *(in progress)* — supervisor, blackboard coordination,
   and specialized recon/vuln/exploit/verify/report agents over a tiered action registry.
 - **Typed asset graph + evidence chain** — assets, edges, findings, and evidence are
@@ -60,9 +52,9 @@ your target's bug-bounty program or pentest contract.
    ┌─────────────┼─────────────┐         ▼
    ▼             ▼             ▼     agents/*  +  actions/registry.py
  modules/*    core/*        state/    (supervisor · blackboard ·
- recon &      scope ·       manager    specialized agents · risk-tiered
- exposure     risk gate ·   (assets,   action registry)
- checks       scoring ·     findings,
+ recon &      budget ·      manager    specialized agents · action
+ exposure     scoring ·     (assets,   registry)
+ checks       audit ·       findings,
               reporting     evidence)
    │             │             │
    └──────► tools/* (async HTTP/DNS/WHOIS wrappers, external tool adapters)
@@ -116,8 +108,8 @@ cp config.example.yaml config.yaml   # runtime config
 cp .env.example .env                 # API keys / LLM credentials
 ```
 
-- **`config.yaml`** — target scope, run mode, rate limits, wordlists, scoring weights,
-  detectability policy, and optional inline API keys.
+- **`config.yaml`** — target, run mode, rate limits, wordlists, scoring weights,
+  detectability metadata, and optional inline API keys.
 - **`.env`** — API keys resolved as environment fallbacks (VirusTotal, Shodan, Hunter,
   SecurityTrails, HIBP, URLScan, …) and LLM credentials.
 
@@ -131,22 +123,22 @@ environment fallbacks. All keys are optional — modules that need a missing key
 ### CLI
 
 ```bash
-# Passive reconnaissance (default, safe)
+# Passive reconnaissance (default)
 python orchestrator.py -t example.com
 
 # LLM-guided module selection
 python orchestrator.py -t example.com --mode llm
 
-# Generate an authorized testing plan
+# Generate a testing plan
 python orchestrator.py -t example.com --module attack_planner
 
-# Active recon (port scan + high-detectability probes) — requires authorization
+# Active recon (port scan + high-detectability probes)
 python orchestrator.py -t example.com --active
 
 # Active vulnerability scanning pass
 python orchestrator.py -t example.com --active --pentest
 
-# Autonomous multi-agent run (optionally scoped to a phase)
+# Autonomous multi-agent run (optionally limited to a phase)
 python orchestrator.py -t example.com --agent --phase recon
 
 # Utilities
@@ -158,7 +150,7 @@ python orchestrator.py --tools
 **Key flags:** `-t/--target` (required), `-o/--output` (default `reports`),
 `-c/--config` (default `config.yaml`), `--mode {auto,llm}`, `--module <id>`,
 `--active`, `--pentest`, `--agent`, `--phase {plan,recon,vuln,exploit,verify,report}`,
-`--list-modules`, `--list-actions`, `--tools`, `--install-tools`, `--skip-auth-check`.
+`--list-modules`, `--list-actions`, `--tools`, `--install-tools`.
 
 ### GUI
 
@@ -173,30 +165,30 @@ identical state and config contracts.
 
 ## Pipeline stages
 
-| Stage | Focus | Example modules | Auth required |
+| Stage | Focus | Example modules | Detectability |
 |---|---|---|:---:|
-| 1 · Seed | Seed target assets | `seed_discovery` | no |
-| 2 · Asset expansion | Subdomains, history, contacts | `subdomain_enum`, `wayback_machine`, `asn_expansion` | no |
-| 3 · Enrichment | Tech, TLS, mail, threat intel, CVEs | `tech_detection`, `tls_audit`, `exploit_lookup`, `port_scan` | port scan only |
-| 4 · Exposure analysis | APIs, misconfig, secrets, takeover | `rest_api_audit`, `graphql_audit`, `misconfig_probes`, `dns_takeover` | no |
-| 5 · Active testing | Authorized vuln validation | `nuclei_scan`, `xss_scan`, `sqli_scan`, `content_discovery` | **yes** |
-| 6 · Prioritization & reporting | Score, plan, report, submit | `risk_prioritization`, `attack_planner`, `reporting` | no |
+| 1 · Seed | Seed target assets | `seed_discovery` | low |
+| 2 · Asset expansion | Subdomains, history, contacts | `subdomain_enum`, `wayback_machine`, `asn_expansion` | low |
+| 3 · Enrichment | Tech, TLS, mail, threat intel, CVEs | `tech_detection`, `tls_audit`, `exploit_lookup`, `port_scan` | low–high |
+| 4 · Exposure analysis | APIs, misconfig, secrets, takeover | `rest_api_audit`, `graphql_audit`, `misconfig_probes`, `dns_takeover` | low–medium |
+| 5 · Active testing | Vuln validation | `nuclei_scan`, `xss_scan`, `sqli_scan`, `content_discovery` | **high** |
+| 6 · Prioritization & reporting | Score, plan, report, submit | `risk_prioritization`, `attack_planner`, `reporting` | low |
 
 Full stage/detectability matrix and data contracts are documented in the internal
 project map.
 
 ---
 
-## Safety model
+## Run model
 
-Three independent controls govern what runs:
+Modules carry `detectability` (`low` / `medium` / `high`) and `active` as
+**descriptive metadata** for prioritization and reporting. Neither blocks execution —
+there is no scope filter, no authorization prompt, and no risk-tier gate anywhere in the
+request path. `--active` selects the active-stage modules; it no longer unlocks anything.
 
-1. **Detectability** (`low` / `medium` / `high`) per module.
-2. **`requires_auth`** — high-impact modules require confirmed authorization.
-3. **`detectability.allow_high`** — high-detectability modules run only in active mode.
-
-`BaseModule.http_get()` additionally enforces target scope before every request and
-records WAF block/allow signals; medium/high modules can auto-skip on repeated WAF blocks.
+`BaseModule.http_get()` records WAF block/allow signals for reporting, and
+`modules.max_consecutive_empty` caps unproductive probing per module — an efficiency
+knob, not a safety control.
 
 ---
 
@@ -208,9 +200,9 @@ python -m pytest                              # full suite (GUI tests need PySid
 python -m pytest --ignore=tests/test_gui_app.py --ignore=tests/test_gui_graph.py
 ```
 
-The suite covers core state, scope, scoring, evidence, external-tool parsing, per-stage
-modules, the attack planner, the risk gate, and the action registry. **98 tests pass**
-without the GUI extras.
+The suite covers core state, scoring, evidence, external-tool parsing, per-stage
+modules, the attack planner, and the action registry. **101 tests pass** including the
+GUI extras.
 
 ---
 
@@ -222,11 +214,11 @@ config.example.yaml  runtime config template (copy to config.yaml)
 .env.example         API-key / LLM credential template
 agents/              autonomous multi-agent layer (supervisor, blackboard, agents)
 actions/             tiered offensive action registry (web/api/auth/cloud/verify)
-core/                scope, risk gate, scoring, prioritization, reporting, keyvault
+core/                scoring, prioritization, reporting, keyvault, budget, audit log
 modules/             45+ recon / enrichment / exposure / active modules
 state/               persistent per-target asset graph, findings, evidence store
 tools/               async HTTP/DNS/WHOIS wrappers + external tool adapters
-payloads/            payload catalogs for authorized active checks
+payloads/            payload catalogs for active checks
 gui/                 PySide6 desktop application
 tests/               pytest suite
 ```
@@ -236,16 +228,18 @@ tests/               pytest suite
 ## Design notes
 
 The distinguishing element is not the individual recon checks (those are table stakes),
-but the **governance and orchestration layer around them**:
+but the **orchestration layer around them**:
 
-- A **deterministic risk gate** that classifies every action and enforces rules of
-  engagement before execution.
-- **Scope as a first-class primitive**, enforced at the request layer, not merely advised.
-- **LLM-guided, then multi-agent, orchestration** that plans and sequences actions while
-  remaining inside the authorization and detectability envelope.
+- A **typed action registry** where every capability is a declared, catalogued action
+  with required parameters, risk metadata, and a timeout.
+- **LLM-guided, then multi-agent, orchestration** that plans, sequences, and executes
+  actions, with a supervisor, blackboard, and verification agents confirming findings.
+- A **tamper-evident audit log** (SHA-256 hash chain) recording every plan, action, and
+  result, plus a typed asset graph with evidence references.
 
-Together these make the tool an **auditable, policy-constrained autonomous system**
-rather than a fire-and-forget scanner.
+Together these make the tool an **auditable autonomous system** rather than a
+fire-and-forget scanner. Execution is unconstrained by design — targeting discipline
+is the operator's responsibility.
 
 ---
 
