@@ -234,6 +234,14 @@ modules:
       - "__proto__"
       - "constructor.prototype"
 
+  cors_audit:
+    enabled: true
+
+    # Endpoints to send the probe Origin at. Left empty, the endpoints
+    # recon already recorded are used, then a short list of common shapes.
+    endpoints: []
+    max_endpoints: 20
+
   sqli_scan:
     # Hand sqlmap an interactsh server so blind injections get proof instead of
     # a "the response looked the same either way" FIRM. Requires the top-level
