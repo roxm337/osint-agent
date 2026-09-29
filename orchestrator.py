@@ -510,6 +510,7 @@ Examples:
                 else:
                     await orchestrator.run_all()
             await orchestrator.run_pentest()
+        elif args.module:
             await orchestrator.run_module(args.module)
         elif mode == "llm":
             await orchestrator.run_llm()
