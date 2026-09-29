@@ -260,6 +260,20 @@ modules:
     # shapes, so this is the real bound on request volume.
     max_targets: 40
 
+  cms_deep_scan:
+    enabled: true
+
+    # How many webapps to hand to the CMS scanners. These are slow (WPScan and
+    # droopescan run to five minutes each), so the bound matters.
+    max_targets: 5
+
+    # Results are graded per component, not merged into one count. A disclosed
+    # version lands as INFO; a known CVE lands as HIGH, or CRITICAL when CISA
+    # lists it as exploited; a keyword-matched line that names no component is
+    # LOW/TENTATIVE, because a scanner mentioning "/administrator/" is not a
+    # finding. Confirm a version match against the running build before
+    # treating any of it as confirmed.
+
   cors_audit:
     enabled: true
 
