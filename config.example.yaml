@@ -179,6 +179,34 @@ modules:
       radius: 3    # how far from each known reference to try
       max: 20      # hard ceiling on requests
 
+  mass_assignment:
+    # Writes to the configured account, so it is off unless you turn it on.
+    # It only ever writes to the caller's own object, never anyone else's.
+    enabled: false
+
+    # Where to look for the caller's own record. Left empty it tries the
+    # usual /api/me, /api/profile, ... shapes. Set it when recon already found
+    # the object URL — that URL is also used as the write target.
+    endpoints: []
+    #   - "https://api.example.com/users/me"
+
+    # Optional: a different URL for the update, e.g. when the read endpoint is
+    # read-only. Accepts a full URL or a path.
+    # write_endpoint: "https://api.example.com/users/me"
+
+    method: PATCH      # PATCH, PUT or POST
+
+    # Fields to try. Defaults to a list of privilege-bearing names (role,
+    # is_admin, credits, ...). Anything the account can already see is skipped.
+    fields: []
+    #   - "role"
+    #   - "is_admin"
+
+    # Value sent for each field, and the value written back afterwards. An API
+    # that binds arbitrary fields is almost always doing a partial update, so
+    # the reset has to name the field — omitting it would leave the probe in.
+    probe_type: bool   # bool | int | string
+
   sqli_scan:
     # Hand sqlmap an interactsh server so blind injections get proof instead of
     # a "the response looked the same either way" FIRM. Requires the top-level
