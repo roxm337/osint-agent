@@ -60,7 +60,7 @@ def _chain(action_id=None, edge_type="exploit", url="https://example.test/s?q=1"
 
 
 def _register(action_id, risk, success=True, confidence="CONFIRMED",
-              evidence=None, error="", raises=False):
+              evidence=None, error="", raises=False, requires=("url",)):
     """Register a fake action and return the call log it appends to."""
     calls = []
 
@@ -78,7 +78,7 @@ def _register(action_id, risk, success=True, confidence="CONFIRMED",
     ActionRegistry.register(
         ActionMeta(id=action_id, risk=risk, detectability="low",
                    description="fake", category="test",
-                   requires=[], produces="Finding"),
+                   requires=list(requires), produces="Finding"),
         fn,
     )
     return calls
@@ -287,6 +287,182 @@ def test_record_action_is_called():
     ex = ChainExecutor(_state(), {}, budget=budget)
     asyncio_run(ex.execute([_chain(action_id="test.probe")]))
     assert budget.actions == 1
+
+
+# --- param preflight: never look clean because we were not armed ---------
+
+def test_sqli_action_gets_the_param_name_from_a_parameter_node():
+    chain = FakeChain(
+        nodes={
+            "n1": AttackNode(id="n1", label="id", node_type="parameter",
+                             confidence="FIRM", attrs={"url": "https://example.test/s"}),
+            "n2": _node("n2", "vuln", category="SQL Injection"),
+        },
+        edges=[AttackEdge(source_id="n1", target_id="n2", edge_type="exploit",
+                          likelihood=0.5, impact=0.9, action_id="web.sqli.detect")],
+    )
+    ex = ChainExecutor(_state(), {})
+    planned = ex.plan(chain)
+    assert len(planned) == 1, "a parameter node should arm the SQL action"
+    assert planned[0].params["param"] == "id"
+    assert planned[0].params["url"] == "https://example.test/s"
+
+
+def test_action_needing_a_param_is_not_planned_without_one():
+    chain = FakeChain(
+        nodes={"n1": _node("n1", "url", url="https://example.test/s"),
+               "n2": _node("n2", "vuln", category="SQL Injection")},
+        edges=[AttackEdge(source_id="n1", target_id="n2", edge_type="exploit",
+                          likelihood=0.5, impact=0.9, action_id="web.sqli.detect")],
+    )
+    ex = ChainExecutor(_state(), {})
+    assert ex.plan(chain) == [], "should not plan an action it cannot arm"
+    assert ex.unarmable, "the unarmable edge must be reported"
+    assert "param" in ex.unarmable[0].detail
+
+
+def test_unarmable_edge_never_becomes_a_clean_run():
+    """A KeyError inside the action would look identical to 'not vulnerable'.
+    Preflight is what stops the executor manufacturing a false negative."""
+    chain = FakeChain(
+        nodes={"n1": _node("n1", "url", url="https://example.test/s"),
+               "n2": _node("n2", "vuln", category="SQL Injection")},
+        edges=[AttackEdge(source_id="n1", target_id="n2", edge_type="exploit",
+                          likelihood=0.5, impact=0.9, action_id="web.sqli.detect")],
+    )
+    state = _state()
+    ex = ChainExecutor(state, {})
+    report = asyncio_run(ex.execute([chain]))
+    assert report.proven == 0
+    assert _findings(state) == []
+    assert report.unarmable, "must not look like a clean bill of health"
+
+
+def test_param_is_read_from_the_url_query_when_there_is_no_parameter_node():
+    meta, _ = ActionRegistry.get("web.sqli.detect")
+    chain = FakeChain(
+        nodes={"n1": _node("n1", "url", url="https://example.test/s?user=bob"),
+               "n2": _node("n2", "vuln", category="SQL Injection")},
+        edges=[AttackEdge(source_id="n1", target_id="n2", edge_type="exploit",
+                          likelihood=0.5, impact=0.9, action_id="web.sqli.detect")],
+    )
+    ex = ChainExecutor(_state(), {})
+    planned = ex.plan(chain)
+    assert len(planned) == 1
+    assert planned[0].params["param"] == "user"
+
+
+def test_two_url_oracle_gets_a_derived_baseline():
+    chain = FakeChain(
+        nodes={"n1": _node("n1", "url", url="https://example.test/s?user=bob"),
+               "n2": _node("n2", "goal")},
+        edges=[AttackEdge(source_id="n1", target_id="n2", edge_type="extract",
+                          likelihood=0.5, impact=0.5, action_id="verify.differential")],
+    )
+    ex = ChainExecutor(_state(), {})
+    planned = ex.plan(chain)
+    assert len(planned) == 1
+    assert "user=1" in planned[0].params["baseline_url"]
+    assert planned[0].params["test_url"] != planned[0].params["baseline_url"]
+
+
+def test_falls_back_to_an_armable_action_rather_than_giving_up():
+    """verify.differential needs two URLs. On a plain URL it cannot be armed, so
+    the executor must fall through to verify.reproducible, which only needs one.
+    Picking the first action that merely exists leaves the edge unproven."""
+    chain = FakeChain(
+        nodes={"n1": _node("n1", "url", url="https://example.test/robots.txt"),
+               "n2": _node("n2", "goal")},
+        edges=[AttackEdge(source_id="n1", target_id="n2", edge_type="extract",
+                          likelihood=0.5, impact=0.5, action_id="")],
+    )
+    ex = ChainExecutor(_state(), {})
+    planned = ex.plan(chain)
+    assert len(planned) == 1, "should fall back to an action it can arm"
+    assert planned[0].action_id == "verify.reproducible"
+    assert ex.unarmable == []
+
+
+def test_missing_url_is_named_in_the_unarmable_reason():
+    chain = FakeChain(
+        nodes={"n1": _node("n1", "asset", attrs={}), "n2": _node("n2", "goal")},
+        edges=[AttackEdge(source_id="n1", target_id="n2", edge_type="extract",
+                          likelihood=0.5, impact=0.5, action_id="")],
+    )
+    ex = ChainExecutor(_state(), {})
+    assert ex.plan(chain) == []
+    assert ex.unarmable
+    assert "url" in ex.unarmable[0].detail, \
+        "the operator must be told which input was missing"
+
+
+def test_token_action_falls_back_when_graph_has_no_token():
+    """auth.jwt.none_alg is the stronger proof but needs a token the graph does
+    not have. Rather than dropping the edge, fall back to auth.jwt.detect,
+    which only needs a URL, so the edge is still examined."""
+    chain = FakeChain(
+        nodes={"n1": _node("n1", "url", url="https://example.test/"),
+               "n2": _node("n2", "goal")},
+        edges=[AttackEdge(source_id="n1", target_id="n2", edge_type="authenticate",
+                          likelihood=0.5, impact=0.8, action_id="")],
+    )
+    ex = ChainExecutor(_state(), {})
+    planned = ex.plan(chain)
+    assert [p.action_id for p in planned] == ["auth.jwt.detect"]
+    assert ex.unarmable == []
+
+
+def test_authenticate_edge_declaring_a_token_action_says_so_when_unarmable():
+    chain = FakeChain(
+        nodes={"n1": _node("n1", "url", url="https://example.test/"),
+               "n2": _node("n2", "goal")},
+        edges=[AttackEdge(source_id="n1", target_id="n2", edge_type="authenticate",
+                          likelihood=0.5, impact=0.8, action_id="auth.jwt.none_alg")],
+    )
+    ex = ChainExecutor(_state(), {})
+    planned = ex.plan(chain)
+    assert planned[0].action_id == "auth.jwt.detect", \
+        "the token action cannot run, so the weaker one should"
+    assert "auth.jwt.none_alg" not in [p.action_id for p in planned]
+
+
+def test_token_action_arms_when_the_graph_has_one():
+    chain = FakeChain(
+        nodes={"n1": AttackNode(id="n1", label="tok", node_type="secret",
+                               confidence="FIRM",
+                               attrs={"url": "https://example.test/",
+                                      "token": "eyJhbGciOiJub25lIn0.e30."}),
+               "n2": _node("n2", "goal")},
+        edges=[AttackEdge(source_id="n1", target_id="n2", edge_type="authenticate",
+                          likelihood=0.5, impact=0.8, action_id="auth.jwt.none_alg")],
+    )
+    ex = ChainExecutor(_state(), {})
+    planned = ex.plan(chain)
+    assert len(planned) == 1
+    assert planned[0].params["token"].startswith("eyJ")
+
+
+def test_every_required_param_is_present_for_each_armable_action():
+    """Cross-check the whole mapping: anything we do plan must be fully armed."""
+    cases = {
+        "web.sqli.detect": ("https://example.test/s?user=bob", "SQL Injection"),
+        "web.ssrf.oob_detect": ("https://example.test/s?url=x", "SSRF"),
+        "verify.reproducible": ("https://example.test/s", "Info Disclosure"),
+    }
+    for action_id, (url, category) in cases.items():
+        chain = FakeChain(
+            nodes={"n1": _node("n1", "url", url=url),
+                   "n2": _node("n2", "vuln", category=category)},
+            edges=[AttackEdge(source_id="n1", target_id="n2",
+                              edge_type="exploit", likelihood=0.5, impact=0.8,
+                              action_id=action_id)],
+        )
+        planned = ChainExecutor(_state(), {}).plan(chain)
+        assert planned, f"{action_id} should be armable from a plain URL"
+        required = ActionRegistry.get(action_id)[0].requires
+        for name in required:
+            assert planned[0].params.get(name), \
+                f"{action_id} planned without required param {name}"
 
 
 # --- wiring: pentest mode must be off unless asked ----------------------

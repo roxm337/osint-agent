@@ -269,6 +269,11 @@ class Orchestrator:
             print(f"    BLOCKED {outcome.action_id}: {outcome.detail}")
         for outcome in report.skipped:
             print(f"    skip    {outcome.action_id}: {outcome.detail}")
+        for outcome in report.unarmable:
+            print(f"    NO ARM  {outcome.action_id}: {outcome.detail}")
+        if report.unarmable:
+            print(f"    ({len(report.unarmable)} edge(s) had an action but not "
+                  "enough data to run it — coverage was incomplete, not clean.)")
         print()
         return report
 

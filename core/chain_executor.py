@@ -40,9 +40,11 @@ while a plausible one is not.
 import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from urllib.parse import parse_qsl, urlparse
 
 from actions.registry import ActionRegistry, RiskLevel
 from core.attack_graph import AttackEdge
+from core.validators import inject_param
 
 RISK_ORDER = [RiskLevel.SAFE, RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH,
               RiskLevel.DESTRUCTIVE]
@@ -59,7 +61,12 @@ def risk_allows(action_risk: str, ceiling: RiskLevel) -> bool:
 
 
 # Which action can prove which kind of edge. Ordered by preference: the first
-# registered action that exists and is under the ceiling wins.
+# registered action that exists, is under the ceiling, and whose required
+# params we can actually satisfy wins.
+#
+# Note verify.differential is deliberately not first for `extract`: it needs
+# both baseline_url and test_url, which the graph does not supply, so listing
+# it first made every extract edge fail on a missing param.
 EDGE_ACTIONS: dict[str, list[str]] = {
     "exploit": [
         "web.sqli.detect",
@@ -67,14 +74,15 @@ EDGE_ACTIONS: dict[str, list[str]] = {
         "web.xss.reflected",
     ],
     "pivot": [
-        "web.ssrf.cloud_metadata",
         "web.ssrf.oob_detect",
+        "web.ssrf.cloud_metadata",
     ],
     "extract": [
-        "verify.differential",
         "verify.reproducible",
+        "verify.composite_oracle",
     ],
     "authenticate": [
+        "auth.jwt.none_alg",
         "auth.jwt.detect",
     ],
 }
@@ -102,6 +110,7 @@ class PlannedEdge:
     risk: str
     url: str
     reason: str = ""
+    params: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -122,14 +131,18 @@ class ExecutionReport:
     ran: list[EdgeOutcome] = field(default_factory=list)
     blocked: list[EdgeOutcome] = field(default_factory=list)
     skipped: list[EdgeOutcome] = field(default_factory=list)
+    unarmable: list[EdgeOutcome] = field(default_factory=list)
 
     @property
     def proven(self) -> int:
         return sum(1 for o in self.ran if o.finding_id)
 
     def summary(self) -> str:
-        return (f"{self.proven} proven, {len(self.blocked)} blocked by risk, "
-                f"{len(self.skipped)} skipped")
+        parts = [f"{self.proven} proven", f"{len(self.blocked)} blocked by risk",
+                 f"{len(self.skipped)} skipped"]
+        if self.unarmable:
+            parts.append(f"{len(self.unarmable)} unarmable")
+        return ", ".join(parts)
 
 
 class ChainExecutor:
@@ -146,38 +159,144 @@ class ChainExecutor:
         self.max_risk = max_risk
         self.max_actions = max(0, int(max_actions))
         self._used = 0
+        # Edges we recognised but could not arm, so the operator can see that
+        # coverage was limited instead of assuming the run was exhaustive.
+        self.unarmable: list[EdgeOutcome] = []
 
     # ── planning ──────────────────────────────────────────────────
 
     def plan(self, chain) -> list[PlannedEdge]:
-        """Choose, for each edge in a chain, the action that can prove it."""
+        """Choose, for each edge in a chain, the action that can prove it.
+
+        An action is only planned if we can satisfy every parameter it declares
+        in `ActionMeta.requires`. Checking that here rather than at call time is
+        the point: a missing param raised as a KeyError inside the action looks
+        exactly like "target not vulnerable" in the report, which is how a
+        broken executor talks you into a false negative.
+        """
         planned = []
         for edge in chain.edges:
-            action_id, reason = self._select_action(edge, chain)
-            if not action_id:
+            candidates = self._select_action(edge, chain)
+            if not candidates:
                 continue
-            entry = ActionRegistry.get(action_id)
-            if not entry:
+
+            # Pick the first candidate we can actually arm, not merely the first
+            # one that exists. verify.differential needs two URLs, so on a plain
+            # URL it is unusable and we must fall through to verify.reproducible
+            # rather than give up on the edge.
+            chosen = None
+            first_failure = None
+            for action_id, reason in candidates:
+                entry = ActionRegistry.get(action_id)
+                if not entry:
+                    continue
+                meta, _ = entry
+                params, missing = self._build_params(edge, chain, meta)
+                if not missing and params.get("url"):
+                    chosen = (action_id, reason, meta, params)
+                    break
+                if first_failure is None:
+                    first_failure = (action_id, reason, missing or ["url"])
+
+            if chosen is None:
+                # Remember the edges we could not arm, so the operator learns
+                # that coverage was limited rather than assuming a clean run.
+                action_id, reason, missing = first_failure
+                self.unarmable.append(EdgeOutcome(
+                    edge=edge, action_id=action_id, status="no_action",
+                    detail=reason + " — cannot supply " + ", ".join(missing)))
                 continue
-            meta, _ = entry
-            url = self._target_for(edge, chain)
-            if not url:
-                continue
-            # ActionMeta.risk is a plain string, not a RiskLevel, so normalise
-            # it here rather than reaching for .value.
+
+            action_id, reason, meta, params = chosen
             risk = getattr(meta.risk, "value", meta.risk)
             planned.append(PlannedEdge(
-                edge=edge, action_id=action_id, risk=str(risk), url=url,
-                reason=reason))
+                edge=edge, action_id=action_id, risk=str(risk),
+                url=params["url"], reason=reason, params=params))
         return planned
 
-    def _select_action(self, edge: AttackEdge, chain) -> tuple:
-        """Prefer the action the edge declares, then a category match, then the
-        edge type's default."""
-        if edge.action_id and ActionRegistry.get(edge.action_id):
-            return edge.action_id, "declared on edge"
+    def _build_params(self, edge: AttackEdge, chain, meta):
+        """Work out the arguments an action needs, from what the graph knows.
 
-        target = chain.nodes.get(edge.target_id) if hasattr(chain, "nodes") else None
+        Returns (params, missing) where `missing` names the required parameters
+        we could not fill in. The graph is thin: a `parameter` node knows its
+        own name and the URL it belongs to, a `url` node only knows its URL, and
+        a `vuln` node knows the category and nothing about where to send
+        anything. So most edges can supply url+param and little else.
+        """
+        params: dict[str, Any] = {}
+        nodes = [n for n in (self._node(edge.source_id, chain),
+                             self._node(edge.target_id, chain))
+                 if n is not None]
+
+        url = ""
+        param = ""
+        for node in nodes:
+            attrs = node.attrs or {}
+            if not url:
+                for key in ("url", "value", "endpoint"):
+                    candidate = str(attrs.get(key, "")).strip()
+                    if candidate.startswith(("http://", "https://")):
+                        url = candidate
+                        break
+                if not url and str(node.label or "").startswith(
+                        ("http://", "https://")):
+                    url = str(node.label).strip()
+            if not param:
+                if str(node.node_type) == "parameter":
+                    # A parameter asset's label IS the parameter name.
+                    param = str(node.label or "").strip()
+                elif attrs.get("param"):
+                    param = str(attrs["param"]).strip()
+                elif attrs.get("name") and str(attrs.get("name")):
+                    param = str(attrs["name"]).strip()
+
+        if url and not param:
+            # A URL like https://h/s?a=1 tells us the parameter name.
+            query = urlparse(url).query
+            if query:
+                first = parse_qsl(query)
+                param = first[0][0] if first else ""
+
+        if url:
+            params["url"] = url
+        if param:
+            params["param"] = param
+        token = ""
+        for node in nodes:
+            token = str((node.attrs or {}).get("token", "")).strip()
+            if token:
+                break
+        if token:
+            params["token"] = token
+
+        # Two-URL oracles: baseline is the same request with a benign value,
+        # test is the one carrying the payload. `inject_param` tolerates a
+        # parameter that is not yet present, so this is safe to build.
+        if "baseline_url" in getattr(meta, "requires", []) and url and param:
+            params["baseline_url"] = inject_param(url, param, "1")
+            params.setdefault("test_url", inject_param(url, param, "'"))
+        if "urls" in getattr(meta, "requires", []) and url:
+            params["urls"] = [url]
+
+        missing = [r for r in getattr(meta, "requires", []) if not params.get(r)]
+        return params, missing
+
+    @staticmethod
+    def _node(node_id, chain):
+        return chain.nodes.get(node_id) if hasattr(chain, "nodes") else None
+
+    def _select_action(self, edge: AttackEdge, chain) -> list:
+        """Candidate actions to prove this edge, best first.
+
+        Returns a list of (action_id, reason) so the caller can fall through to
+        the next candidate if the preferred one cannot be armed with the data
+        the graph actually has.
+        """
+        candidates = []
+        if edge.action_id and ActionRegistry.get(edge.action_id):
+            candidates.append((edge.action_id, "declared on edge"))
+
+        target = self._node(edge.target_id, chain)
         category = ""
         if target is not None:
             category = str((target.attrs or {}).get("category", "")).lower()
@@ -185,25 +304,21 @@ class ChainExecutor:
         if category:
             for token, action_id in CATEGORY_ACTIONS:
                 if token in category and ActionRegistry.get(action_id):
-                    return action_id, f"vuln category '{category}'"
+                    candidates.append((action_id, f"vuln category '{category}'"))
+                    break
 
         for action_id in EDGE_ACTIONS.get(edge.edge_type, []):
             if ActionRegistry.get(action_id):
-                return action_id, f"edge type '{edge.edge_type}'"
-        return "", "no registered action proves this edge"
+                candidates.append((action_id, f"edge type '{edge.edge_type}'"))
 
-    def _target_for(self, edge: AttackEdge, chain) -> str:
-        """The URL the action should be pointed at."""
-        for node_id in (edge.source_id, edge.target_id):
-            node = chain.nodes.get(node_id) if hasattr(chain, "nodes") else None
-            if node is None:
-                continue
-            attrs = node.attrs or {}
-            for key in ("url", "value", "endpoint"):
-                candidate = str(attrs.get(key, "")).strip()
-                if candidate.startswith(("http://", "https://")):
-                    return candidate
-        return ""
+        # Deduplicate, keeping the earliest (strongest) reason for each action.
+        seen = set()
+        unique = []
+        for action_id, reason in candidates:
+            if action_id not in seen:
+                seen.add(action_id)
+                unique.append((action_id, reason))
+        return unique
 
     # ── execution ─────────────────────────────────────────────────
 
@@ -223,6 +338,7 @@ class ChainExecutor:
                     report.blocked.append(outcome)
                 else:
                     report.skipped.append(outcome)
+        report.unarmable = list(self.unarmable)
         return report
 
     async def _run_one(self, planned: PlannedEdge) -> EdgeOutcome:
@@ -244,7 +360,7 @@ class ChainExecutor:
 
         ctx = ActionContext(
             action_id=planned.action_id,
-            params={"url": planned.url},
+            params=dict(planned.params),
             target=planned.url,
         )
         entry = ActionRegistry.get(planned.action_id)
