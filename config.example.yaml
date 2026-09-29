@@ -179,6 +179,14 @@ modules:
       radius: 3    # how far from each known reference to try
       max: 20      # hard ceiling on requests
 
+  sqli_scan:
+    # Hand sqlmap an interactsh server so blind injections get proof instead of
+    # a "the response looked the same either way" FIRM. Requires the top-level
+    # `oob.server_url` above — a callback domain alone is not enough, because
+    # sqlmap needs somewhere to poll. Findings are only promoted to CONFIRMED
+    # for the exact URL that produced a callback.
+    oast: true
+
 misconfig:
   concurrency: 12
   timeout: 5
@@ -227,6 +235,8 @@ oob:
   token: ""
   poll_interval: 2
   poll_timeout: 30
+  # `enabled: false` turns off OOB everywhere without deleting the settings.
+  # enabled: true
 
 xss:
   max_points: 80

@@ -467,13 +467,22 @@ async def dalfox_scan(urls: List[str], timeout: int = 600) -> dict:
 
 
 def parse_sqlmap_text(text: str) -> List[dict]:
-    """Extract high-signal SQLMap vulnerability lines."""
+    """Extract high-signal SQLMap vulnerability lines.
+
+    Each finding keeps the target URL so a caller can attribute an out-of-band
+    confirmation to the one request that produced it. sqlmap prints the URL on
+    the connection line, so that is where it is recovered from.
+    """
     findings = []
     current_url = ""
+    marker = "testing connection to the target URL:"
     for line in (text or "").splitlines():
         stripped = line.strip()
-        if "testing connection to the target URL" in stripped:
-            current_url = ""
+        if marker in stripped:
+            # Split on the marker, not on the first colon: the line starts with
+            # a "[HH:MM:SS]" timestamp that would otherwise become the URL.
+            _, _, tail = stripped.partition(marker)
+            current_url = tail.strip() or current_url
         if "GET parameter" in stripped or "POST parameter" in stripped:
             findings.append({"url": current_url, "evidence": stripped})
         elif "is vulnerable" in stripped.lower():
@@ -481,8 +490,31 @@ def parse_sqlmap_text(text: str) -> List[dict]:
     return findings
 
 
-async def sqlmap_scan(url: str, timeout: int = 900) -> dict:
-    """Run sqlmap with conservative risk/level defaults."""
+# sqlmap reports an out-of-band confirmation on its own terms. Blind payloads
+# never touch the response, so without this a real finding is stuck at FIRM.
+_OAST_MARKERS = (
+    "oast",
+    "interactsh",
+    "out-of-band",
+    "out of band",
+    "dns exfiltration",
+    "parameter is injectable",
+)
+
+
+def _has_oast(text: str) -> bool:
+    low = (text or "").lower()
+    return any(marker in low for marker in _OAST_MARKERS)
+
+
+async def sqlmap_scan(url: str, timeout: int = 900,
+                      interactsh_url: str = "") -> dict:
+    """Run sqlmap with conservative risk/level defaults.
+
+    `interactsh_url` turns on sqlmap's own out-of-band mode, which is the only
+    way a blind injection gets proof: an in-band response looks identical
+    whether or not the query executed. Left empty, nothing changes.
+    """
     if not tool_available("sqlmap"):
         return {"available": False, "results": [], "error": "missing"}
 
@@ -495,13 +527,17 @@ async def sqlmap_scan(url: str, timeout: int = 900) -> dict:
         "--smart",
         "--flush-session",
     ]
+    if interactsh_url:
+        args += ["--oast", "--interactsh-url", interactsh_url]
     result = await run_command(args, timeout=timeout)
+    oast = _has_oast(result["stdout"]) or _has_oast(result["stderr"])
     return {
         "available": True,
         "results": parse_sqlmap_text(result["stdout"]),
         "stdout": result["stdout"][:20000],
         "stderr": result["stderr"][:5000],
         "exit_code": result["exit_code"],
+        "oast": oast,
         "error": result.get("error"),
     }
 

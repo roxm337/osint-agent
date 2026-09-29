@@ -75,6 +75,23 @@ class BaseModule:
             result["evidence_id"] = evidence_id
         return result
 
+    def oob(self):
+        """Return an out-of-band callback client, or None if none is configured.
+
+        Modules ask here instead of reading the oracle's config themselves, so
+        the "is there somewhere for a callback to land" decision lives in one
+        place. Returning None matters: `InteractshClient` will happily build a
+        `*.oob.invalid` URL, and a target that dutifully tries to resolve it
+        turns an unconfigured check into a silent false negative that still
+        costs a request against the target.
+        """
+        from core.verification_oracle import InteractshClient
+        cfg = self.config.get("oob") or {}
+        if isinstance(cfg, dict) and cfg.get("enabled") is False:
+            return None
+        client = InteractshClient(config=cfg if isinstance(cfg, dict) else {})
+        return client if client.enabled else None
+
     async def resolve(self, subdomain: str) -> Optional[str]:
         """Resolve subdomain to IP."""
         fqdn = f"{subdomain}.{self.domain}"

@@ -208,8 +208,14 @@ class InteractshClient:
 
     def __init__(self, server_url: str = "", poll_interval: float = 2.0,
                  poll_timeout: float = 30.0, callback_domain: str = "",
-                 poll_url: str = "", token: str = ""):
-        cfg = _OOB_CONFIG
+                 poll_url: str = "", token: str = "", config: Optional[dict] = None):
+        # An explicit `config` wins over the process-wide `_OOB_CONFIG`. Without
+        # it a caller can only ever read the configuration that happened to be
+        # in place when some other object called `configure_oob`, which makes
+        # the client impossible to test in isolation.
+        cfg = config if config is not None else _OOB_CONFIG
+        if not isinstance(cfg, dict):
+            cfg = {}
         self.server_url = (
             server_url
             or cfg.get("server_url")

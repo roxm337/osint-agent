@@ -1,9 +1,14 @@
 """Tests for external tool parsers."""
 
+import asyncio
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from tools import external
 
 from modules.content_discovery import classify_content_hit
 from modules.exploit_lookup import build_search_terms
@@ -113,6 +118,87 @@ def test_parse_sqlmap_text():
     results = parse_sqlmap_text("GET parameter 'id' is vulnerable. Do you want to keep testing?")
 
     assert results[0]["evidence"].startswith("GET parameter")
+
+
+def test_parse_sqlmap_text_keeps_the_target_url():
+    """The URL is what lets an out-of-band callback be attributed to the one
+    request that caused it, so the parser has to recover it from sqlmap's
+    connection line rather than dropping it."""
+    text = (
+        "[12:00:01] testing connection to the target URL: https://t/api/x?id=1\n"
+        "[12:00:02] GET parameter 'id' is vulnerable. Do you want to keep testing?\n"
+    )
+    results = parse_sqlmap_text(text)
+
+    assert results == [{
+        "url": "https://t/api/x?id=1",
+        "evidence": "[12:00:02] GET parameter 'id' is vulnerable. "
+                    "Do you want to keep testing?",
+    }]
+
+
+def test_parse_sqlmap_text_survives_a_url_with_a_colon_in_the_path():
+    text = "testing connection to the target URL: https://t:8443/a:b?id=1\n"
+    text += "GET parameter 'id' is vulnerable.\n"
+    assert parse_sqlmap_text(text)[0]["url"] == "https://t:8443/a:b?id=1"
+
+
+def test_parse_sqlmap_text_without_a_connection_line_keeps_no_url():
+    assert parse_sqlmap_text("POST parameter 'q' is injectable")[0]["url"] == ""
+
+
+def test_sqlmap_scan_leaves_oast_off_by_default(monkeypatch):
+    """No interactsh server, no behaviour change: the argv must be identical to
+    what it was before OAST existed, or every existing run shifts under it."""
+    captured = {}
+
+    async def fake_run_command(args, timeout=None):
+        captured["args"] = args
+        return {"stdout": "", "stderr": "", "exit_code": 0}
+
+    monkeypatch.setattr(external, "tool_available", lambda name: True)
+    monkeypatch.setattr(external, "run_command", fake_run_command)
+    result = asyncio.run(external.sqlmap_scan("https://t/api/x?id=1"))
+
+    assert "--oast" not in captured["args"]
+    assert "--interactsh-url" not in captured["args"]
+    assert result["oast"] is False
+
+
+def test_sqlmap_scan_enables_oast_when_a_server_is_given(monkeypatch):
+    captured = {}
+
+    async def fake_run_command(args, timeout=None):
+        captured["args"] = args
+        return {"stdout": "", "stderr": "", "exit_code": 0}
+
+    monkeypatch.setattr(external, "tool_available", lambda name: True)
+    monkeypatch.setattr(external, "run_command", fake_run_command)
+    asyncio.run(external.sqlmap_scan("https://t/api/x?id=1",
+                                     interactsh_url="https://oast.test"))
+
+    assert "--oast" in captured["args"]
+    assert captured["args"][captured["args"].index("--interactsh-url") + 1] == \
+           "https://oast.test"
+
+
+@pytest.mark.parametrize("line,expected", [
+    ("[+] interactsh OOB: the target resolved our host", True),
+    ("[+] OAST confirmed blind injection", True),
+    ("[+] the parameter is injectable, out-of-band data exfiltrated", True),
+    ("GET parameter 'id' is vulnerable", False),
+    ("[12:00:01] testing connection to the target URL: https://t/api/x?id=1", False),
+])
+def test_oast_marker_detection(monkeypatch, line, expected):
+    async def fake_run_command(args, timeout=None):
+        return {"stdout": line, "stderr": "", "exit_code": 0}
+
+    monkeypatch.setattr(external, "tool_available", lambda name: True)
+    monkeypatch.setattr(external, "run_command", fake_run_command)
+    result = asyncio.run(external.sqlmap_scan("https://t/api/x?id=1",
+                                              interactsh_url="https://oast.test"))
+
+    assert result["oast"] is expected
 
 
 def test_parse_maigret_json():
