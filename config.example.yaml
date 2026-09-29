@@ -274,6 +274,15 @@ modules:
     # finding. Confirm a version match against the running build before
     # treating any of it as confirmed.
 
+  content_discovery:
+    enabled: true
+
+    # Results are graded by what the status establishes. A 200 on a
+    # sensitive-looking path is MEDIUM; a 401/403 is INFO, because access
+    # control holding is not a weakness. ffuf runs with -ac, and hits sharing a
+    # dominant response shape are dropped as catch-all, so a SPA answering 200
+    # for everything does not report the whole wordlist.
+
   cors_audit:
     enabled: true
 

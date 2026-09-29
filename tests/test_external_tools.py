@@ -71,8 +71,13 @@ def test_build_search_terms_from_webapp_assets():
 
 
 def test_classify_content_hit():
-    assert classify_content_hit({"url": "https://e.com/admin", "status": 200}) == "interesting"
+    # "served" replaced the old "interesting" label: a 200 on a sensitive-looking
+    # name is served without a redirect to a login, which is the case worth
+    # reporting. A 403 stays "protected" — the resource exists, access control
+    # held. See tests/test_content_discovery.py for the full grading.
+    assert classify_content_hit({"url": "https://e.com/admin", "status": 200}) == "served"
     assert classify_content_hit({"url": "https://e.com/private", "status": 403}) == "protected"
+    assert classify_content_hit({"url": "https://e.com/login", "status": 302}) == "redirected"
 
 
 def test_parse_nuclei_jsonl():
