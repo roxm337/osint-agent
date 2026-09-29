@@ -34,6 +34,46 @@ auth:
   bearer_token: ""
   probe_backoff_seconds: 10
 
+  # ── Multi-identity sessions (required by the idor_differ module) ──
+  #
+  # IDOR testing compares what two different accounts can see, so supply two
+  # accounts you own. Each identity gets its own cookie jar inside the shared
+  # connection pool, so the two sessions cannot contaminate each other.
+  #
+  # Three ways to authenticate an identity, in order of preference:
+  #
+  #   1. Static session (simplest — log in by hand, copy the cookie):
+  #        user_a:
+  #          cookies: {session: "abc123"}
+  #          verify_url: "https://target/dashboard"
+  #          success_marker: "Sign out"      # must appear when logged in
+  #
+  #   2. Scripted login (harness submits the form and adopts the cookie):
+  #        user_b:
+  #          login:
+  #            url: "https://target/login"
+  #            method: POST
+  #            data: {user: me@example.com, pass: "..."}
+  #            success_marker: "Sign out"
+  #
+  #   3. Bearer token:
+  #        user_c:
+  #          bearer_token: "eyJhbGci..."
+  #          verify_url: "https://target/api/me"
+  #
+  # success_marker matters more than it looks. A failed login usually returns
+  # HTTP 200 with the login form again, so without a marker the harness cannot
+  # tell a real session from a bounce and will report confident nonsense.
+  identities: {}
+  #   user_a:
+  #     cookies: {session: "..."}
+  #     verify_url: "https://target/dashboard"
+  #     success_marker: "Sign out"
+  #   user_b:
+  #     cookies: {session: "..."}
+  #     verify_url: "https://target/dashboard"
+  #     success_marker: "Sign out"
+
 llm:
   model: ""            # e.g. "deepseek" (deepseek/deepseek-chat), "openai", or a full "provider/model"
   api_key: ""
@@ -75,6 +115,13 @@ modules:
   auto_run: true
   max_consecutive_empty: 5  # stop module after N empty probes
   record_http_evidence: true
+  idor:
+    # Explicit object endpoints for the idor_differ module. Normally derived
+    # from js_analysis output; list them here when the API shape is already
+    # known, otherwise the module falls back to its built-in path seeds.
+    endpoints: []
+    # Ceiling on cross-account probes per endpoint template.
+    max_probes_per_template: 15
 
 misconfig:
   concurrency: 12

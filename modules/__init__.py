@@ -38,6 +38,7 @@ from .mobile_assets import MobileAssets
 from .social_osint import SocialOSINT
 from .git_exposure import GitExposure
 from .secret_validation import SecretValidation
+from .idor_differ import IdorDiffer
 from .xss_scan import XSSScan
 from .sqli_scan import SQLiScan
 from .cors_audit import CORSAudit
@@ -327,6 +328,13 @@ MODULE_REGISTRY = {
         "stage": 5,
         "detectability": "high",
         "depends_on": ["parameter_discovery"],
+        "active": True,
+    },
+    "idor_differ": {
+        "class": IdorDiffer,
+        "stage": 5,
+        "detectability": "medium",
+        "depends_on": ["subdomain_enum"],
         "active": True,
     },
     "cors_audit": {
