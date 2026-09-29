@@ -17,6 +17,7 @@ The same local aiohttp server convention as test_http_engine is used, and
 """
 
 import asyncio
+import contextlib
 import json
 import sys
 import tempfile
@@ -25,10 +26,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import tools.wrappers as wrappers
+from tools.wrappers import curl
 from core.auth_harness import AuthHarness, Identity, fingerprint_body
+from aiohttp import web
+
 from modules.idor_differ import (
     IdorDiffer,
+    _absent_ref,
     _extract_object_ids,
+    _extract_refs,
     _identity_markers,
     _looks_like_id,
     _swap_id,
@@ -41,11 +47,19 @@ from tools.http_engine import HttpEngine
 # ── Local servers ────────────────────────────────────────────────
 
 
-def _build_app(vulnerable: bool):
+def _build_app(vulnerable: bool, *, write_vulnerable: bool = False,
+               public_ids=(), third_party=(), csrf: bool = False,
+               orphaned=()):
     """An app with two accounts and a per-invoice endpoint.
 
     Invoices 100/200 belong to alice/bob. When `vulnerable`, the object
     endpoint skips the ownership check; when not, it returns 403.
+
+    `write_vulnerable` controls the same check on PATCH/PUT/DELETE, which is
+    usually enforced independently of the read path. `public_ids` are readable
+    with no session at all. `third_party` adds records owned by an account
+    that is not in the harness, for sequential-ID probing. `csrf` makes the
+    login form carry a token the POST must echo back.
     """
     from aiohttp import web
 
@@ -55,13 +69,30 @@ def _build_app(vulnerable: bool):
         "200": {"invoice_id": "200", "owner_email": "bob@example.com",
                 "customer": "bob@example.com", "amount": 80.0, "status": "open"},
     }
+    for inv_id in third_party:
+        DB[str(inv_id)] = {
+            "invoice_id": str(inv_id), "owner_email": "carol@example.com",
+            "customer": "carol@example.com", "amount": 55.0, "status": "open",
+        }
+    for inv_id in orphaned:
+        # An orphaned record: no owner field at all, so there is nothing for
+        # an ownership check to compare against, and nothing in the payload
+        # that says whose it was.
+        DB[str(inv_id)] = {"invoice_id": str(inv_id), "status": "open",
+                           "amount": 42.0}
+    public_ids = {str(p) for p in public_ids}
     sessions = {
         "sess_alice": {"user": "alice", "email": "alice@example.com"},
         "sess_bob": {"user": "bob", "email": "bob@example.com"},
     }
+    CSRF_TOKEN = "tok-abc-123"
+    issued = set()
 
     def current(request):
         return sessions.get(request.cookies.get("session"))
+
+    def owns(user, inv):
+        return user and inv.get("owner_email") == user["email"]
 
     async def dashboard(request):
         user = current(request)
@@ -78,8 +109,21 @@ def _build_app(vulnerable: bool):
             content_type="text/html",
         )
 
+    async def login_page(request):
+        if not csrf:
+            return web.Response(text="<h1>Sign in</h1>", content_type="text/html")
+        return web.Response(
+            text=f'<h1>Sign in</h1><form method="post">'
+                 f'<input type="hidden" name="csrfmiddlewaretoken" '
+                 f'value="{CSRF_TOKEN}">'
+                 f'<input name="user"></form>',
+            content_type="text/html",
+        )
+
     async def login(request):
         data = await request.post()
+        if csrf and data.get("csrfmiddlewaretoken") != CSRF_TOKEN:
+            raise web.HTTPForbidden(text="bad csrf token")
         sid = {"alice": "sess_alice", "bob": "sess_bob"}.get(data.get("user"))
         if not sid:
             raise web.HTTPUnauthorized(text="no")
@@ -102,25 +146,102 @@ def _build_app(vulnerable: bool):
 
     async def invoice(request):
         user = current(request)
+        inv = DB.get(request.match_info["id"])
+        if not inv:
+            raise web.HTTPNotFound(text="not found")
+        if "owner_email" not in inv:
+            # No owner to check against. An application that lets this
+            # through discloses a real record to every session.
+            return web.json_response(inv)
+        if not user:
+            # Public records are readable by design; everything else is not.
+            if request.match_info["id"] in public_ids:
+                return web.json_response(inv)
+            raise web.HTTPUnauthorized()
+        if not vulnerable and not owns(user, inv):
+            # Correctly enforced: the object exists but is not theirs.
+            raise web.HTTPForbidden(text="forbidden")
+        return web.json_response(inv)
+
+    async def write_invoice(request):
+        user = current(request)
         if not user:
             raise web.HTTPUnauthorized()
         inv = DB.get(request.match_info["id"])
         if not inv:
             raise web.HTTPNotFound(text="not found")
-        if not vulnerable and inv["owner_email"] != user["email"]:
-            # Correctly enforced: the object exists but is not theirs.
+        if not write_vulnerable and not owns(user, inv):
             raise web.HTTPForbidden(text="forbidden")
-        return web.json_response(inv)
+        if request.method == "DELETE":
+            del DB[request.match_info["id"]]
+            issued.add(request.match_info["id"])
+            return web.json_response({"deleted": True})
+        payload = await request.json() if request.can_read_body else {}
+        # Echo the victim's own values back so a caller can tell an accepted
+        # write from a rejected one without changing anything meaningful.
+        body = {**inv, **{k: v for k, v in (payload or {}).items()
+                          if k in ("status", "reference")}}
+        DB[request.match_info["id"]] = body
+        issued.add(request.match_info["id"])
+        return web.json_response(body)
+
+    async def not_a_collection(request):
+        raise web.HTTPNotFound(text="not found")
 
     app = web.Application()
     app.router.add_get("/", dashboard)
     app.router.add_get("/dashboard", dashboard)
+    app.router.add_get("/login", login_page)
     app.router.add_post("/login", login)
     app.router.add_get("/api/me", api_me)
     app.router.add_get("/api/invoices", collection)
     app.router.add_get("/api/invoices/{id}", invoice)
     app.router.add_get("/api/v1/invoices/{id}", invoice)
+    for method in ("PATCH", "PUT", "DELETE"):
+        app.router.add_route(method, "/api/invoices/{id}", write_invoice)
+    # A decoy so wordlist probing is not trivially all-404.
+    app.router.add_get("/api/widgets", not_a_collection)
     return app
+
+
+@contextlib.asynccontextmanager
+async def _served_app(**app_kwargs):
+    """Start a server on an ephemeral port and yield its base URL."""
+    async with _served_app_with(_build_app(True, **app_kwargs)) as base:
+        yield base
+
+
+@contextlib.asynccontextmanager
+async def _served_app_with(app):
+    """Serve an already-configured app.
+
+    Routes must be added before this is entered: aiohttp freezes the router
+    during `AppRunner.setup()`, and a late `add_post` raises.
+    """
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    base = f"http://127.0.0.1:{runner.addresses[0][1]}"
+    wrappers._engine = HttpEngine(cookies_from_ip_hosts=True)
+    wrappers.configure_http_limiter(max_concurrent=20, max_per_minute=100000)
+    try:
+        yield base
+    finally:
+        await wrappers.close_engine()
+        await runner.cleanup()
+
+
+@contextlib.asynccontextmanager
+async def _csrf_app():
+    async with _served_app(csrf=True) as base:
+        yield base
+
+
+@contextlib.asynccontextmanager
+async def _tokenless_app():
+    async with _served_app(csrf=False) as base:
+        yield base
 
 
 class _Env:
@@ -144,17 +265,20 @@ class _Env:
         return self.state.evidence["items"]
 
 
-def _harness(fn, *args, vulnerable=True, **kwargs):
+def _harness(fn, *args, vulnerable=True, app_kwargs=None, module_cfg=None,
+             identities=None, **kwargs):
     """Run a test body against a local server.
 
     `vulnerable` is keyword-only: pytest passes the test instance as the first
     positional argument, so a second positional parameter would silently bind
-    the instance to the flag.
+    the instance to the flag. `app_kwargs` and `module_cfg` let a test switch
+    on the optional behaviours (writes, public records, wordlists) without
+    duplicating the whole fixture.
     """
     from aiohttp import web
 
     async def runner():
-        app = _build_app(vulnerable)
+        app = _build_app(vulnerable, **(app_kwargs or {}))
         runner_ = web.AppRunner(app)
         await runner_.setup()
         site = web.TCPSite(runner_, "127.0.0.1", 0)
@@ -170,10 +294,15 @@ def _harness(fn, *args, vulnerable=True, **kwargs):
         wrappers.configure_http_limiter(max_concurrent=20, max_per_minute=100000)
 
         out = tempfile.mkdtemp()
+        idor_cfg = {"endpoints": [
+            f"{base}/api/invoices/100",
+            f"{base}/api/invoices/200",
+        ]}
+        idor_cfg.update(module_cfg or {})
         config = {
             "target": {"domain": f"127.0.0.1:{port}"},
             "paths": {"output_dir": out},
-            "auth": {"identities": {
+            "auth": {"identities": identities if identities is not None else {
                 "alice": {"cookies": {"session": "sess_alice"},
                           "verify_url": f"{base}/dashboard",
                           "success_marker": "Sign out"},
@@ -181,10 +310,7 @@ def _harness(fn, *args, vulnerable=True, **kwargs):
                         "verify_url": f"{base}/dashboard",
                         "success_marker": "Sign out"},
             }},
-            "modules": {"idor": {"endpoints": [
-                f"{base}/api/invoices/100",
-                f"{base}/api/invoices/200",
-            ]}},
+            "modules": {"idor": idor_cfg},
         }
         state = StateManager(str(out))
         env = _Env(base, app, engine, config, state)
@@ -200,6 +326,27 @@ def _harness(fn, *args, vulnerable=True, **kwargs):
 def served(fn):
     def wrapper(*args, **kwargs):
         return _harness(fn, *args, vulnerable=True, **kwargs)
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
+
+
+def variant(**app_kwargs):
+    """Like `served`, but switches on optional server behaviour."""
+    def wrapper(fn):
+        def inner(*args, **kwargs):
+            return _harness(fn, *args, vulnerable=True,
+                            app_kwargs=app_kwargs, **kwargs)
+        inner.__name__ = fn.__name__
+        inner.__doc__ = fn.__doc__
+        return inner
+    return wrapper
+
+
+def standalone(fn):
+    """Run a bare `async def` test, since there is no pytest-asyncio here."""
+    def wrapper(*args, **kwargs):
+        return asyncio.run(fn(*args, **kwargs))
     wrapper.__name__ = fn.__name__
     wrapper.__doc__ = fn.__doc__
     return wrapper
@@ -314,6 +461,49 @@ class TestAuthHarness:
         anon = await harness.request_anonymous(f"{env.base}/api/me", output="body")
         assert anon["status"] in (401, 403), "anonymous request inherited a cookie"
 
+    @standalone
+    async def test_anonymous_request_ignores_the_legacy_global_session(self):
+        """The legacy single-session config must not authenticate every probe.
+
+        Otherwise an ordinary authenticated read is reported as a public
+        exposure, which is the worst kind of wrong for a finding that claims
+        no credentials are needed.
+        """
+        async with _served_app() as base:
+            wrappers.configure_http_session({"auth": {
+                "cookies": {"session": "sess_alice"},
+                "bearer_token": "legacy-token",
+            }})
+            try:
+                harness = AuthHarness({"auth": {}})
+                anon = await harness.request_anonymous(f"{base}/api/me",
+                                                        output="body")
+                assert anon["status"] in (401, 403), \
+                    "a global cookie was sent on an anonymous request"
+            finally:
+                wrappers.configure_http_session({})
+
+    def test_global_auth_headers_are_stripped_per_identity(self):
+        wrappers.configure_http_session({"auth": {
+            "cookies": {"session": "sess_alice"},
+            "bearer_token": "legacy-token",
+            "headers": {"User-Agent": "scanner", "X-Team": "research"},
+        }})
+        try:
+            # A named identity supplies its own credential.
+            scoped = wrappers._merge_session_headers({}, drop_auth=True)
+            assert "Cookie" not in scoped and "Authorization" not in scoped
+            # Non-auth headers still apply, or every probe looks synthetic.
+            assert scoped["User-Agent"] == "scanner"
+            assert scoped["X-Team"] == "research"
+
+            # A bare request keeps the legacy behaviour other modules rely on.
+            legacy = wrappers._merge_session_headers({})
+            assert legacy["Authorization"] == "Bearer legacy-token"
+            assert "session=sess_alice" in legacy["Cookie"]
+        finally:
+            wrappers.configure_http_session({})
+
     def test_identities_accept_mapping_form(self):
         harness = AuthHarness({"auth": {"identities": {
             "a": {"cookies": {"s": "1"}}, "b": {"bearer_token": "t"}}}})
@@ -353,13 +543,13 @@ class TestIdorDetected:
     async def test_finding_records_the_victim_and_attacker(self, env):
         await env.run_module()
         subjects = [e["subject"] for e in env.evidence()
-                    if e["type"] == "idor_cross_account"]
+                    if e["type"] == "idor_read"]
         assert any("alice" in s and "bob" in s for s in subjects), subjects
 
     @served
     async def test_evidence_carries_the_leaked_markers(self, env):
         await env.run_module()
-        leaked = [e for e in env.evidence() if e["type"] == "idor_cross_account"]
+        leaked = [e for e in env.evidence() if e["type"] == "idor_read"]
         assert leaked, "a confirmed finding must have evidence"
 
         # `path` is stored relative to the run's output directory.
@@ -387,7 +577,7 @@ class TestIdorNotReported:
     @served_hardened
     async def test_denied_object_is_not_evidence(self, env):
         await env.run_module()
-        assert not [e for e in env.evidence() if e["type"] == "idor_cross_account"]
+        assert not [e for e in env.evidence() if e["type"] == "idor_read"]
 
 
 class TestNoFalsePositives:
@@ -433,3 +623,370 @@ class TestNoFalsePositives:
         ]
         assert await env.run_module() in ("done", "skipped")
         assert env.findings() == []
+
+
+# ── Bug regressions: false-positive sources found in review ───────
+
+
+class TestParameterAndUrlConfusion:
+
+    def test_only_configured_codes_count_as_waf_blocks(self):
+        """401/403 is the auth layer working; logging it as a WAF block lies."""
+        from modules.idor_differ import IdorDiffer as D
+
+        differ = D.__new__(D)
+        differ.waf_config = {}
+        assert differ._waf_codes() == {429, 503}
+
+        differ.waf_config = {"block_codes": [403, 503]}
+        assert differ._waf_codes() == {403, 503}
+
+        differ.waf_config = {"block_codes": "garbage"}
+        assert differ._waf_codes() == {429, 503}, "bad config must not crash the run"
+
+    def test_pagination_and_sort_params_are_not_object_references(self):
+        for url in ("https://t/api/x?page=2", "https://t/api/x?limit=50",
+                    "https://t/api/x?offset=100", "https://t/api/x?sort=asc",
+                    "https://t/api/x?order=desc", "https://t/api/x?cursor=abc"):
+            assert _extract_object_ids(url) == [], url
+            assert "{id}" not in _template_key(url), url
+
+    def test_swapping_rewrites_the_id_query_param_and_leaves_the_rest(self):
+        swapped = _swap_id("https://t/api/orders/7?page=7&order_id=7", "7", "100")
+        assert swapped == "https://t/api/orders/100?page=7&order_id=100", swapped
+        assert _swap_id("https://t/api/orders/7?page=7", "7", "100") == \
+               "https://t/api/orders/100?page=7"
+
+    def test_real_id_params_are_still_harvested(self):
+        """The fix must not over-correct into ignoring genuine references."""
+        for url in ("https://t/api/x?id=7", "https://t/api/x?invoice_id=1042",
+                    "https://t/api/x/42"):
+            assert _extract_refs(url), url
+        assert _extract_object_ids('{"invoice_id":"1042"}') == ["1042"]
+
+    def test_swap_does_not_mutate_version_or_year_segments(self):
+        """A blind substring replace corrupted /api/v7 and /reports/2017."""
+        assert _swap_id("https://t/api/v7/orders/7", "7", "77") == \
+               "https://t/api/v7/orders/77"
+        assert _swap_id("https://t/reports/2017/q3", "2017", "88") == \
+               "https://t/reports/88/q3"
+
+    def test_absent_reference_is_never_the_same_as_a_real_one(self):
+        import re
+        uuid = re.compile(r"^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
+        for ref in ("0", "1", "42", "100", "aB3dEfGhIjKlMnOp",
+                    "00000000-0000-0000-0000-000000000000",
+                    "3f8a1b2c-1111-2222-3333-444455556666"):
+            absent = _absent_ref(ref)
+            assert absent != ref, ref
+            # The baseline must keep the reference's shape, or the request it
+            # produces is not the "same request with a different id" the
+            # comparison depends on.
+            if uuid.match(ref):
+                assert uuid.match(absent), (ref, absent)
+
+
+# ── Anonymous exposure ───────────────────────────────────────────
+
+
+class TestAnonymousExposure:
+
+    @served
+    async def test_private_object_is_not_reported_without_opt_in(self, env):
+        """Nothing on this server is public, so the probe must find nothing."""
+        env.config["modules"]["idor"]["test_anonymous"] = True
+        env.config["modules"]["idor"]["endpoints"] = [f"{env.base}/api/invoices/100"]
+        assert await env.run_module() == "done"
+        assert not [f for f in env.findings()
+                    if "without authentication" in f["title"]], \
+            f"nothing here is public: {env.findings()}"
+
+    @variant(public_ids=["100"])
+    async def test_anonymous_probe_is_off_unless_requested(self, env):
+        """Record 100 *is* readable with no session, so the opt-in is the
+        only thing standing between this run and a real finding."""
+        env.config["modules"]["idor"]["endpoints"] = [f"{env.base}/api/invoices/100"]
+        assert await env.run_module() == "done"
+        assert not [f for f in env.findings()
+                    if "without authentication" in f["title"]]
+
+    @variant(public_ids=["100"])
+    async def test_public_object_is_reported_when_enabled(self, env):
+        env.config["modules"]["idor"]["test_anonymous"] = True
+        env.config["modules"]["idor"]["endpoints"] = [f"{env.base}/api/invoices/100"]
+        assert await env.run_module() == "done"
+
+        anon = [f for f in env.findings() if "without authentication" in f["title"]]
+        assert anon, env.findings()
+        # Unauthenticated disclosure of a named customer's data is the worst
+        # case, so it must not be filed as a medium.
+        assert anon[0]["severity"] == "critical"
+        assert "alice@example.com" in anon[0]["description"]
+
+
+# ── Sequential / unknown-owner probing ───────────────────────────
+
+
+class TestSequentialProbing:
+
+    @variant(third_party=[101])
+    async def test_third_party_record_is_reported(self, env):
+        """The case two accounts cannot prove: a stranger's record."""
+        env.config["modules"]["idor"]["id_probing"] = {
+            "enabled": True, "radius": 3, "max": 20,
+        }
+        env.config["modules"]["idor"]["endpoints"] = [f"{env.base}/api/invoices/100"]
+        assert await env.run_module() == "done"
+
+        unknown = [f for f in env.findings() if "unowned record" in f["title"]]
+        assert unknown, [f["title"] for f in env.findings()]
+        # carol@example.com appears in no session, so it can only have come
+        # from the other account's record.
+        assert "carol@example.com" in unknown[0]["description"]
+        assert unknown[0]["verified"] is True
+
+    @variant(third_party=[101])
+    async def test_probing_is_off_by_default(self, env):
+        """A stranger's record sits one ID away, so only the opt-in stands
+        between this run and reaching other people's data."""
+        env.config["modules"]["idor"]["endpoints"] = [f"{env.base}/api/invoices/100"]
+        assert await env.run_module() == "done"
+        assert not [f for f in env.findings() if "unowned" in f["title"]]
+
+    @variant(orphaned=[101, 102, 103, 104, 105, 106, 107, 108])
+    async def test_probing_respects_its_budget(self, env):
+        """Every candidate here exists, so each probe that runs is recorded.
+        Counting 404s would pass even with no budget at all."""
+        env.config["modules"]["idor"]["id_probing"] = {
+            "enabled": True, "radius": 8, "max": 3,
+        }
+        env.config["modules"]["idor"]["endpoints"] = [f"{env.base}/api/invoices/100"]
+        assert await env.run_module() == "done"
+        probed = [e for e in env.evidence() if e["type"] == "idor_unattributed"]
+        assert 0 < len(probed) <= 3, \
+            f"the budget must bound the probes, got {len(probed)}"
+
+    def _hardened_third_party(fn):
+        def inner(*args, **kwargs):
+            return _harness(fn, *args, vulnerable=False,
+                            app_kwargs={"third_party": [101]})
+        inner.__name__ = fn.__name__
+        inner.__doc__ = fn.__doc__
+        return inner
+
+    @_hardened_third_party
+    async def test_enforced_server_leaks_nothing_to_sequential_probing(self, env):
+        env.config["modules"]["idor"]["id_probing"] = {
+            "enabled": True, "radius": 3, "max": 20,
+        }
+        env.config["modules"]["idor"]["endpoints"] = [f"{env.base}/api/invoices/100"]
+        assert await env.run_module() == "done"
+        assert env.findings() == [], f"false positive: {env.findings()}"
+
+
+# ── Write authorisation ──────────────────────────────────────────
+
+
+class TestUnattributedLeaks:
+
+    def test_orphaned_record_is_not_reported_without_proof_of_ownership(self):
+        """A record that came back but cannot be tied to any account is a weak
+        signal. Filing it as CONFIRMED would be a guess; it is still recorded."""
+        async def body(env):
+            env.config["modules"]["idor"]["endpoints"] = \
+                [f"{env.base}/api/invoices/100"]
+            assert await env.run_module() == "done"
+
+            assert env.findings() == [], \
+                f"an unattributable leak must not become a finding: {env.findings()}"
+            recorded = [e for e in env.evidence()
+                        if e["type"] == "idor_unattributed"]
+            assert recorded, "the probe should still be recorded as evidence"
+
+        # Enforced for the two known accounts, so the only thing that comes
+        # back is the markerless stranger's record reached by probing.
+        return _harness(body, vulnerable=False,
+                        app_kwargs={"orphaned": [101]},
+                        module_cfg={"id_probing":
+                                    {"enabled": True, "radius": 1, "max": 5}})
+
+
+class TestWriteAuthorisation:
+
+    @variant(write_vulnerable=True)
+    async def test_accepted_cross_account_write_is_critical(self, env):
+        env.config["modules"]["idor"]["test_write_methods"] = ["PATCH"]
+        # Only alice's own URL is known; bob's record must be reached by
+        # substituting into the shape, which recon never observed directly.
+        env.config["modules"]["idor"]["endpoints"] = [f"{env.base}/api/invoices/100"]
+        assert await env.run_module() == "done"
+
+        writes = [f for f in env.findings() if "can modify" in f["title"]]
+        assert writes, [f["title"] for f in env.findings()]
+        # A confirmed write is a data-integrity problem, not a read leak.
+        assert writes[0]["severity"] == "critical"
+        assert "PATCH" in writes[0]["title"]
+
+    @variant(write_vulnerable=True)
+    async def test_echoed_write_leaves_the_record_intact(self, env):
+        """The probe must not quietly destroy the victim's data."""
+        from tools.wrappers import curl
+
+        env.config["modules"]["idor"]["test_write_methods"] = ["PUT"]
+        env.config["modules"]["idor"]["endpoints"] = [f"{env.base}/api/invoices/100"]
+        await env.run_module()
+
+        after = await curl(f"{env.base}/api/invoices/200", identity="bob",
+                           output="body")
+        assert json.loads(after["body"])["amount"] == 80.0
+        assert json.loads(after["body"])["status"] == "open"
+
+    @variant(write_vulnerable=True)
+    async def test_writes_are_off_by_default(self, env):
+        env.config["modules"]["idor"]["endpoints"] = [f"{env.base}/api/invoices/200"]
+        assert await env.run_module() == "done"
+        assert not [f for f in env.findings() if "can modify" in f["title"]]
+
+    @variant(write_vulnerable=True)
+    async def test_delete_is_never_sent_without_destructive_consent(self, env):
+        env.config["modules"]["idor"]["test_write_methods"] = ["DELETE"]
+        env.config["modules"]["idor"]["endpoints"] = [f"{env.base}/api/invoices/100"]
+        assert await env.run_module() == "done"
+
+        after = await curl(f"{env.base}/api/invoices/200", identity="bob",
+                           output="body")
+        assert after["status"] == 200, "an unconsented DELETE destroyed the record"
+
+    @served
+    async def test_enforced_server_rejects_cross_account_writes(self, env):
+        env.config["modules"]["idor"]["test_write_methods"] = ["PATCH", "PUT"]
+        env.config["modules"]["idor"]["endpoints"] = [f"{env.base}/api/invoices/100"]
+        assert await env.run_module() == "done"
+        assert not [f for f in env.findings() if "can modify" in f["title"]]
+
+
+# ── Collection discovery ─────────────────────────────────────────
+
+
+class TestCollectionDiscovery:
+
+    @served
+    async def test_wordlist_finds_collections_and_synthesises_templates(self, env):
+        """No object URL was ever observed; the run must still find records."""
+        env.config["modules"]["idor"]["endpoints"] = []
+        env.config["modules"]["idor"]["collection_paths"] = ["/api/invoices"]
+        assert await env.run_module() == "done"
+
+        titles = [f["title"] for f in env.findings()]
+        assert any("IDOR" in t for t in titles), \
+            f"collection-only discovery produced nothing: {titles}"
+
+    @served
+    async def test_404_collections_do_not_invent_endpoints(self, env):
+        env.config["modules"]["idor"]["endpoints"] = []
+        env.config["modules"]["idor"]["collection_paths"] = ["/api/widgets"]
+        env.config["modules"]["idor"]["max_collections"] = 5
+        assert await env.run_module() in ("done", "skipped")
+        assert env.findings() == [], "a 404 is not an endpoint"
+
+
+# ── CSRF-aware and Basic-auth identities ─────────────────────────
+
+
+@contextlib.asynccontextmanager
+async def _json_app():
+    """A server that only accepts a JSON login body."""
+    app = _build_app(True)
+
+    async def json_login(request):
+        try:
+            data = await request.json()
+        except Exception:
+            raise web.HTTPUnsupportedMediaType(text="json required")
+        sid = {"alice": "sess_alice", "bob": "sess_bob"}.get(data.get("username"))
+        if not sid:
+            raise web.HTTPUnauthorized(text="no")
+        resp = web.json_response({"ok": True})
+        resp.set_cookie("session", sid, path="/")
+        return resp
+
+    app.router.add_post("/auth/login", json_login)
+    async with _served_app_with(app) as base:
+        yield base
+
+
+class TestLoginVariants:
+
+    @standalone
+    async def test_csrf_token_is_harvested_from_the_login_page(self):
+        """A login form that demands a token must still work scripted."""
+        async with _csrf_app() as base:
+            identity = Identity(
+                name="carol", verify_url=f"{base}/dashboard",
+                success_marker="Sign out",
+                login={"url": f"{base}/login", "data": {"user": "alice"}},
+            )
+            assert await identity.establish(base) is True, identity.verification_note
+            assert identity.cookies.get("session") == "sess_alice"
+
+    @standalone
+    async def test_login_without_the_token_is_rejected(self):
+        """Confirms the fixture actually enforces CSRF, so the test above bites."""
+        async with _csrf_app() as base:
+            bad = await curl(f"{base}/login", method="POST",
+                             data={"user": "alice"}, output="body")
+            assert bad["status"] == 403, "the CSRF fixture is not enforcing anything"
+
+    @standalone
+    async def test_csrf_can_be_disabled_for_tokenless_forms(self):
+        """Not every login form has a CSRF field, and the GET must not break it."""
+        async with _tokenless_app() as base:
+            identity = Identity(
+                name="carol", verify_url=f"{base}/dashboard",
+                success_marker="Sign out",
+                login={"url": f"{base}/login", "data": {"user": "alice"},
+                       "csrf": False},
+            )
+            assert await identity.establish(base) is True, identity.verification_note
+
+    @standalone
+    async def test_json_login_sends_a_json_body(self):
+        """A JSON login must not be form-encoded, and must not be CSRF-patched."""
+        async with _json_app() as base:
+            identity = Identity(
+                name="api", verify_url=f"{base}/api/me",
+                success_marker="alice@example.com",
+                login={"url": f"{base}/auth/login", "content_type": "json",
+                       "data": {"username": "alice", "password": "pw"},
+                       "extract_token": False},
+            )
+            assert await identity.establish(base) is True, identity.verification_note
+            assert identity.cookies.get("session") == "sess_alice"
+
+    def test_basic_auth_identity_builds_the_header(self):
+        identity = Identity(name="api", basic_auth=("user", "pw"))
+        assert identity.request_headers()["Authorization"] == \
+               "Basic dXNlcjpwdw=="
+
+    def test_basic_auth_counts_as_a_credential(self):
+        assert Identity(name="api", basic_auth=("u", "p")).has_credentials()
+        assert not Identity(name="anon").has_credentials()
+
+    def test_bearer_token_wins_over_basic_auth(self):
+        identity = Identity(name="api", basic_auth=("u", "p"),
+                            bearer_token="t")
+        assert identity.request_headers()["Authorization"] == "Bearer t"
+
+
+def test_csrf_hidden_field_parser_handles_attribute_order():
+    from core.auth_harness import _hidden_form_fields
+
+    html = (
+        '<input value="tok-1" name="csrfmiddlewaretoken" type="hidden">'
+        "<input type='hidden' name='authenticity_token' value='tok-2'>"
+        '<input type="text" name="user">'
+        '<input type="hidden">'
+    )
+    fields = _hidden_form_fields(html)
+    assert fields == {"csrfmiddlewaretoken": "tok-1",
+                      "authenticity_token": "tok-2"}, fields

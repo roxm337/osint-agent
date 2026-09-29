@@ -270,10 +270,27 @@ class TestCookieIsolation:
     @served
     async def test_forget_identities_clears_cookies_but_keeps_pool(self, base, srv, engine):
         await engine.request(f"{base}/set-cookie?sid=GONE", identity="u")
+        session = engine.session("u")
         engine.forget_identities()
         assert engine.cookies_for("u") == {}
-        # Pool survives — this is a cookie reset, not a connection reset.
+        # The pool survives — this is a cookie reset, not a connection reset.
         assert engine.connections_opened == 1
+        # The session is reused rather than orphaned: swapping it out leaks an
+        # unclosed ClientSession and re-dials on the next request.
+        assert engine.session("u") is session
+        assert not session.closed
+        assert engine.cookies_for("u") == {}
+
+    @served
+    async def test_forget_identities_resets_every_identity(self, base, srv, engine):
+        for identity in ("alice", "bob"):
+            engine.set_cookies({"sid": identity.upper()}, identity=identity)
+        engine.forget_identities()
+        for identity in ("alice", "bob"):
+            assert engine.cookies_for(identity) == {}, identity
+        # A request after the reset must not replay a pre-reset cookie.
+        result = await engine.request(f"{base}/whoami", output="body", identity="alice")
+        assert json.loads(result["body"])["sid"] == "none"
 
     def test_normalise_defaults_to_shared_identity(self):
         assert CookieJar.normalise(None) == "default"

@@ -22,6 +22,11 @@ _engine: Optional[HttpEngine] = None
 _COOKIE_JAR: str | None = None
 _HTTP_SESSION_HEADERS: dict[str, str] = {}
 
+# Headers that carry a credential. Stripped whenever a request is bound to a
+# named identity or explicitly marked sessionless, so the single legacy
+# session in `auth.cookies` can never authenticate every other request.
+_AUTH_HEADERS = frozenset({"authorization", "cookie", "cookie_header", "x-api-key"})
+
 def _get_cookie_jar() -> str:
     global _COOKIE_JAR
     if _COOKIE_JAR is None or not os.path.exists(_COOKIE_JAR):
@@ -70,10 +75,22 @@ def configure_http_session(config: Optional[dict] = None):
     _HTTP_SESSION_HEADERS = headers
 
 
-def _merge_session_headers(headers: Optional[dict] = None) -> dict:
+def _merge_session_headers(headers: Optional[dict] = None,
+                           drop_auth: bool = False) -> dict:
+    """Combine the globally configured headers with the caller's.
+
+    `drop_auth` removes the credentials. The global `Cookie` and
+    `Authorization` headers come from a single legacy session, and applying
+    them to a request made under a different identity would defeat the whole
+    point of isolated jars — and applying them to an anonymous probe would
+    turn "this record is public" into a false claim.
+    """
     merged = dict(_HTTP_SESSION_HEADERS)
     if headers:
-        merged.update({str(k): str(v) for k, v in headers.items() if v is not None})
+        merged.update({str(k): v for k, v in headers.items() if v is not None})
+    if drop_auth:
+        for name in [h for h in merged if h.lower() in _AUTH_HEADERS]:
+            merged.pop(name, None)
     return merged
 
 
@@ -171,11 +188,15 @@ async def _curl_subprocess(url: str, method: str = "GET",
                            http1_0: bool = False,
                            output: str = "status",
                            follow_redirects: bool = True,
-                           timeout: int = 10) -> dict:
+                           timeout: int = 10,
+                           session_headers: Optional[dict] = None) -> dict:
     """Original curl-subprocess path.
 
     Kept for the two cases the aiohttp engine cannot serve: forcing HTTP/1.0
     (waf_module's protocol probe) and running without aiohttp installed.
+
+    `session_headers` carries the already-merged global headers so this path
+    applies exactly the same credential-stripping rules as the engine.
     """
     cmd = ["curl", "-s", "--max-time", str(timeout), "--connect-timeout", "5"]
 
@@ -197,7 +218,8 @@ async def _curl_subprocess(url: str, method: str = "GET",
         cmd.append("--http1.0")
     if method != "GET":
         cmd.extend(["-X", method])
-    merged_headers = _merge_session_headers(headers)
+    merged_headers = session_headers if session_headers is not None \
+        else _merge_session_headers(headers)
     if merged_headers:
         for k, v in merged_headers.items():
             cmd.extend(["-H", f"{k}: {v}"])
@@ -252,7 +274,8 @@ async def curl(url: str, method: str = "GET",
               output: str = "status",
               follow_redirects: bool = True,
               timeout: int = 10,
-              identity: Optional[str] = None) -> dict:
+              identity: Optional[str] = None,
+              no_session: bool = False) -> dict:
     """HTTP request via the pooled aiohttp engine.
 
     Drop-in replacement for the old curl wrapper: same arguments, same return
@@ -263,8 +286,14 @@ async def curl(url: str, method: str = "GET",
     `identity` selects an isolated cookie jar. Requests using different
     identities never see each other's cookies, which is the precondition for
     two-account IDOR testing.
+
+    `no_session` drops the globally configured `Authorization` and `Cookie`
+    headers. Two callers need it: the anonymous probe, which would otherwise
+    send a global credential and report an authenticated read as a public
+    exposure, and any request bound to a named identity, which supplies its
+    own. Non-authentication headers such as User-Agent still apply.
     """
-    merged_headers = _merge_session_headers(headers)
+    merged_headers = _merge_session_headers(headers, drop_auth=no_session or bool(identity))
 
     # HTTP/1.0 has no aiohttp equivalent, and a missing aiohttp disables the
     # engine entirely — both fall back to the original subprocess.
@@ -273,6 +302,7 @@ async def curl(url: str, method: str = "GET",
             return await _curl_subprocess(
                 url, method, headers, data, http1_0, output,
                 follow_redirects, timeout,
+                session_headers=merged_headers,
             )
 
     async with _http_limiter:

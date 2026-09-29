@@ -231,13 +231,30 @@ class HttpEngine:
         return {cookie.key: cookie.value for cookie in jar}
 
     def forget_identities(self) -> None:
-        """Discard every session's cookies without tearing down the pool.
+        """Drop every cookie while leaving the connection pool intact.
 
-        Sessions are recreated lazily on next use, so the connection pool
-        survives — this is a cookie reset, not a connection reset.
+        The sessions themselves are kept. They all share this engine's single
+        `TCPConnector`, but aiohttp scopes cookies to the *session* rather than
+        the request, so each one owns the jar that has to be cleared. Emptying
+        the jars in place is the real cookie reset and leaves the pooled
+        sockets immediately reusable.
+
+        Discarding `self._sessions` would look equivalent — the next request
+        would build a fresh session and see no cookies — but it orphans
+        unclosed `ClientSession` objects for the garbage collector to reap
+        (surfacing as "Unclosed client session") instead of releasing them
+        here, and it throws away the identity registry for no gain.
         """
-        self._sessions = {}
-        self._identities = []
+        for name in list(self._sessions):
+            try:
+                self._sessions[name].cookie_jar.clear()
+            except Exception:
+                # One jar refusing to clear must not leave the other
+                # identities holding cookies. Dropping the session is the
+                # fallback; it is rebuilt empty on the next request.
+                self._sessions.pop(name, None)
+        self._identities = [name for name in self._identities
+                            if name in self._sessions]
 
     async def _on_connection_reuse(self, _session, _ctx, _params) -> None:
         """A pooled connection was reused instead of dialling a new one."""

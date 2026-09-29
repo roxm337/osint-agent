@@ -50,20 +50,32 @@ auth:
   #
   #   2. Scripted login (harness submits the form and adopts the cookie):
   #        user_b:
+  #          verify_url: "https://target/dashboard"
+  #          success_marker: "Sign out"
   #          login:
   #            url: "https://target/login"
   #            method: POST
   #            data: {user: me@example.com, pass: "..."}
-  #            success_marker: "Sign out"
+  #
+  #      The login page is fetched first and its hidden fields are merged in,
+  #      so CSRF and authenticity tokens are handled without configuration.
+  #      Set `csrf: false` for a form that has none, or `content_type: json`
+  #      for a JSON API (data is then serialised and not CSRF-patched).
   #
   #   3. Bearer token:
   #        user_c:
   #          bearer_token: "eyJhbGci..."
   #          verify_url: "https://target/api/me"
   #
-  # success_marker matters more than it looks. A failed login usually returns
-  # HTTP 200 with the login form again, so without a marker the harness cannot
-  # tell a real session from a bounce and will report confident nonsense.
+  #   4. HTTP Basic:
+  #        user_d:
+  #          basic_auth: {user: "api-user", password: "..."}
+  #          verify_url: "https://target/api/me"
+  #
+  # `success_marker` sits on the identity, not inside `login`, and matters more
+  # than it looks: a failed login usually returns HTTP 200 with the login form
+  # again, so without a marker the harness cannot tell a real session from a
+  # bounce and will report confident nonsense.
   identities: {}
   #   user_a:
   #     cookies: {session: "..."}
@@ -122,6 +134,50 @@ modules:
     endpoints: []
     # Ceiling on cross-account probes per endpoint template.
     max_probes_per_template: 15
+
+    # Ceiling on collection endpoints fetched while mapping who owns what.
+    max_collections: 60
+
+    # Collection endpoints to enumerate directly. When neither `endpoints` nor
+    # a discovered object URL exists, the module synthesises object templates
+    # from these — that is the case where recon only ever found a list route.
+    collection_paths: []
+    #   - "/api/v1/invoices"
+
+    # Probe a built-in resource wordlist for collection endpoints. This is
+    # what finds objects the crawler never saw. Costs one request per
+    # (prefix x resource), so lower `max_collections` if the target is slow.
+    probe_collections: true
+    # Resources to try when the wordlist above is not enough. Defaults to a
+    # built-in list of per-user resources.
+    resources: []
+    # api_prefixes: ["/api", "/api/v1", "/v1"]
+
+    # Page that identifies the *requesting* account, used to attribute a leak
+    # to a third party. Defaults to each identity's own verify_url.
+    account_endpoint: ""
+
+    # Objects readable with no session at all. Off by default because it
+    # widens the test surface beyond the accounts you supplied.
+    test_anonymous: false
+
+    # Cross-account write authorisation. Reading another account's invoice is
+    # bad; overwriting it is worse, and many apps check GET but not the
+    # mutating verbs. PATCH/PUT echo the record's current values back, so a
+    # confirmed bug still leaves the data intact.
+    test_write_methods: []
+    #   - PATCH
+    #   - PUT
+    # DELETE cannot be made safe and is never sent without this flag.
+    allow_destructive: false
+
+    # Sequential identifier probing for records belonging to accounts you do
+    # not control — the case two test accounts can never prove. Reaches other
+    # people's data, so it is opt-in and bounded.
+    id_probing:
+      enabled: false
+      radius: 3    # how far from each known reference to try
+      max: 20      # hard ceiling on requests
 
 misconfig:
   concurrency: 12

@@ -21,7 +21,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse
 
 from tools.wrappers import curl, get_engine
 
@@ -56,6 +56,7 @@ class Identity:
     cookies: dict[str, str] = field(default_factory=dict)
     headers: dict[str, str] = field(default_factory=dict)
     bearer_token: str = ""
+    basic_auth: tuple = ()          # (user, password) for HTTP Basic
     login: dict[str, Any] = field(default_factory=dict)
     verify_url: str = ""
     success_marker: str = ""
@@ -68,14 +69,22 @@ class Identity:
             bits.append(f"{len(self.cookies)} cookie(s)")
         if self.bearer_token:
             bits.append("bearer token")
+        if self.basic_auth:
+            bits.append("basic auth")
         if self.login:
             bits.append("login flow")
         return f"{self.name} ({', '.join(bits) or 'no credentials'})"
 
     def request_headers(self) -> dict[str, str]:
         headers = dict(self.headers)
-        if self.bearer_token and "Authorization" not in headers:
-            headers["Authorization"] = f"Bearer {self.bearer_token}"
+        if "Authorization" not in headers:
+            if self.bearer_token:
+                headers["Authorization"] = f"Bearer {self.bearer_token}"
+            elif self.basic_auth:
+                import base64
+                raw = f"{self.basic_auth[0]}:{self.basic_auth[1]}"
+                encoded = base64.b64encode(raw.encode()).decode()
+                headers["Authorization"] = f"Basic {encoded}"
         return headers
 
     # ── Session establishment ────────────────────────────────────
@@ -94,11 +103,22 @@ class Identity:
                 self.verification_note = "login request failed"
                 return False
 
-        if self.cookies or self.bearer_token:
+        if self.cookies:
             # Seed the engine jar so every later request carries the session.
             get_engine().set_cookies(self.cookies, identity=self.name)
 
         return await self.verify(base_url)
+
+    def has_credentials(self) -> bool:
+        """Whether any authentication material is configured at all.
+
+        Basic auth is stateless, so there is nothing to seed into the cookie
+        jar — the header travels with each request. It still counts as a
+        credential, and leaving it out made a correctly configured Basic
+        identity look credential-less to the fallback path.
+        """
+        return bool(self.cookies or self.bearer_token or self.basic_auth
+                    or self.headers.get("Authorization"))
 
     async def _perform_login(self, base_url: str) -> bool:
         """Submit the configured login and adopt any session cookie set."""
@@ -113,20 +133,43 @@ class Identity:
         method = str(spec.get("method", "POST")).upper()
         payload = spec.get("data", {}) or {}
         content_type = spec.get("content_type", "")
+        is_json = content_type == "json" or spec.get("json") is True
+
+        # Hidden fields the server put in the form: CSRF tokens, authenticity
+        # tokens, and framework bookkeeping. Django, Rails, Laravel, Spring and
+        # most enterprise stacks reject a login POST that omits these, so a
+        # scripted login that skips the page fetch fails for a reason that has
+        # nothing to do with the credentials.
+        extra_headers: dict[str, str] = {}
+        if spec.get("csrf", True) and not is_json:
+            page = await self._fetch_form_page(url, spec)
+            # A raw string body is parsed first so hidden fields can still be
+            # merged; dropping the page fields there would silently discard
+            # the caller's own credentials.
+            if isinstance(payload, str):
+                merged = dict(parse_qsl(payload.lstrip("?"), keep_blank_values=True))
+            else:
+                merged = dict(payload or {})
+            payload = {**page["fields"], **merged}
+            for cookie_name, cookie_value in page["cookies"].items():
+                get_engine().set_cookies({cookie_name: cookie_value}, identity=self.name)
+            if page["referer"]:
+                extra_headers["Referer"] = page["referer"]
 
         kwargs: dict[str, Any] = {"output": "full", "follow_redirects": True}
-        if content_type == "json" or spec.get("json") is True:
+        if is_json:
             # The wrapper takes a body string, not a dict, so the JSON is
             # encoded here and the content type set explicitly.
             kwargs["data"] = json.dumps(payload)
             kwargs["headers"] = {"Content-Type": "application/json"}
         else:
-            kwargs["data"] = payload if isinstance(payload, str) else _form_encode(payload)
+            kwargs["data"] = _form_encode(payload)
             # Required: aiohttp sends a string body as text/plain, which makes
             # the server see an empty form. Without this every scripted
             # form login fails while looking like a network error.
             kwargs["headers"] = {
-                "Content-Type": content_type or "application/x-www-form-urlencoded"
+                "Content-Type": content_type or "application/x-www-form-urlencoded",
+                **extra_headers,
             }
 
         try:
@@ -146,13 +189,33 @@ class Identity:
         if harvested:
             self.cookies = {**harvested, **self.cookies}
 
-        if spec.get("extract_token"):
+        if spec.get("extract_token", True):
             token = _extract_token(result.get("body", ""))
-            if token:
+            if token and not self.bearer_token:
                 self.bearer_token = token
                 self.headers.setdefault("Authorization", f"Bearer {token}")
 
         return True
+
+    async def _fetch_form_page(self, url: str, spec: dict) -> dict:
+        """GET the login page and harvest its hidden fields and cookies.
+
+        A failure here is not fatal: plenty of applications need no CSRF token,
+        and the login POST is still worth sending.
+        """
+        page = {"fields": {}, "cookies": {}, "referer": url}
+        try:
+            result = await curl(url, method="GET", identity=self.name, output="body")
+        except Exception:
+            return page
+
+        if result.get("status", 0) in (0, 404, 500, 502, 503):
+            return page
+
+        body = result.get("body", "") or ""
+        page["fields"] = _hidden_form_fields(body)
+        page["cookies"] = dict(get_engine().cookies_for(self.name))
+        return page
 
     # ── Verification ─────────────────────────────────────────────
 
@@ -166,7 +229,7 @@ class Identity:
         """
         url = self.verify_url or base_url
         if not url:
-            self.verified = bool(self.cookies or self.bearer_token)
+            self.verified = self.has_credentials()
             self.verification_note = (
                 "assumed authenticated — no verify_url configured"
                 if self.verified else "no credentials and no verify_url"
@@ -229,13 +292,39 @@ def _form_encode(payload: Any) -> str:
     """Encode a dict as application/x-www-form-urlencoded."""
     if isinstance(payload, str):
         return payload
-    from urllib.parse import urlencode
     return urlencode({k: v for k, v in (payload or {}).items() if v is not None})
 
 
 _TOKEN_RE = re.compile(
     r'"(?:access_token|token|id_token|jwt)"\s*:\s*"([^"]{8,})"', re.IGNORECASE
 )
+
+# `<input type="hidden" name="csrfmiddlewaretoken" value="...">` in any
+# attribute order, which is how every mainstream framework emits them.
+_HIDDEN_INPUT_RE = re.compile(
+    r"<input\b[^>]*\btype\s*=\s*[\"']?hidden[\"']?[^>]*>", re.IGNORECASE
+)
+_ATTR_RE = re.compile(r"""(\w[\w:-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""")
+
+
+def _hidden_form_fields(html: str) -> dict:
+    """Name/value pairs from every hidden input on the page.
+
+    Returned fields are merged *under* the caller's explicit `data`, so a
+    configured field always wins over one scraped from the page and a stale
+    token in the config cannot silently override the live one.
+    """
+    fields: dict[str, str] = {}
+    for tag in _HIDDEN_INPUT_RE.findall(html or ""):
+        attrs: dict[str, str] = {}
+        for match in _ATTR_RE.finditer(tag):
+            name = match.group(1).lower()
+            value = match.group(2) or match.group(3) or match.group(4) or ""
+            attrs[name] = value
+        name = attrs.get("name")
+        if name:
+            fields[name] = attrs.get("value", "")
+    return fields
 
 
 def _extract_token(body: str) -> str:
@@ -272,9 +361,16 @@ class AuthHarness:
                 cookies=_as_str_dict(entry.get("cookies")),
                 headers=_as_str_dict(entry.get("headers")),
                 bearer_token=str(entry.get("bearer_token") or entry.get("token") or ""),
+                basic_auth=_basic_pair(entry.get("basic_auth") or entry.get("basic")),
                 login=entry.get("login") or {},
                 verify_url=str(entry.get("verify_url") or ""),
-                success_marker=str(entry.get("success_marker") or ""),
+                # Earlier documentation put this inside `login`, so both are
+                # honoured. A top-level value wins.
+                success_marker=str(
+                    entry.get("success_marker")
+                    or (entry.get("login") or {}).get("success_marker")
+                    or ""
+                ),
             )
             self.identities[name] = identity
 
@@ -333,16 +429,30 @@ class AuthHarness:
         """Issue a request with no session at all.
 
         Uses a dedicated identity so it cannot inherit cookies from the
-        authenticated sessions.
+        authenticated sessions, and additionally drops the globally configured
+        `Cookie`/`Authorization` headers. Without that, a run configured with
+        the legacy single-session `auth.cookies` would send a live credential
+        here and report an ordinary authenticated read as a public exposure.
         """
         kwargs.setdefault("output", "body")
-        return await curl(url, identity="__anonymous__", **kwargs)
+        return await curl(url, identity="__anonymous__", no_session=True, **kwargs)
 
 
 def _as_str_dict(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
     return {str(k): str(v) for k, v in value.items() if k and v is not None and str(v) != ""}
+
+
+def _basic_pair(value: Any) -> tuple:
+    """Accept `basic_auth: {user: a, password: b}` or a two-item sequence."""
+    if isinstance(value, dict):
+        user = str(value.get("user") or value.get("username") or "")
+        password = str(value.get("password") or value.get("pass") or "")
+        return (user, password) if user else ()
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return (str(value[0]), str(value[1]))
+    return ()
 
 
 def fingerprint_body(body: str) -> dict:
