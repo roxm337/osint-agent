@@ -234,6 +234,15 @@ modules:
       - "__proto__"
       - "constructor.prototype"
 
+  http_smuggling:
+    enabled: true
+
+    # Hosts to hand to smuggler. Left empty, URLs from recon are used.
+    # Results land as TENTATIVE, never as confirmed findings: smuggling needs a
+    # front end and a back end that disagree on request boundaries, which no
+    # single-host check can show.
+    max_targets: 10
+
   open_redirect:
     enabled: true
 
