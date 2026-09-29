@@ -49,8 +49,16 @@ class Orchestrator:
 
         # State
         report_dir = self.output_dir / self.domain
-        self.state = StateManager(str(report_dir))
+        self.        state = StateManager(str(report_dir))
         configure_oob(self.config)
+
+        # Chain execution. Off unless asked for, and the risk ceiling defaults
+        # to LOW so that only SAFE/LOW actions can fire without an explicit
+        # opt-in to something more aggressive.
+        self.execute_chains = False
+        self.max_risk = "LOW"
+        self.max_actions = 25
+        self.max_chains = 10
 
     def _load_config(self, path: str) -> dict:
         """Load YAML config."""
@@ -218,14 +226,51 @@ class Orchestrator:
                 print(f"    {path.summary}")
                 print()
 
+        # Actually prove them. This is the step that used to be missing: the
+        # chains above were printed and nothing was ever run against the
+        # target, so every finding stayed a claim.
+        report = await self._execute_chains(chains)
+
         # Summary
         budget_summary = self.budget.summary() if hasattr(self, 'budget') else {}
         print(f"{'='*60}")
         print(f"  PENTEST COMPLETE")
         print(f"  Attack chains found: {chains_found}")
+        if report is not None:
+            print(f"  Edges proven: {report.proven}  ({report.summary()})")
         print(f"  Budget used: {budget_summary.get('requests', 'N/A')}")
         print(f"  Attack graph: {self.output_dir / self.target / 'attack_graph.json'}")
         print(f"{'='*60}\n")
+
+    async def _execute_chains(self, chains):
+        """Run the proving action for each chain edge, under risk and budget."""
+        from core.chain_executor import ChainExecutor
+
+        if not self.execute_chains:
+            print("  Chain execution is off. Pass --execute to prove chains.")
+            return None
+
+        ceiling = RiskLevel(str(self.max_risk).upper())
+        executor = ChainExecutor(
+            self.state, self.config, budget=self.budget,
+            max_risk=ceiling, max_actions=self.max_actions,
+        )
+        print(f"  Executing chains (risk ceiling: {ceiling.value}, "
+              f"max {self.max_actions} actions)")
+        report = await executor.execute(chains, max_chains=self.max_chains)
+
+        for outcome in report.ran:
+            if outcome.finding_id:
+                print(f"    PROVEN  {outcome.action_id} -> {outcome.finding_id} "
+                      f"[{outcome.confidence}] {outcome.impact or outcome.detail}")
+            else:
+                print(f"    ran     {outcome.action_id}: {outcome.detail}")
+        for outcome in report.blocked:
+            print(f"    BLOCKED {outcome.action_id}: {outcome.detail}")
+        for outcome in report.skipped:
+            print(f"    skip    {outcome.action_id}: {outcome.detail}")
+        print()
+        return report
 
     async def run_module(self, module_id: str):
         """Run a single module by ID."""
@@ -298,6 +343,13 @@ Examples:
   # Pentest mode: build attack graph + run action library
   python orchestrator.py -t euro2c.com --pentest
 
+  # Pentest and actually prove the chains (risk ceiling LOW by default)
+  python orchestrator.py -t euro2c.com --pentest --execute
+
+  # Raise the ceiling. This is what unlocks sqlmap, cloud metadata and the
+  # rest, so it should be a deliberate choice rather than a default.
+  python orchestrator.py -t euro2c.com --pentest --execute --max-risk MEDIUM
+
   # Pentest with active vuln scanning first
   python orchestrator.py -t euro2c.com --active --pentest
 
@@ -326,6 +378,17 @@ Examples:
                         help="List all registered pentesting actions")
     parser.add_argument("--pentest", action="store_true",
                         help="Post-OSINT attack graph analysis + action execution")
+    parser.add_argument("--execute", action="store_true",
+                        help="Actually run the proving action for each chain. "
+                             "Without this, pentest mode only prints chains.")
+    parser.add_argument("--max-risk", default="LOW",
+                        choices=["SAFE", "LOW", "MEDIUM", "HIGH", "DESTRUCTIVE"],
+                        help="Risk ceiling for executed actions (default: LOW). "
+                             "MEDIUM+ allows sqlmap and cloud metadata probes.")
+    parser.add_argument("--max-actions", type=int, default=25,
+                        help="Cap on actions executed per engagement (default: 25)")
+    parser.add_argument("--max-chains", type=int, default=10,
+                        help="Cap on chains executed per engagement (default: 10)")
     parser.add_argument("--agent", action="store_true",
                         help="Autonomous multi-agent pentesting engagement")
     parser.add_argument("--phase", choices=["plan", "recon", "vuln", "exploit", "verify", "report"],
@@ -389,6 +452,14 @@ Examples:
         config_path=args.config,
         mode=mode,
     )
+    orchestrator.execute_chains = bool(args.execute)
+    orchestrator.max_risk = args.max_risk
+    orchestrator.max_actions = args.max_actions
+    orchestrator.max_chains = args.max_chains
+
+    if args.pentest and args.execute and args.max_risk not in ("SAFE", "LOW"):
+        print(f"\n  Chain execution enabled, risk ceiling {args.max_risk}.")
+        print("  Only run this against targets you are authorised to test.\n")
 
     try:
         if args.agent or args.phase:
@@ -434,7 +505,6 @@ Examples:
                 else:
                     await orchestrator.run_all()
             await orchestrator.run_pentest()
-        elif args.module:
             await orchestrator.run_module(args.module)
         elif mode == "llm":
             await orchestrator.run_llm()
