@@ -234,6 +234,23 @@ modules:
       - "__proto__"
       - "constructor.prototype"
 
+  open_redirect:
+    enabled: true
+
+    # Parameter names to try. Left empty, the common redirect names plus any
+    # redirect-like name recon already recorded.
+    params: []
+    #   - "next"
+    #   - "returnUrl"
+
+    # Endpoints to test. Left empty, URLs from recon are used, then a short
+    # list of shapes that usually redirect (sign-in flows included).
+    endpoints: []
+
+    # (endpoint, parameter) pairs to try. Each pair may send several payload
+    # shapes, so this is the real bound on request volume.
+    max_targets: 40
+
   cors_audit:
     enabled: true
 
