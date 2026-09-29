@@ -1,4 +1,4 @@
-"""Verification actions — oracle-driven confirmation and scope integrity checks."""
+"""Verification actions — oracle-driven confirmation checks."""
 
 from actions.registry import action, ActionContext, ActionResult
 from core.verification_oracle import (VerificationOracle, DifferentialAnalyzer,

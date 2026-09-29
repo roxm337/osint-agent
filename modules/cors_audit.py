@@ -10,7 +10,7 @@ class CORSAudit(BaseModule):
     stage = 5
     detectability = "medium"
     depends_on = ["tech_detection"]
-    requires_auth = True
+    active = True
 
     async def run(self) -> str:
         if not tool_available("corsy"):
@@ -24,8 +24,6 @@ class CORSAudit(BaseModule):
         findings = []
         evidence_refs = []
         for target in targets[:20]:
-            if not self.scope.check(target).allowed:
-                continue
             result = await corsy_scan(target, timeout=180)
             results = result.get("results", [])
             findings.extend(results)

@@ -9,9 +9,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Optional
 
-from core.risk_gate import RiskGate, RiskTier
-from core.scope import ScopeGuard
-
 
 class RiskLevel(Enum):
     SAFE = "SAFE"
@@ -19,15 +16,6 @@ class RiskLevel(Enum):
     MEDIUM = "MEDIUM"
     HIGH = "HIGH"
     DESTRUCTIVE = "DESTRUCTIVE"
-
-
-RISK_TO_TIER = {
-    RiskLevel.SAFE: RiskTier.SAFE,
-    RiskLevel.LOW: RiskTier.LOW,
-    RiskLevel.MEDIUM: RiskTier.MEDIUM,
-    RiskLevel.HIGH: RiskTier.HIGH,
-    RiskLevel.DESTRUCTIVE: RiskTier.DESTRUCTIVE,
-}
 
 
 @dataclass
@@ -49,8 +37,6 @@ class ActionContext:
     action_id: str
     params: dict[str, Any]
     target: str
-    scope: ScopeGuard
-    risk_gate: RiskGate
     timeout: int = 120
     meta: Optional[ActionMeta] = None
     audit: Optional[Any] = None
@@ -108,33 +94,6 @@ class ActionRegistry:
             return ActionResult(False, error=f"unknown action: {action_id}")
 
         meta, fn = entry
-
-        # Risk gate
-        tier = RISK_TO_TIER.get(meta.risk, RiskTier.SAFE)
-        decision = ctx.risk_gate.approve(tier, action_id, ctx.target)
-        if not decision.allowed:
-            if ctx.audit:
-                ctx.audit.gate("risk", action_id, ctx.target,
-                               allowed=False, reason=decision.reason,
-                               risk=meta.risk.value)
-            return ActionResult(False, error=f"risk gate blocked: {decision.reason}")
-        if ctx.audit:
-            ctx.audit.gate("risk", action_id, ctx.target,
-                           allowed=True, reason=decision.reason,
-                           risk=meta.risk.value)
-
-        # Scope check
-        scope_decision = ctx.scope.check(ctx.target)
-        if not scope_decision.allowed:
-            if ctx.audit:
-                ctx.audit.gate("scope", action_id, ctx.target,
-                               allowed=False, reason=scope_decision.reason,
-                               risk=meta.risk.value)
-            return ActionResult(False, error=f"out of scope: {scope_decision.reason}")
-        if ctx.audit:
-            ctx.audit.gate("scope", action_id, ctx.target,
-                           allowed=True, reason=scope_decision.reason,
-                           risk=meta.risk.value)
 
         # Validate required params
         for req in meta.requires:

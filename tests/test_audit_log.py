@@ -80,12 +80,12 @@ def test_sensitive_params_redacted(tmp_path):
 
 def test_typed_events_serialize(tmp_path):
     log = AuditLog(tmp_path / "audit.jsonl")
-    log.engagement_start("example.com", "agent", roe_id="ENG-1", dry_run=True)
-    log.roe_loaded({"engagement_id": "ENG-1"})
+    log.engagement_start("example.com", "agent")
     log.plan({"focus": "x", "hypotheses": [{"id": "HYP-1", "action_id": "web.xss.reflected"}]})
-    log.gate("scope", "web.xss.reflected", "example.com", allowed=False, reason="outside scope")
+    log.action("web.xss.reflected", "example.com", {"url": "https://example.com"},
+               risk="SAFE", result={"success": False})
     log.close()
 
     assert log.verify()["ok"] is True
     events = [r["event"] for r in log.read_records()]
-    assert events == ["engagement.start", "roe.loaded", "plan", "gate.decision"]
+    assert events == ["engagement.start", "plan", "action"]

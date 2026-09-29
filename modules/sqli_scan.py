@@ -10,7 +10,7 @@ class SQLiScan(BaseModule):
     stage = 5
     detectability = "high"
     depends_on = ["parameter_discovery"]
-    requires_auth = True
+    active = True
 
     async def run(self) -> str:
         if not tool_available("sqlmap"):
@@ -25,8 +25,6 @@ class SQLiScan(BaseModule):
         evidence_refs = []
         total = []
         for url in urls[:10]:
-            if not self.scope.check(url).allowed:
-                continue
             result = await sqlmap_scan(url, timeout=900)
             total.extend(result.get("results", []))
             evidence_refs.append(

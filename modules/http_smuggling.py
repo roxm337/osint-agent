@@ -10,7 +10,7 @@ class HTTPSmuggling(BaseModule):
     stage = 5
     detectability = "high"
     depends_on = ["tech_detection"]
-    requires_auth = True
+    active = True
 
     async def run(self) -> str:
         if not tool_available("smuggler"):
@@ -24,8 +24,6 @@ class HTTPSmuggling(BaseModule):
         findings = []
         evidence_refs = []
         for target in targets[:10]:
-            if not self.scope.check(target).allowed:
-                continue
             result = await smuggler_scan(target, timeout=300)
             findings.extend(result.get("results", []))
             evidence_refs.append(

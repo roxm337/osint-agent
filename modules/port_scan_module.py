@@ -88,7 +88,7 @@ class PortScan(BaseModule):
     stage = 3
     detectability = "high"
     depends_on = ["subdomain_enum"]
-    requires_auth = True
+    active = True
 
     async def run(self) -> str:
         ips = self.state.get_assets_by_type("ip")

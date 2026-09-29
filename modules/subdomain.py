@@ -133,8 +133,6 @@ class SubdomainEnum(BaseModule):
 
         added = 0
         for sub in all_subs:
-            if not self.scope.check(sub).allowed:
-                continue
             ips = resolved_all.get(sub, [])
             sources = source_map.get(sub, ["passive"])
 

@@ -11,7 +11,6 @@ from agents import get_llm_config
 from agents.blackboard import Blackboard, AgentRole
 from core.attack_graph import AttackGraph
 from core.budget_manager import BudgetManager, BudgetExceededError
-from core.risk_gate import RiskGate
 from state.manager import StateManager
 
 logger = logging.getLogger("osint-agent")
@@ -28,7 +27,6 @@ class BaseAgent:
         self.bb = blackboard
         self.llm = get_llm_config(config)
         self.model = self.llm["model"]
-        self.risk_gate = RiskGate(config)
         self.budget = BudgetManager(config)
         self.attack_graph: Optional[AttackGraph] = None
         self.audit = None  # core.audit_log.AuditLog, set by the engagement runner
@@ -118,8 +116,6 @@ class BaseAgent:
             action_id=action_id,
             params=params,
             target=target,
-            scope=__import__("core.scope", fromlist=["ScopeGuard"]).ScopeGuard(target, self.config),
-            risk_gate=self.risk_gate,
             timeout=meta.timeout,
             meta=meta,
             audit=self.audit,

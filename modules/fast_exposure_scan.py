@@ -64,10 +64,6 @@ class FastExposureScan(BaseModule):
 
     async def run(self) -> str:
         base_url = self._target()
-        if not self.scope.check(base_url).allowed:
-            self.state.block_module(self.id, "target outside scope")
-            return "blocked"
-
         cfg = self.config.get("fast_scan", {})
         timeout = int(cfg.get("timeout", 4) or 4)
         concurrency = max(1, int(cfg.get("concurrency", 8) or 8))

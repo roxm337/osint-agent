@@ -256,9 +256,6 @@ class DNSTakeover(BaseModule):
         risky = []
 
         for host in candidates:
-            if not self.scope.check(host).allowed:
-                continue
-
             cname = await dig("CNAME", host)
             cname_answers = cname.get("answers", [])
             if not cname_answers:

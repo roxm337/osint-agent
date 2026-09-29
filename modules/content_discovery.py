@@ -26,19 +26,15 @@ class ContentDiscovery(BaseModule):
     stage = 5
     detectability = "high"
     depends_on = ["tech_detection"]
-    requires_auth = True
+    active = True
 
     async def run(self) -> str:
-        self.log("Running authorized ffuf content discovery...")
+        self.log("Running ffuf content discovery...")
         if not tool_available("ffuf"):
             self.state.skip_module(self.id, "ffuf not installed")
             return "skipped"
 
         base_url = f"https://{self.domain}"
-        if not self.scope.check(base_url).allowed:
-            self.state.block_module(self.id, "target outside scope")
-            return "blocked"
-
         words = self.config.get("wordlists", {}).get("content_discovery", [])
         if not words:
             self.state.skip_module(self.id, "no content discovery wordlist")

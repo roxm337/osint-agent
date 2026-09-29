@@ -25,13 +25,8 @@ class LoginEnum(BaseModule):
             self.state.skip_module(self.id, "target is not WordPress")
             return "skipped"
 
-        if self.is_blocked():
-            self.state.block_module(self.id, "WAF active")
-            return "blocked"
-
         base_url = f"https://{self.domain}"
         self.log("Testing login user enumeration...")
-        self._auth_probe_blocked = False
 
         emails = self.state.get_assets_by_type("email")
         valid_email = next(
@@ -91,8 +86,6 @@ class LoginEnum(BaseModule):
         self.log("  Testing author ID enumeration...")
         confirmed_ids = []
         for uid in range(1, 11):
-            if self._auth_probe_blocked:
-                break
             result = await self._auth_probe(
                 f"{base_url}/?author={uid}", output="full",
             )
@@ -170,9 +163,6 @@ class LoginEnum(BaseModule):
         return "done"
 
     async def _auth_probe(self, url: str, **kwargs) -> dict:
-        if self._auth_probe_blocked:
-            return {"status": 0, "body": "", "error": "auth probe rate-limited"}
-
         result = await curl(url, **kwargs)
         status = result.get("status", 0)
         body = str(result.get("body", "")).lower()
@@ -181,15 +171,11 @@ class LoginEnum(BaseModule):
             "try again later", "rate limit", "captcha",
         )
         if status == 429 or any(s in body for s in lockout_signals):
-            self._auth_probe_blocked = True
             self.state.record_waf_block(url, status or 429)
             backoff = float(
-                self.config.get("auth", {}).get(
-                    "probe_backoff_seconds",
-                    self.waf_config.get("backoff_seconds", 10),
-                )
+                self.config.get("auth", {}).get("probe_backoff_seconds", 0)
             )
-            self.log(f"  Lockout signal; backing off {backoff:g}s")
             if backoff > 0:
+                self.log(f"  Lockout signal; backing off {backoff:g}s")
                 await asyncio.sleep(backoff)
         return result

@@ -18,7 +18,7 @@ class XSSScan(BaseModule):
     stage = 5
     detectability = "high"
     depends_on = ["parameter_discovery"]
-    requires_auth = True
+    active = True
 
     async def run(self) -> str:
         points = self._candidate_injection_points()
@@ -26,18 +26,13 @@ class XSSScan(BaseModule):
             self.state.skip_module(self.id, "no parameterized URLs")
             return "skipped"
 
-        in_scope = [point for point in points if self.scope.check(point["url"]).allowed]
-        if not in_scope:
-            self.state.block_module(self.id, "no in-scope URLs")
-            return "blocked"
-
         cfg = self.config.get("xss", {})
         max_points = int(cfg.get("max_points", 80))
         browser_enabled = bool(cfg.get("browser_confirm", True))
         browser_available = browser_enabled and await _playwright_available()
 
         internal_findings = []
-        for point in in_scope[:max_points]:
+        for point in points[:max_points]:
             finding = await self._test_reflected_xss(point, browser_available)
             if finding:
                 internal_findings.append(finding)
@@ -45,7 +40,7 @@ class XSSScan(BaseModule):
         dalfox_findings = []
         if tool_available("dalfox"):
             result = await dalfox_scan(
-                [point["url"] for point in in_scope[:max_points]],
+                [point["url"] for point in points[:max_points]],
                 timeout=int(cfg.get("dalfox_timeout", 600)),
             )
             dalfox_findings = result.get("results", []) if result.get("available", True) else []
@@ -57,7 +52,7 @@ class XSSScan(BaseModule):
             "xss_scan",
             self.domain,
             {
-                "targets": in_scope[:max_points],
+                "targets": points[:max_points],
                 "internal_findings": internal_findings,
                 "dalfox_findings": dalfox_findings,
                 "browser_confirm": browser_available,

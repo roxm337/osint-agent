@@ -33,9 +33,6 @@ class BrowserCrawl(BaseModule):
         evidence_refs = []
 
         for target in targets[:max_targets]:
-            if not self.scope.check(target).allowed:
-                continue
-
             rendered = await _render_page(target, self.config, wait_ms=wait_ms)
             discovered.update(rendered.get("links", []))
             discovered.update(rendered.get("forms", []))
@@ -60,11 +57,8 @@ class BrowserCrawl(BaseModule):
                 )
             )
 
-        scoped_urls = [
-            url for url in sorted(discovered)
-            if self.scope.check(url).allowed and _is_http(url)
-        ]
-        for url in scoped_urls[:1000]:
+        http_urls = [url for url in sorted(discovered) if _is_http(url)]
+        for url in http_urls[:1000]:
             asset_type = "api_endpoint" if _looks_api(url) else "url"
             self.state.add_asset(
                 asset_type,
@@ -77,26 +71,24 @@ class BrowserCrawl(BaseModule):
             self.state.add_edge(f"domain:{self.domain}", f"{asset_type}:{url}", "rendered_crawl_url")
 
         for js_url in sorted(js_urls)[:200]:
-            if self.scope.check(js_url).allowed:
-                self.state.add_asset(
-                    "js_file",
-                    f"js:{js_url}",
-                    js_url,
-                    confidence="FIRM",
-                    sources=[self.id],
-                    attrs={"rendered": True},
-                )
+            self.state.add_asset(
+                "js_file",
+                f"js:{js_url}",
+                js_url,
+                confidence="FIRM",
+                sources=[self.id],
+                attrs={"rendered": True},
+            )
 
         for map_url in sorted(source_maps)[:100]:
-            if self.scope.check(map_url).allowed:
-                self.state.add_asset(
-                    "source_map",
-                    f"source_map:{map_url}",
-                    map_url,
-                    confidence="FIRM",
-                    sources=[self.id],
-                    attrs={"rendered": True},
-                )
+            self.state.add_asset(
+                "source_map",
+                f"source_map:{map_url}",
+                map_url,
+                confidence="FIRM",
+                sources=[self.id],
+                attrs={"rendered": True},
+            )
 
         if dom_sinks:
             self.state.add_finding(
@@ -124,7 +116,7 @@ class BrowserCrawl(BaseModule):
             sources=[self.id],
             attrs={
                 "targets": targets[:max_targets],
-                "urls": len(scoped_urls),
+                "urls": len(http_urls),
                 "js_files": len(js_urls),
                 "source_maps": len(source_maps),
                 "dom_sinks": len(dom_sinks),
@@ -132,7 +124,7 @@ class BrowserCrawl(BaseModule):
         )
         self.state.complete_module(self.id)
         self.log(
-            f"Rendered crawl: {len(scoped_urls)} URLs | {len(js_urls)} JS | "
+            f"Rendered crawl: {len(http_urls)} URLs | {len(js_urls)} JS | "
             f"{len(source_maps)} source maps | {len(dom_sinks)} DOM sinks"
         )
         return "done"

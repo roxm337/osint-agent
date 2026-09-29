@@ -12,7 +12,7 @@ class OpenRedirectScan(BaseModule):
     stage = 5
     detectability = "medium"
     depends_on = ["parameter_discovery"]
-    requires_auth = True
+    active = True
 
     async def run(self) -> str:
         if not tool_available("openredirex"):
@@ -24,15 +24,14 @@ class OpenRedirectScan(BaseModule):
             self.state.skip_module(self.id, "no redirect-like parameters")
             return "skipped"
 
-        in_scope = [url for url in urls if self.scope.check(url).allowed]
-        result = await openredirex_scan(in_scope[:50], timeout=300)
+        result = await openredirex_scan(urls[:50], timeout=300)
         findings = result.get("results", [])
         evidence_id = self.state.add_evidence(
             self.id,
             "openredirex",
             self.domain,
             {
-                "targets": in_scope[:50],
+                "targets": urls[:50],
                 "results": findings,
                 "exit_code": result.get("exit_code"),
                 "stderr": result.get("stderr", ""),

@@ -26,8 +26,6 @@ class DeepCrawl(BaseModule):
         evidence_refs = []
         depth = int(self.config.get("crawl", {}).get("depth", 2))
         for target in targets[:10]:
-            if not self.scope.check(target).allowed:
-                continue
             source_results = {}
             if tool_available("katana"):
                 urls = await katana_crawl(target, depth=depth, timeout=180)
@@ -50,11 +48,8 @@ class DeepCrawl(BaseModule):
                 )
             )
 
-        in_scope_urls = [
-            url for url in sorted(discovered)
-            if self.scope.check(url).allowed and _is_http(url)
-        ]
-        for url in in_scope_urls[:1000]:
+        http_urls = [url for url in sorted(discovered) if _is_http(url)]
+        for url in http_urls[:1000]:
             asset_type = "api_endpoint" if _looks_api(url) else "url"
             self.state.add_asset(
                 asset_type,
@@ -66,8 +61,8 @@ class DeepCrawl(BaseModule):
             )
             self.state.add_edge(f"domain:{self.domain}", f"{asset_type}:{url}", "crawled_url")
 
-        api_urls = [url for url in in_scope_urls if _looks_api(url)]
-        admin_urls = [url for url in in_scope_urls if _looks_admin(url)]
+        api_urls = [url for url in http_urls if _looks_api(url)]
+        admin_urls = [url for url in http_urls if _looks_admin(url)]
         if api_urls or admin_urls:
             self.state.add_finding(
                 title="Crawl Discovered High-Value Endpoints",
@@ -90,10 +85,10 @@ class DeepCrawl(BaseModule):
             self.domain,
             confidence="FIRM",
             sources=[self.id],
-            attrs={"targets": targets, "urls": len(in_scope_urls)},
+            attrs={"targets": targets, "urls": len(http_urls)},
         )
         self.state.complete_module(self.id)
-        self.log(f"Crawl URLs: {len(in_scope_urls)}")
+        self.log(f"Crawl URLs: {len(http_urls)}")
         return "done"
 
     def _targets(self) -> list[str]:

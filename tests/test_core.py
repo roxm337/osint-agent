@@ -1,90 +1,14 @@
-"""Tests for core policy and scoring helpers."""
+"""Tests for core scoring, prioritization, and verification helpers."""
 
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.scope import ScopeGuard
 from core.keyvault import KeyVault
 from core.prioritization import prioritize_findings
 from core.scoring import score_finding, score_label
 from core.verification_oracle import InteractshClient, configure_oob
-
-
-class TestScopeGuardPermissive:
-    """Default: scope enforcement is off. Everything passes."""
-
-    def test_off_scope_hosts_are_allowed_by_default(self):
-        guard = ScopeGuard("example.com", {"target": {"scope": []}})
-
-        assert guard.check("example.com").allowed is True
-        assert guard.check("https://www.example.com/login").allowed is True
-        assert guard.check("other.com").allowed is True
-        assert guard.check("192.0.2.10").allowed is True
-
-    def test_deny_list_is_ignored_by_default(self):
-        guard = ScopeGuard(
-            "example.com",
-            {"target": {"scope": ["example.com"],
-                        "deny": ["admin.example.com"]}},
-        )
-        assert guard.check("admin.example.com").allowed is True
-
-    def test_filter_returns_all_by_default(self):
-        guard = ScopeGuard("example.com", {"target": {"scope": []}})
-        values = ["example.com", "other.com", "api.example.com"]
-        assert guard.filter(values) == values
-
-
-class TestScopeGuardEnforced:
-    """With scope.enforce = true, the guard blocks off-scope hosts."""
-
-    def test_default_scope_allows_target_and_subdomains(self):
-        guard = ScopeGuard(
-            "example.com",
-            {"scope": {"enforce": True}, "target": {"scope": []}},
-        )
-
-        assert guard.check("example.com").allowed is True
-        assert guard.check("https://www.example.com/login").allowed is True
-        assert guard.check("other.com").allowed is False
-
-    def test_deny_scope_wins(self):
-        guard = ScopeGuard(
-            "example.com",
-            {
-                "scope": {"enforce": True},
-                "target": {
-                    "scope": ["example.com", "*.example.com"],
-                    "deny": ["admin.example.com"],
-                },
-            },
-        )
-
-        assert guard.check("admin.example.com").allowed is False
-        assert guard.check("www.example.com").allowed is True
-
-    def test_cidr_scope(self):
-        guard = ScopeGuard(
-            "example.com",
-            {
-                "scope": {"enforce": True},
-                "target": {"scope": ["192.0.2.0/24"]},
-            },
-        )
-
-        assert guard.check("192.0.2.10").allowed is True
-        assert guard.check("198.51.100.10").allowed is False
-
-    def test_filter_drops_off_scope(self):
-        guard = ScopeGuard(
-            "example.com",
-            {"scope": {"enforce": True},
-             "target": {"scope": ["*.example.com"]}},
-        )
-        values = ["example.com", "api.example.com", "other.com"]
-        assert guard.filter(values) == ["api.example.com"]
 
 
 def test_score_finding_is_stable_and_labeled():

@@ -22,8 +22,6 @@ class GitExposure(BaseModule):
 
         for path in GIT_PATHS:
             url = f"{base_url}{path}"
-            if not self.scope.check(url).allowed:
-                continue
             result = await self.http_get(url, output="full")
             status = result.get("status", 0)
             body = result.get("body", "")

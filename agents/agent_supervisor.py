@@ -1,8 +1,8 @@
 """Agent Supervisor — orchestrates the multi-agent lifecycle.
 
-Execution runs by default. Pass `engage=False` to preview a dry-run
-(plan only, no actions executed). An ROE is optional and, when supplied,
-is recorded as engagement metadata; it does not gate execution.
+Runs the full plan → analyze → exploit → verify → report sequence with no
+gating, confirmation prompts, or dry-run mode. Resource use is bounded only
+by `budget_limits` in config (all zero/unlimited by default).
 """
 
 from __future__ import annotations
@@ -20,31 +20,20 @@ from agents.verification_agent import VerificationAgent
 from agents.reporting_agent import ReportingAgent
 from core.audit_log import AuditLog
 from core.budget_manager import BudgetExceededError
-from core.roe import ROE
 from state.manager import StateManager
 
 
-class EngagementGateError(Exception):
-    """Raised on unrecoverable engagement faults (e.g. budget exceeded)."""
-
-
-_EXECUTION_PHASES = {"exploit", "verify"}
+class BudgetAbortError(Exception):
+    """Raised when an engagement exceeds its resource budget."""
 
 
 class AgentSupervisor:
     """Top-level orchestrator that initializes and runs the multi-agent team."""
 
-    def __init__(self, state: StateManager, config: dict, *,
-                 roe: ROE | None = None,
-                 engage: bool = True,
+    def __init__(self, state: StateManager, config: dict,
                  audit: AuditLog | None = None):
         self.state = state
-        self._roe = roe
-        self._engage = engage
-
-        # ROE is metadata. It populates scope/exclude lists and marks
-        # authorization confirmed; it does not gate execution.
-        self.config = roe.enforce(config) if roe is not None else config
+        self.config = config
 
         self.bb = Blackboard(state, self.config)
         self.audit = audit or AuditLog(self.state.state_dir / "engagement.audit.jsonl")
@@ -63,37 +52,21 @@ class AgentSupervisor:
     # ── engagement entry points ───────────────────────────────────
 
     async def run_full_engagement(self) -> dict:
-        """Run plan + execution, or a pure dry-run plan if engage=False."""
+        """Run the full plan + execution lifecycle."""
         target = self.config.get("target", {}).get("domain", "?")
-        dry_run = not self._engage
-        roe_id = self._roe.to_dict().get("engagement_id", "") if self._roe else ""
 
         print("\n" + "=" * 60)
         print("  AUTONOMOUS PENTEST ENGAGEMENT")
         print(f"  Target: {target}")
-        print(f"  Mode: {'DRY RUN (plan only)' if dry_run else 'EXECUTE'}")
-        if roe_id:
-            print(f"  ROE: {roe_id}")
+        print("  Mode: EXECUTE")
         print("=" * 60 + "\n")
 
-        self.audit.engagement_start(target, "agent", roe_id=roe_id, dry_run=dry_run)
-
-        if dry_run:
-            return await self._run_dry_run()
-        return await self._run_engaged()
+        self.audit.engagement_start(target, "agent")
+        return await self._run_execution()
 
     async def run_single_phase(self, phase: str) -> dict:
         target = self.config.get("target", {}).get("domain", "?")
-        dry_run = not self._engage
-        roe_id = self._roe.to_dict().get("engagement_id", "") if self._roe else ""
-        self.audit.engagement_start(target, "phase", roe_id=roe_id, dry_run=dry_run)
-
-        if dry_run and phase in _EXECUTION_PHASES:
-            self.audit.record("phase.skipped", {
-                "phase": phase, "reason": "dry-run: engage=False",
-            })
-            print(f"  [{phase}] skipped: dry-run")
-            return {"phase": phase, "dry_run": True, "skipped_reason": "engage=False"}
+        self.audit.engagement_start(target, "phase")
 
         phase_map = {
             "plan": lambda: self.agents["supervisor"].analyze_and_plan(),
@@ -110,52 +83,17 @@ class AgentSupervisor:
             return {"phase": phase, "result": result}
         return {"error": f"Unknown phase: {phase}"}
 
-    # ── dry-run ───────────────────────────────────────────────────
+    # ── execution ─────────────────────────────────────────────────
 
-    async def _run_dry_run(self) -> dict:
-        print("[Plan] Supervisor: analyzing attack surface (dry-run)...")
-        plan = await self.agents["supervisor"].analyze_and_plan()
-        self.audit.plan(plan)
-        targets = self._write_plan_artifacts(plan)
-
-        action_targets = [
-            h for h in plan.get("hypotheses", []) if h.get("action_id")
-            and h.get("action_id") != "manual_review"
-        ]
-        print(f"  Plan created: {len(plan.get('hypotheses', []))} hypotheses, "
-              f"{len(action_targets)} would execute actions")
-        print("  No actions were executed — dry run.")
-        print(f"  Plan: {targets['plan_json']}")
-        print(f"  Markdown: {targets['plan_md']}")
-        print(f"  Dry-run report: {targets['dry_report']}\n")
-
-        summary = {
-            "mode": "dry_run",
-            "hypotheses_proposed": len(plan.get("hypotheses", [])),
-            "actions_would_run": len(action_targets),
-            "actions_to_endpoints": [
-                {
-                    "title": h.get("title"),
-                    "action_id": h.get("action_id"),
-                    "target": h.get("target"),
-                    "assigned_to": h.get("assigned_to"),
-                }
-                for h in plan.get("hypotheses", []) if h.get("action_id")
-            ][:50],
-        }
-        self.state.save()
-        return {"plan": plan, "dry_run": True, "summary": summary}
-
-    # ── engaged ───────────────────────────────────────────────────
-
-    async def _run_engaged(self) -> dict:
-        roe_id = self._roe.to_dict().get("engagement_id", "") if self._roe else ""
-
+    async def _run_execution(self) -> dict:
         # Phase 1: Supervisor analyzes and plans
         print("[Phase 1/5] Supervisor: Analyzing attack surface...")
         plan = await self.agents["supervisor"].analyze_and_plan()
         self.audit.plan(plan)
-        print(f"  Plan created: {len(plan.get('hypotheses', []))} hypotheses\n")
+        artifacts = self._write_plan_artifacts(plan)
+        print(f"  Plan created: {len(plan.get('hypotheses', []))} hypotheses")
+        print(f"  Plan: {artifacts['plan_json']}")
+        print(f"  Markdown: {artifacts['plan_md']}\n")
 
         # Phase 2: Vuln Analyst maps tech to CVEs
         print("[Phase 2/5] Vuln Analyst: Mapping technologies to vulnerabilities...")
@@ -232,8 +170,7 @@ class AgentSupervisor:
         print("=" * 60 + "\n")
 
         summary = {
-            "mode": "engaged",
-            "roe_id": roe_id,
+            "mode": "execute",
             "hypotheses_proposed": len(self.bb.get_hypotheses()),
             "confirmed_findings": len(confirmed_final),
             "rejected_hypotheses": len(rejected),
@@ -262,19 +199,11 @@ class AgentSupervisor:
 
         plan_json = report_dir / f"{domain}_attack_plan.json"
         plan_md = report_dir / f"{domain}_attack_plan.md"
-        dry_report = report_dir / f"{domain}_dry_run_report.json"
 
         plan_json.write_text(json.dumps(plan, indent=2, default=str))
         plan_md.write_text(_render_plan_markdown(plan, domain))
-        dry_report.write_text(json.dumps({
-            "mode": "dry_run",
-            "target": domain,
-            "roe_id": self._roe.to_dict().get("engagement_id", "") if self._roe else "",
-            "plan": plan,
-            "note": "Dry-run artifact. No actions were executed against the target.",
-        }, indent=2, default=str))
 
-        return {"plan_json": plan_json, "plan_md": plan_md, "dry_report": dry_report}
+        return {"plan_json": plan_json, "plan_md": plan_md}
 
     def _check_budget(self, agent: BaseAgent):
         try:
@@ -282,7 +211,7 @@ class AgentSupervisor:
         except BudgetExceededError as exc:
             self.audit.budget(agent.budget.summary())
             self.audit.record("engagement.abort", {"reason": str(exc)})
-            raise EngagementGateError(str(exc)) from exc
+            raise BudgetAbortError(str(exc)) from exc
 
     async def _run_exploitation_phase(self) -> list:
         results = []
@@ -301,7 +230,7 @@ class AgentSupervisor:
 
 def _render_plan_markdown(plan: dict, domain: str) -> str:
     lines = [
-        f"# Authorized Testing Plan: {domain}",
+        f"# Attack Plan: {domain}",
         "",
         f"Focus: {plan.get('focus', '-')}",
         "",

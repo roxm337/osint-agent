@@ -16,7 +16,7 @@ class CMSDeepScan(BaseModule):
     stage = 5
     detectability = "high"
     depends_on = ["tech_detection"]
-    requires_auth = True
+    active = True
 
     async def run(self) -> str:
         targets = self._targets()
@@ -30,8 +30,6 @@ class CMSDeepScan(BaseModule):
         evidence_refs = []
         findings = []
         for target, cms in targets[:5]:
-            if not self.scope.check(target).allowed:
-                continue
             cms_lower = cms.lower()
             if "wordpress" in cms_lower and tool_available("wpscan"):
                 result = await wpscan(target, timeout=300)

@@ -10,15 +10,13 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import logging
-from core.scope import ScopeGuard
 from state.manager import StateManager
 from modules import MODULE_REGISTRY, get_all_module_ids
 from tools.wrappers import configure_http_limiter, configure_http_session
 from core.attack_graph import AttackGraph
 from core.budget_manager import BudgetManager, BudgetExceededError
 from actions import ActionRegistry, ActionContext, list_actions
-from actions.registry import ActionMeta, RiskLevel, RISK_TO_TIER
-from core.risk_gate import RiskGate, RiskTier
+from actions.registry import ActionMeta, RiskLevel
 from core.verification_oracle import configure_oob
 
 logger = logging.getLogger("osint-agent")
@@ -31,8 +29,7 @@ class Orchestrator:
 
     def __init__(self, target: str, output_dir: str,
                  config_path: str = "config.yaml",
-                 mode: str = "auto",
-                 skip_auth_check: bool = False):
+                 mode: str = "auto"):
         self.raw_target = target
         self.output_dir = Path(output_dir)
         self.config = self._load_config(config_path)
@@ -47,11 +44,6 @@ class Orchestrator:
         self.config["target"]["domain"] = self.domain
         self.config["target"]["raw_url"] = target
         self.config["target"]["mode"] = mode
-        self.scope = ScopeGuard(self.domain, self.config)
-
-        # Authorization is implicit — no prompt, no gate.
-        self.config["target"]["authorization"] = "confirmed"
-        self.config["detectability"]["allow_high"] = True
 
         # State
         report_dir = self.output_dir / self.domain
@@ -68,16 +60,12 @@ class Orchestrator:
                 print(f"Warning: Could not load config: {e}")
         # Default config
         return {
-            "target": {"domain": "", "authorization": "confirmed", "mode": "active"},
+            "target": {"domain": "", "mode": "active"},
             "paths": {"output_dir": "reports", "state_dir": "reports/{target}/state"},
             "rate_limits": {"default": {"concurrent": 5, "per_minute": 60}},
-            "detectability": {"default": "high", "allow_high": True},
-            "scope": {"enforce": False},
-            "risk_gate": {"enforce": False},
-            "waf": {"max_bypass_attempts": 10, "backoff_seconds": 60,
-                    "block_codes": [503, 429], "honeypot_codes": [500]},
-            "modules": {"auto_run": True, "skip_on_waf": False,
-                        "max_consecutive_empty": 5},
+            "detectability": {"default": "high"},
+            "waf": {"block_codes": [503, 429], "honeypot_codes": [500]},
+            "modules": {"auto_run": True, "max_consecutive_empty": 5},
             "wordlists": {"subdomains": [], "misconfig_paths": [], "wp_paths": [],
                           "bucket_prefixes": [""], "bucket_suffixes": [""],
                           "cloud_providers": {}},
@@ -194,9 +182,8 @@ class Orchestrator:
         print(f"  Target: {self.target}")
         print(f"{'='*60}\n")
 
-        # Init budget and risk gate
+        # Init budget
         self.budget = BudgetManager(self.config)
-        self.risk_gate = RiskGate(self.config)
 
         # Build attack graph from current state
         graph = AttackGraph(self.state)
@@ -269,11 +256,7 @@ class Orchestrator:
         print(f"  Detectability: {entry['detectability']}")
 
         try:
-            if module.is_blocked():
-                result = "blocked"
-                self.state.block_module(module_id, "blocked by WAF safety policy")
-            else:
-                result = await module.run()
+            result = await module.run()
 
             if result == "done":
                 print(f"  ✓ Complete")
@@ -330,7 +313,7 @@ Examples:
     parser.add_argument("-o", "--output", default="reports", help="Output directory")
     parser.add_argument("-c", "--config", default="config.yaml", help="Config file")
     parser.add_argument("--active", action="store_true",
-                        help="Enable active mode (accepted, no longer gates anything)")
+                        help="Enable active mode (active probing, port scans, vuln scanners)")
     parser.add_argument("--module", help="Run a single module only")
     parser.add_argument("--mode", default="auto",
                         choices=["auto", "llm"],
@@ -349,8 +332,6 @@ Examples:
                         help="List available external tools")
     parser.add_argument("--install-tools", nargs="*",
                         help="Install missing external tools (optionally by category)")
-    parser.add_argument("--skip-auth-check", action="store_true",
-                        help="Accepted for backwards compatibility; no longer does anything")
 
     args = parser.parse_args()
 
@@ -393,9 +374,9 @@ Examples:
         print("\nAvailable modules:")
         for mid in get_all_module_ids():
             entry = MODULE_REGISTRY[mid]
-            auth = " [AUTH]" if entry.get("requires_auth") else ""
+            kind = " [ACTIVE]" if entry.get("active") else ""
             print(f"  {mid:25s} (stage {entry['stage']}, "
-                  f"{entry['detectability']}){auth}")
+                  f"{entry['detectability']}){kind}")
         print()
         return
 
@@ -405,15 +386,12 @@ Examples:
         output_dir=args.output,
         config_path=args.config,
         mode=mode,
-        skip_auth_check=args.skip_auth_check,
     )
 
     if args.agent or args.phase:
         from agents.agent_supervisor import AgentSupervisor
         # Inject the raw target URL so agents can target specific paths
         orchestrator.config["target"]["raw_url"] = args.target
-        orchestrator.config["target"]["authorization"] = "confirmed"
-        orchestrator.config["detectability"]["allow_high"] = True
 
         # Seed the raw URL as an asset + parameters for attack graph
         if "?" in args.target and "=" in args.target:

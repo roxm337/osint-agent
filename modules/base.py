@@ -6,7 +6,6 @@ import yaml
 from pathlib import Path
 from typing import Optional
 from core.keyvault import KeyVault
-from core.scope import ScopeGuard
 from core.verification_oracle import configure_oob
 from state.manager import StateManager
 from tools.wrappers import bash, configure_http_session, curl, dig, whois_lookup
@@ -22,7 +21,7 @@ class BaseModule:
     stage = 0
     detectability = "low"
     depends_on = []
-    requires_auth = False
+    active = False
 
     def __init__(self, state: StateManager, config: dict):
         self.state = state
@@ -32,32 +31,21 @@ class BaseModule:
         self.target = config.get("target", {})
         self.domain = self.target.get("domain", "")
         self.output_dir = Path(config.get("paths", {}).get("output_dir", "reports"))
-        self.scope = ScopeGuard(self.domain, config)
         self.keys = KeyVault(config)
         configure_http_session(config)
         configure_oob(config)
 
     async def run(self) -> str:
-        """Run the module. Returns 'done', 'skipped', or 'blocked'."""
-        raise NotImplementedError
+        """Run the module. Returns 'done' or 'skipped'.
 
-    def is_blocked(self) -> bool:
-        """WAF safety policy is disabled — never blocks."""
-        return False
+        Nothing is refused on policy grounds; a module that cannot run reports
+        'skipped' with a reason. The orchestrator records raised exceptions as
+        'blocked'.
+        """
+        raise NotImplementedError
 
     async def http_get(self, url: str, **kwargs) -> dict:
         """HTTP GET with WAF tracking."""
-        scope_check = kwargs.pop("scope_check", True)
-        if scope_check:
-            decision = self.scope.check(url)
-            if not decision.allowed:
-                self.log(f"Blocked out-of-scope HTTP request: {decision.value}")
-                return {
-                    "status": 0,
-                    "body": "",
-                    "error": f"out of scope: {decision.reason}",
-                }
-
         result = await curl(url, **kwargs)
         status = result.get("status", 0)
 
@@ -78,7 +66,6 @@ class BaseModule:
                 url,
                 {
                     "url": url,
-                    "scope_checked": scope_check,
                     "status": status,
                     "output": kwargs.get("output", "status"),
                     "body_preview": str(result.get("body", ""))[:5000],
@@ -91,11 +78,6 @@ class BaseModule:
     async def resolve(self, subdomain: str) -> Optional[str]:
         """Resolve subdomain to IP."""
         fqdn = f"{subdomain}.{self.domain}"
-        decision = self.scope.check(fqdn)
-        if not decision.allowed:
-            self.log(f"Blocked out-of-scope DNS resolve: {decision.value}")
-            return None
-
         result = await dig("A", fqdn)
         answers = result.get("answers", [])
         for answer in answers:

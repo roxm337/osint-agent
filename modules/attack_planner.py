@@ -13,7 +13,7 @@ class LLMAttackPlanner(BaseModule):
     stage = 6
     detectability = "low"
     depends_on = ["risk_prioritization"]
-    requires_auth = False
+    active = False
 
     async def run(self) -> str:
         self.log("Building authorized testing plan from OSINT findings...")

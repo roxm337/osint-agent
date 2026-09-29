@@ -30,16 +30,22 @@ class BudgetExceededError(Exception):
 
 
 class BudgetManager:
-    """Per-engagement budget enforcement."""
+    """Per-engagement resource accounting.
+
+    Caps are operator-set convenience limits, not safety policy. A limit of 0
+    (or absent) means unlimited for that dimension.
+    """
 
     def __init__(self, config: dict | None = None):
         cfg = config or {}
         limits = cfg.get("budget_limits", {})
 
-        self.max_requests = limits.get("max_requests", 0) or 10000
-        self.max_wall_clock = limits.get("max_wall_clock_seconds", 0) or 3600
-        self.max_llm_calls = limits.get("max_llm_calls", 0) or 200
-        self.max_concurrent_actions = limits.get("max_concurrent_actions", 0) or 5
+        self.max_requests = int(limits.get("max_requests", 0) or 0)
+        self.max_wall_clock = int(limits.get("max_wall_clock_seconds", 0) or 0)
+        self.max_llm_calls = int(limits.get("max_llm_calls", 0) or 0)
+        # Concurrency still needs a real value for the semaphore; it is a
+        # throughput knob rather than a cap, so it falls back to 5.
+        self.max_concurrent_actions = int(limits.get("max_concurrent_actions", 0) or 5)
 
         self.state = BudgetState(wall_start=time.time())
         self._lock = Lock()
@@ -57,11 +63,11 @@ class BudgetManager:
         now = time.time()
         exceeded = []
 
-        if self.state.requests_used >= self.max_requests:
+        if self.max_requests and self.state.requests_used >= self.max_requests:
             exceeded.append(f"requests ({self.state.requests_used}/{self.max_requests})")
-        if now - self.state.wall_start >= self.max_wall_clock:
+        if self.max_wall_clock and now - self.state.wall_start >= self.max_wall_clock:
             exceeded.append(f"wall clock ({now - self.state.wall_start:.0f}s/{self.max_wall_clock}s)")
-        if self.state.llm_calls_used >= self.max_llm_calls:
+        if self.max_llm_calls and self.state.llm_calls_used >= self.max_llm_calls:
             exceeded.append(f"LLM calls ({self.state.llm_calls_used}/{self.max_llm_calls})")
 
         if exceeded:
@@ -88,9 +94,9 @@ class BudgetManager:
 
     def summary(self) -> dict:
         return {
-            "requests": f"{self.state.requests_used}/{self.max_requests}",
-            "wall_clock": f"{self.elapsed():.0f}s/{self.max_wall_clock}s",
-            "llm_calls": f"{self.state.llm_calls_used}/{self.max_llm_calls}",
+            "requests": f"{self.state.requests_used}/{self.max_requests or '∞'}",
+            "wall_clock": f"{self.elapsed():.0f}s/{self.max_wall_clock or '∞'}s",
+            "llm_calls": f"{self.state.llm_calls_used}/{self.max_llm_calls or '∞'}",
             "actions": self.state.actions_used,
             "errored": self.state.errored,
             "exceeded": self.state.exceeded,

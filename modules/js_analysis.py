@@ -170,13 +170,12 @@ class JSAnalysis(BaseModule):
             if r.get("status") == 200 and "function" in r.get("body", ""):
                 js_urls.add(f"{base_url}{path}")
 
-        # Filter to in-scope JS files only
-        scoped_js = [
+        target_js = [
             url for url in js_urls
             if self.domain in url and url.endswith(".js")
         ][:50]  # Limit to 50 files
 
-        self.log(f"  Analyzing {len(scoped_js)} JS files...")
+        self.log(f"  Analyzing {len(target_js)} JS files...")
 
         all_secrets = []
         all_endpoints = []
@@ -184,7 +183,7 @@ class JSAnalysis(BaseModule):
         source_maps = []
         analyzed = 0
 
-        for js_url in scoped_js:
+        for js_url in target_js:
             result = await curl_with_status(js_url)
             if result.get("status") != 200:
                 continue
@@ -331,7 +330,7 @@ class JSAnalysis(BaseModule):
             sources=["js_analysis"],
             attrs={
                 "js_files_analyzed": analyzed,
-                "total_js_urls": len(scoped_js),
+                "total_js_urls": len(target_js),
                 "secrets_found": len(unique_secrets),
                 "endpoints_found": len(unique_endpoints),
                 "source_maps_found": len(source_maps),

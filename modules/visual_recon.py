@@ -20,13 +20,8 @@ class VisualRecon(BaseModule):
         if not targets:
             targets = [f"https://{self.domain}"]
 
-        in_scope = [target for target in targets if self.scope.check(target).allowed]
-        if not in_scope:
-            self.state.block_module(self.id, "no in-scope visual targets")
-            return "blocked"
-
         output_dir = self.state.state_dir / "screenshots"
-        result = await gowitness_scan(in_scope[:50], str(output_dir), timeout=300)
+        result = await gowitness_scan(targets[:50], str(output_dir), timeout=300)
         if not result.get("available", True):
             self.state.skip_module(self.id, "gowitness not installed")
             return "skipped"
@@ -36,7 +31,7 @@ class VisualRecon(BaseModule):
             "screenshots",
             self.domain,
             {
-                "targets": in_scope[:50],
+                "targets": targets[:50],
                 "output_dir": str(output_dir.relative_to(self.state.output_dir)),
                 "screenshots": result.get("screenshots", []),
                 "exit_code": result.get("exit_code"),
@@ -44,7 +39,7 @@ class VisualRecon(BaseModule):
             },
         )
 
-        for target in in_scope[:50]:
+        for target in targets[:50]:
             self.state.add_asset(
                 "screenshot_target",
                 f"screenshot:{target}",
@@ -55,7 +50,7 @@ class VisualRecon(BaseModule):
             )
 
         self.state.complete_module(self.id)
-        self.log(f"Screenshot targets: {len(in_scope[:50])}")
+        self.log(f"Screenshot targets: {len(targets[:50])}")
         return "done"
 
     def _targets(self) -> list[str]:

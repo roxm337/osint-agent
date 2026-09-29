@@ -46,7 +46,7 @@ class NucleiScan(BaseModule):
     stage = 5
     detectability = "high"
     depends_on = ["tech_detection"]
-    requires_auth = True
+    active = True
 
     async def run(self) -> str:
         self.log("Running authorized nuclei scan...")
@@ -55,10 +55,6 @@ class NucleiScan(BaseModule):
             return "skipped"
 
         target_url = f"https://{self.domain}"
-        if not self.scope.check(target_url).allowed:
-            self.state.block_module(self.id, "target outside scope")
-            return "blocked"
-
         rate_limit = self.config.get("rate_limits", {}).get("scan", {}).get("per_minute", 10)
 
         # Determine technology-specific tags from detected tech

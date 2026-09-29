@@ -8,8 +8,6 @@ from actions.registry import (
     ActionRegistry, ActionMeta, ActionContext, ActionResult,
     RiskLevel, action, action_catalog, get_action, list_actions,
 )
-from core.risk_gate import RiskGate, RiskTier
-from core.scope import ScopeGuard
 
 
 def test_action_registry_is_empty_by_default():
@@ -60,14 +58,10 @@ def test_get_action_returns_tuple():
 
 
 def test_action_context_properties():
-    scope = ScopeGuard("test.com")
-    gate = RiskGate({})
     ctx = ActionContext(
         action_id="test.ping",
         params={"host": "test.com"},
         target="test.com",
-        scope=scope,
-        risk_gate=gate,
         timeout=30,
     )
     assert ctx.action_id == "test.ping"

@@ -124,7 +124,7 @@ def test_stage_order_and_active_modules_are_registered():
     ]:
         entry = MODULE_REGISTRY[module_id]
         assert entry["stage"] == 5
-        assert entry["requires_auth"] is True
+        assert entry["active"] is True
 
     assert MODULE_REGISTRY["reporting"]["stage"] == 6
     assert MODULE_REGISTRY["risk_prioritization"]["stage"] == 6

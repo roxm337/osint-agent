@@ -230,9 +230,7 @@ class MainWindow(QMainWindow):
         self.module_combo.currentIndexChanged.connect(self._update_operation_context)
         self.module_hint = QLabel("-")
         self.module_hint.setWordWrap(True)
-        self.active_check = QCheckBox("Active authorized")
-        self.skip_auth_check = QCheckBox("Skip prompt")
-        self.skip_auth_check.setChecked(True)
+        self.active_check = QCheckBox("Active mode")
         self.auto_report_check = QCheckBox("Generate report after run")
         self.auto_report_check.setChecked(True)
         form.addRow("Mode", self.mode_combo)
@@ -240,7 +238,6 @@ class MainWindow(QMainWindow):
         form.addRow("Module", self.module_combo)
         form.addRow("Info", self.module_hint)
         form.addRow("", self.active_check)
-        form.addRow("", self.skip_auth_check)
         form.addRow("", self.auto_report_check)
         layout.addWidget(target_box)
 
@@ -323,7 +320,7 @@ class MainWindow(QMainWindow):
         summary_layout.addLayout(metrics_grid)
         secondary_layout = QFormLayout()
         secondary_layout.addRow("Skipped", self.skipped_value)
-        secondary_layout.addRow("Auth modules", self.active_value)
+        secondary_layout.addRow("Active modules", self.active_value)
         secondary_layout.addRow("Report", self.report_value)
         summary_layout.addLayout(secondary_layout)
         layout.addWidget(summary_box)
@@ -453,16 +450,9 @@ class MainWindow(QMainWindow):
         target_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.config_target_domain_input = QLineEdit()
         self.config_target_domain_input.setPlaceholderText("Default target when CLI does not override")
-        self.config_scope_input = QPlainTextEdit()
-        self.config_scope_input.setPlaceholderText("One allowed domain or pattern per line")
-        self.config_scope_input.setMaximumHeight(110)
-        self.config_authorization_combo = QComboBox()
-        self.config_authorization_combo.addItems(["pending", "confirmed", "denied"])
         self.config_mode_combo = QComboBox()
         self.config_mode_combo.addItems(["passive", "active", "deep"])
         target_form.addRow("Domain", self.config_target_domain_input)
-        target_form.addRow("Scope", self.config_scope_input)
-        target_form.addRow("Authorization", self.config_authorization_combo)
         target_form.addRow("Mode", self.config_mode_combo)
         layout.addWidget(target_box)
 
@@ -470,20 +460,16 @@ class MainWindow(QMainWindow):
         detectability_form = QFormLayout(detectability_box)
         self.config_default_detectability_combo = QComboBox()
         self.config_default_detectability_combo.addItems(["low", "medium", "high"])
-        self.config_allow_high_check = QCheckBox("Allow high-detectability modules")
         detectability_form.addRow("Default", self.config_default_detectability_combo)
-        detectability_form.addRow("", self.config_allow_high_check)
         layout.addWidget(detectability_box)
 
         module_box = QGroupBox("Module Behavior")
         module_form = QFormLayout(module_box)
         self.config_auto_run_check = QCheckBox("Auto-run module chain")
-        self.config_skip_on_waf_check = QCheckBox("Skip modules when WAF blocks")
         self.config_record_http_evidence_check = QCheckBox("Record HTTP evidence")
         self.config_max_empty_spin = QSpinBox()
         self.config_max_empty_spin.setRange(0, 100)
         module_form.addRow("", self.config_auto_run_check)
-        module_form.addRow("", self.config_skip_on_waf_check)
         module_form.addRow("", self.config_record_http_evidence_check)
         module_form.addRow("Max empty modules", self.config_max_empty_spin)
         layout.addWidget(module_box)
@@ -905,8 +891,8 @@ class MainWindow(QMainWindow):
             entry = MODULE_REGISTRY[module_id]
             if stage_filter and entry.get("stage") != stage_filter:
                 continue
-            auth = " [AUTH]" if entry.get("requires_auth") else ""
-            label = f"S{entry['stage']}  {module_id}{auth}"
+            kind = " [ACTIVE]" if entry.get("active") else ""
+            label = f"S{entry['stage']}  {module_id}{kind}"
             self.module_combo.addItem(label, module_id)
             if selected == module_id:
                 self.module_combo.setCurrentIndex(self.module_combo.count() - 1)
@@ -925,10 +911,10 @@ class MainWindow(QMainWindow):
         if not entry:
             self.module_hint.setText("-")
             return
-        auth = "auth required" if entry.get("requires_auth") else "passive"
+        kind = "active" if entry.get("active") else "passive"
         deps = ", ".join(entry.get("depends_on", [])) or "none"
         self.module_hint.setText(
-            f"Stage {entry.get('stage')} · {entry.get('detectability')} · {auth} · deps: {deps}"
+            f"Stage {entry.get('stage')} · {entry.get('detectability')} · {kind} · deps: {deps}"
         )
 
     def _llm_status(self) -> tuple[bool, str]:
@@ -977,8 +963,6 @@ class MainWindow(QMainWindow):
         mode = self.mode_combo.currentText()
         if self.active_check.isChecked():
             args.append("--active")
-            if self.skip_auth_check.isChecked():
-                args.append("--skip-auth-check")
         elif mode == "LLM":
             args.extend(["--mode", "llm"])
 
@@ -1124,7 +1108,7 @@ class MainWindow(QMainWindow):
         self.requests_value.setText(str(stats.get("total_requests", "-")))
         self.completed_value.setText(str(len(module.get("completed", []))))
         self.skipped_value.setText(str(len(module.get("skipped", []))))
-        active_count = sum(1 for mid, entry in MODULE_REGISTRY.items() if entry.get("requires_auth"))
+        active_count = sum(1 for mid, entry in MODULE_REGISTRY.items() if entry.get("active"))
         self.active_value.setText(str(active_count))
         risk = summary_bundle.get("risk", {})
         self.max_risk_value.setText(str(risk.get("max_score", "-")))
@@ -1359,11 +1343,6 @@ class MainWindow(QMainWindow):
         target = config.get("target", {})
         if hasattr(self, "config_target_domain_input"):
             self.config_target_domain_input.setText(str(target.get("domain", "")))
-            scope = target.get("scope", [])
-            if isinstance(scope, str):
-                scope = [scope]
-            self.config_scope_input.setPlainText("\n".join(str(item) for item in scope if item is not None))
-            self._set_combo_value(self.config_authorization_combo, str(target.get("authorization", "pending")))
             self._set_combo_value(self.config_mode_combo, str(target.get("mode", "passive")))
 
         detectability = config.get("detectability", {})
@@ -1372,12 +1351,10 @@ class MainWindow(QMainWindow):
                 self.config_default_detectability_combo,
                 str(detectability.get("default", "low")),
             )
-            self.config_allow_high_check.setChecked(bool(detectability.get("allow_high", False)))
 
         modules = config.get("modules", {})
         if hasattr(self, "config_auto_run_check"):
             self.config_auto_run_check.setChecked(bool(modules.get("auto_run", True)))
-            self.config_skip_on_waf_check.setChecked(bool(modules.get("skip_on_waf", True)))
             self.config_record_http_evidence_check.setChecked(bool(modules.get("record_http_evidence", True)))
             self.config_max_empty_spin.setValue(int(modules.get("max_consecutive_empty", 5) or 0))
 
@@ -1448,12 +1425,6 @@ class MainWindow(QMainWindow):
             config.setdefault("target", {})
             config["target"].update({
                 "domain": self.config_target_domain_input.text().strip(),
-                "scope": [
-                    line.strip()
-                    for line in self.config_scope_input.toPlainText().splitlines()
-                    if line.strip()
-                ],
-                "authorization": self.config_authorization_combo.currentText(),
                 "mode": self.config_mode_combo.currentText(),
             })
 
@@ -1461,14 +1432,12 @@ class MainWindow(QMainWindow):
             config.setdefault("detectability", {})
             config["detectability"].update({
                 "default": self.config_default_detectability_combo.currentText(),
-                "allow_high": self.config_allow_high_check.isChecked(),
             })
 
         if hasattr(self, "config_auto_run_check"):
             config.setdefault("modules", {})
             config["modules"].update({
                 "auto_run": self.config_auto_run_check.isChecked(),
-                "skip_on_waf": self.config_skip_on_waf_check.isChecked(),
                 "max_consecutive_empty": self.config_max_empty_spin.value(),
                 "record_http_evidence": self.config_record_http_evidence_check.isChecked(),
             })

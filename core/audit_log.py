@@ -161,17 +161,13 @@ class AuditLog:
 
     # ── typed events ──────────────────────────────────────────────
 
-    def engagement_start(self, target: str, mode: str, roe_id: str = "",
-                         dry_run: bool = True) -> int:
+    def engagement_start(self, target: str, mode: str) -> int:
         return self.record("engagement.start", {
-            "target": target, "mode": mode, "roe_id": roe_id, "dry_run": dry_run,
+            "target": target, "mode": mode,
         })
 
     def engagement_end(self, summary: dict) -> int:
         return self.record("engagement.end", summary)
-
-    def roe_loaded(self, roe: dict) -> int:
-        return self.record("roe.loaded", roe)
 
     def plan(self, plan: dict) -> int:
         safe = {
@@ -191,13 +187,6 @@ class AuditLog:
             "watch_items": plan.get("watch_items", []),
         }
         return self.record("plan", safe)
-
-    def gate(self, kind: str, action_id: str, target: str,
-             allowed: bool, reason: str, risk: str = "") -> int:
-        return self.record("gate.decision", {
-            "kind": kind, "action_id": action_id, "target": target,
-            "allowed": allowed, "reason": reason, "risk": risk,
-        })
 
     def action(self, action_id: str, target: str, params: dict,
                risk: str, result: dict) -> int:
