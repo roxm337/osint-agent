@@ -40,6 +40,7 @@ from .git_exposure import GitExposure
 from .secret_validation import SecretValidation
 from .idor_differ import IdorDiffer
 from .mass_assignment import MassAssignment
+from .prototype_pollution import PrototypePollution
 from .xss_scan import XSSScan
 from .sqli_scan import SQLiScan
 from .cors_audit import CORSAudit
@@ -336,6 +337,13 @@ MODULE_REGISTRY = {
         "stage": 5,
         "detectability": "medium",
         "depends_on": ["idor_differ"],
+        "active": True,
+    },
+    "prototype_pollution": {
+        "class": PrototypePollution,
+        "stage": 5,
+        "detectability": "medium",
+        "depends_on": [],
         "active": True,
     },
     "idor_differ": {

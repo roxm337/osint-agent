@@ -207,6 +207,33 @@ modules:
     # the reset has to name the field — omitting it would leave the probe in.
     probe_type: bool   # bool | int | string
 
+  prototype_pollution:
+    # Sends a canary property through a JSON body and checks whether it turned
+    # up on Object.prototype. Left on: a handful of POSTs, no data harmed, and
+    # the canary is inert and unique per run. The pollution itself does persist
+    # until the process restarts.
+    enabled: true
+
+    # Endpoints that accept a JSON body. Set these from recon when you know
+    # them; otherwise the usual profile/account/update shapes are tried.
+    endpoints: []
+    #   - "https://api.example.com/api/profile"
+
+    # Where to look for proof. It must return a freshly built object, and it
+    # must list inherited properties — an endpoint that returns a bare {}
+    # proves nothing, because JSON.stringify only walks own properties and
+    # would hide a polluted prototype. Point this at a Node/Express app you
+    # control while testing. Defaults to the first endpoint above.
+    # reflect_endpoint: "https://api.example.com/api/reflect"
+
+    methods: [POST, PUT]
+
+    # The two shapes that reach a prototype. Trim to one if you want the
+    # smallest possible footprint.
+    payloads:
+      - "__proto__"
+      - "constructor.prototype"
+
   sqli_scan:
     # Hand sqlmap an interactsh server so blind injections get proof instead of
     # a "the response looked the same either way" FIRM. Requires the top-level
