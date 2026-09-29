@@ -12,7 +12,9 @@ from urllib.parse import urlparse
 import logging
 from state.manager import StateManager
 from modules import MODULE_REGISTRY, get_all_module_ids
-from tools.wrappers import configure_http_limiter, configure_http_session
+from tools.wrappers import (
+    close_engine, configure_http_limiter, configure_http_session, engine_stats,
+)
 from core.attack_graph import AttackGraph
 from core.budget_manager import BudgetManager, BudgetExceededError
 from actions import ActionRegistry, ActionContext, list_actions
@@ -388,55 +390,72 @@ Examples:
         mode=mode,
     )
 
-    if args.agent or args.phase:
-        from agents.agent_supervisor import AgentSupervisor
-        # Inject the raw target URL so agents can target specific paths
-        orchestrator.config["target"]["raw_url"] = args.target
+    try:
+        if args.agent or args.phase:
+            from agents.agent_supervisor import AgentSupervisor
+            # Inject the raw target URL so agents can target specific paths
+            orchestrator.config["target"]["raw_url"] = args.target
 
-        # Seed the raw URL as an asset + parameters for attack graph
-        if "?" in args.target and "=" in args.target:
-            from urllib.parse import urlparse, parse_qs
-            parsed = urlparse(args.target)
-            url_without_params = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-            orchestrator.state.add_asset(
-                "url", f"url:{url_without_params}", url_without_params,
-                confidence="CONFIRMED", sources=["user_target"],
-            )
-            for param in parse_qs(parsed.query):
+            # Seed the raw URL as an asset + parameters for attack graph
+            if "?" in args.target and "=" in args.target:
+                from urllib.parse import urlparse, parse_qs
+                parsed = urlparse(args.target)
+                url_without_params = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
                 orchestrator.state.add_asset(
-                    "parameter", f"param:{url_without_params}:{param}", param,
+                    "url", f"url:{url_without_params}", url_without_params,
                     confidence="CONFIRMED", sources=["user_target"],
-                    attrs={"url": url_without_params},
                 )
-        else:
-            orchestrator.state.add_asset(
-                "url", f"url:{args.target}", args.target,
-                confidence="CONFIRMED", sources=["user_target"],
-            )
-
-        supervisor = AgentSupervisor(orchestrator.state, orchestrator.config)
-
-        if args.phase:
-            result = await supervisor.run_single_phase(args.phase)
-            print(f"\nPhase '{args.phase}' complete.")
-        else:
-            result = await supervisor.run_full_engagement()
-        return
-
-    if args.pentest:
-        # Run OSINT first if not already done, then attack graph
-        if mode == "active" or args.module:
-            if args.module:
-                await orchestrator.run_module(args.module)
+                for param in parse_qs(parsed.query):
+                    orchestrator.state.add_asset(
+                        "parameter", f"param:{url_without_params}:{param}", param,
+                        confidence="CONFIRMED", sources=["user_target"],
+                        attrs={"url": url_without_params},
+                    )
             else:
-                await orchestrator.run_all()
-        await orchestrator.run_pentest()
-    elif args.module:
-        await orchestrator.run_module(args.module)
-    elif mode == "llm":
-        await orchestrator.run_llm()
-    else:
-        await orchestrator.run_all()
+                orchestrator.state.add_asset(
+                    "url", f"url:{args.target}", args.target,
+                    confidence="CONFIRMED", sources=["user_target"],
+                )
+
+            supervisor = AgentSupervisor(orchestrator.state, orchestrator.config)
+
+            if args.phase:
+                result = await supervisor.run_single_phase(args.phase)
+                print(f"\nPhase '{args.phase}' complete.")
+            else:
+                result = await supervisor.run_full_engagement()
+            return
+
+        if args.pentest:
+            # Run OSINT first if not already done, then attack graph
+            if mode == "active" or args.module:
+                if args.module:
+                    await orchestrator.run_module(args.module)
+                else:
+                    await orchestrator.run_all()
+            await orchestrator.run_pentest()
+        elif args.module:
+            await orchestrator.run_module(args.module)
+        elif mode == "llm":
+            await orchestrator.run_llm()
+        else:
+            await orchestrator.run_all()
+    finally:
+        await _close_http()
+
+
+async def _close_http() -> None:
+    """Report connection-pool usage, then release the pool."""
+    stats = engine_stats()
+    if stats.get("requests"):
+        total = stats["requests"]
+        opened = stats.get("connections_opened", 0)
+        reused = stats.get("connections_reused", 0)
+        share = (reused / total * 100) if total else 0.0
+        print(f"\n{'='*60}")
+        print(f"HTTP: {total} requests over {opened} connections "
+              f"({reused} served from the pool, {share:.0f}%)")
+    await close_engine()
 
 
 def cli():

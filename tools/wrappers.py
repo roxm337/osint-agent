@@ -11,6 +11,13 @@ import os
 from typing import Optional
 from urllib.parse import quote, urlencode
 
+from tools import http_engine as _http_engine_mod
+from tools.http_engine import HttpEngine
+
+# Pooled aiohttp engine. Created lazily on first request and reused for the
+# whole run so connections (and TLS handshakes) are shared across modules.
+_engine: Optional[HttpEngine] = None
+
 # Global cookie jar for stateful web sessions across requests
 _COOKIE_JAR: str | None = None
 _HTTP_SESSION_HEADERS: dict[str, str] = {}
@@ -22,13 +29,18 @@ def _get_cookie_jar() -> str:
     return _COOKIE_JAR
 
 def reset_cookie_jar():
-    global _COOKIE_JAR
+    """Drop all session cookies — both the engine's in-memory jars and the
+    on-disk jar the curl fallback still uses."""
+    global _COOKIE_JAR, _HTTP_SESSION_HEADERS
     if _COOKIE_JAR and os.path.exists(_COOKIE_JAR):
         try:
             os.remove(_COOKIE_JAR)
         except OSError:
             pass
     _COOKIE_JAR = None
+    _HTTP_SESSION_HEADERS = {}
+    if _engine is not None:
+        _engine.forget_identities()
 
 
 def configure_http_session(config: Optional[dict] = None):
@@ -125,115 +137,171 @@ async def bash(command: str, timeout: int = 120) -> dict:
         return {"stdout": "", "stderr": str(e), "exit_code": -1, "error": str(e)}
 
 
+def get_engine() -> HttpEngine:
+    """Return the process-wide HTTP engine, creating it on first use."""
+    global _engine
+    if _engine is None:
+        _engine = HttpEngine()
+    return _engine
+
+
+async def close_engine() -> None:
+    """Close the engine's connection pool. Call on shutdown."""
+    global _engine
+    if _engine is not None:
+        await _engine.close()
+        _engine = None
+
+
+def engine_stats() -> dict:
+    """Connection-pool counters for the run summary."""
+    if _engine is None:
+        return {
+            "requests": 0,
+            "connections_opened": 0,
+            "connections_reused": 0,
+            "identities": [],
+        }
+    return _engine.stats()
+
+
+async def _curl_subprocess(url: str, method: str = "GET",
+                           headers: Optional[dict] = None,
+                           data: Optional[str] = None,
+                           http1_0: bool = False,
+                           output: str = "status",
+                           follow_redirects: bool = True,
+                           timeout: int = 10) -> dict:
+    """Original curl-subprocess path.
+
+    Kept for the two cases the aiohttp engine cannot serve: forcing HTTP/1.0
+    (waf_module's protocol probe) and running without aiohttp installed.
+    """
+    cmd = ["curl", "-s", "--max-time", str(timeout), "--connect-timeout", "5"]
+
+    cmd.extend(["-b", _get_cookie_jar(), "-c", _get_cookie_jar()])
+
+    if follow_redirects:
+        cmd.append("-L")
+
+    if output == "status":
+        cmd.extend(["-o", "/dev/null", "-w", "%{http_code}"])
+    elif output == "headers":
+        cmd.extend(["-D", "-", "-o", "/dev/null"])
+    elif output == "body":
+        cmd.extend(["-w", ""])
+    elif output == "full":
+        cmd.extend(["-D", "-"])
+
+    if http1_0:
+        cmd.append("--http1.0")
+    if method != "GET":
+        cmd.extend(["-X", method])
+    merged_headers = _merge_session_headers(headers)
+    if merged_headers:
+        for k, v in merged_headers.items():
+            cmd.extend(["-H", f"{k}: {v}"])
+    if data:
+        cmd.extend(["-d", data])
+
+    cmd.append(url)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout + 5)
+        out = stdout.decode("utf-8", errors="replace").strip()
+    except asyncio.TimeoutError:
+        return {"status": 0, "body": "", "error": "timeout"}
+    except Exception as e:
+        return {"status": 0, "body": "", "error": str(e)}
+
+    if output == "status":
+        try:
+            return {"status": int(out), "body": ""}
+        except ValueError:
+            return {"status": 0, "body": out, "error": "non-numeric status"}
+    elif output == "headers":
+        status = 0
+        for line in out.split("\n"):
+            m = re.match(r"HTTP/[\d.]+ (\d+)", line)
+            if m:
+                status = int(m.group(1))
+        return {"status": status, "body": out}
+    elif output == "full":
+        parts = out.split("\r\n\r\n", 1) if "\r\n\r\n" in out else out.split("\n\n", 1)
+        header_part = parts[0] if parts else ""
+        body_part = parts[1] if len(parts) > 1 else ""
+        status = 0
+        for line in header_part.split("\n"):
+            m = re.match(r"HTTP/[\d.]+ (\d+)", line)
+            if m:
+                status = int(m.group(1))
+        return {"status": status, "body": body_part, "headers": header_part}
+    else:
+        return {"status": 0, "body": out}
+
+
 async def curl(url: str, method: str = "GET",
               headers: Optional[dict] = None,
               data: Optional[str] = None,
               http1_0: bool = False,
               output: str = "status",
               follow_redirects: bool = True,
-              timeout: int = 10) -> dict:
-    """HTTP request via curl. Returns status code + optional body/headers."""
-    async with _http_limiter:
-        cmd = ["curl", "-s", "--max-time", str(timeout), "--connect-timeout", "5"]
+              timeout: int = 10,
+              identity: Optional[str] = None) -> dict:
+    """HTTP request via the pooled aiohttp engine.
 
-        # Enable cookie persistence for stateful web sessions
-        cmd.extend(["-b", _get_cookie_jar(), "-c", _get_cookie_jar()])
+    Drop-in replacement for the old curl wrapper: same arguments, same return
+    keys, and `identity` is the only addition. Adds `time_ms`, `url`, and
+    `history`, and fixes `time_ms` which was hardcoded to 0 and silently
+    degraded differential response analysis.
 
-        if follow_redirects:
-            cmd.append("-L")
+    `identity` selects an isolated cookie jar. Requests using different
+    identities never see each other's cookies, which is the precondition for
+    two-account IDOR testing.
+    """
+    merged_headers = _merge_session_headers(headers)
 
-        if output == "status":
-            cmd.extend(["-o", "/dev/null", "-w", "%{http_code}"])
-        elif output == "headers":
-            cmd.extend(["-D", "-", "-o", "/dev/null"])
-        elif output == "body":
-            cmd.extend(["-w", ""])
-        elif output == "full":
-            cmd.extend(["-D", "-"])
-
-        if http1_0:
-            cmd.append("--http1.0")
-        if method != "GET":
-            cmd.extend(["-X", method])
-        merged_headers = _merge_session_headers(headers)
-        if merged_headers:
-            for k, v in merged_headers.items():
-                cmd.extend(["-H", f"{k}: {v}"])
-        if data:
-            cmd.extend(["-d", data])
-
-        cmd.append(url)
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+    # HTTP/1.0 has no aiohttp equivalent, and a missing aiohttp disables the
+    # engine entirely — both fall back to the original subprocess.
+    if http1_0 or _http_engine_mod.aiohttp is None:
+        async with _http_limiter:
+            return await _curl_subprocess(
+                url, method, headers, data, http1_0, output,
+                follow_redirects, timeout,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout + 5)
-            out = stdout.decode("utf-8", errors="replace").strip()
-        except asyncio.TimeoutError:
-            return {"status": 0, "body": "", "error": "timeout"}
-        except Exception as e:
-            return {"status": 0, "body": "", "error": str(e)}
 
-        if output == "status":
-            try:
-                return {"status": int(out), "body": ""}
-            except ValueError:
-                return {"status": 0, "body": out, "error": "non-numeric status"}
-        elif output == "headers":
-            status = 0
-            for line in out.split("\n"):
-                m = re.match(r"HTTP/[\d.]+ (\d+)", line)
-                if m:
-                    status = int(m.group(1))
-            return {"status": status, "body": out}
-        elif output == "full":
-            parts = out.split("\r\n\r\n", 1) if "\r\n\r\n" in out else out.split("\n\n", 1)
-            header_part = parts[0] if parts else ""
-            body_part = parts[1] if len(parts) > 1 else ""
-            status = 0
-            for line in header_part.split("\n"):
-                m = re.match(r"HTTP/[\d.]+ (\d+)", line)
-                if m:
-                    status = int(m.group(1))
-            return {"status": status, "body": body_part, "headers": header_part}
-        else:
-            return {"status": 0, "body": out}
+    async with _http_limiter:
+        engine = get_engine()
+        result = await engine.request(
+            url,
+            method,
+            headers=merged_headers,
+            data=data,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            output=output,
+            identity=identity,
+        )
+    return result
 
 
 async def curl_with_status(url: str, **kwargs) -> dict:
     """Fetch URL and return both status code and body."""
-    async with _http_limiter:
-        timeout = int(kwargs.get("timeout", 10) or 10)
-        cmd = [
-            "curl", "-s", "-L",
-            "--max-time", str(timeout), "--connect-timeout", str(min(timeout, 5)),
-            "-w", "\n__STATUS__%{http_code}",
-            url,
-        ]
-        merged_headers = _merge_session_headers(kwargs.get("headers"))
-        if merged_headers:
-            for k, v in merged_headers.items():
-                cmd.extend(["-H", f"{k}: {v}"])
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout + 5)
-            out = stdout.decode("utf-8", errors="replace")
-            if "__STATUS__" in out:
-                body, status_str = out.rsplit("__STATUS__", 1)
-                try:
-                    return {"status": int(status_str.strip()), "body": body}
-                except ValueError:
-                    pass
-        except Exception:
-            pass
-        return {"status": 0, "body": ""}
+    # The old implementation always followed redirects; preserve that here
+    # because callers of this helper rely on landing on the final page.
+    kwargs.setdefault("follow_redirects", True)
+    result = await curl(url, output="full", **kwargs)
+    return {
+        "status": result.get("status", 0),
+        "body": result.get("body", ""),
+        "time_ms": result.get("time_ms", 0.0),
+        "url": result.get("url", url),
+    }
 
 
 async def curl_json(url: str, **kwargs) -> Optional[dict]:
