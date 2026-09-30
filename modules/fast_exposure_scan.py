@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import re
+from typing import Optional
 
+from core.response_fingerprint import (
+    Baseline,
+    content_matches,
+    establish_baseline,
+    fingerprint,
+)
 from modules.base import BaseModule
 from tools.wrappers import curl, curl_with_status
 
@@ -45,7 +52,6 @@ PATH_RULES = [
     (re.compile(r"phpmyadmin|adminer"), "HIGH", "Database Admin Interface Exposed"),
     (re.compile(r"backup\.sql"), "CRITICAL", "Database Backup Exposed"),
 ]
-
 
 SECURITY_HEADERS = {
     "strict-transport-security": "Strict-Transport-Security",
@@ -185,53 +191,125 @@ class FastExposureScan(BaseModule):
         semaphore = asyncio.Semaphore(concurrency)
         findings = []
 
+        async def fetch(path: str):
+            """One request, normalised to (status, body, content_type)."""
+            result = await curl_with_status(f"{base_url}{path}", timeout=timeout)
+            headers = _parse_headers(str(result.get("headers", "")))
+            return (
+                int(result.get("status", 0) or 0),
+                str(result.get("body", "")),
+                headers.get("content-type", ""),
+            )
+
+        # Establish what this site serves when nothing matches, before judging
+        # any of the paths. On a modern SPA every path returns the same
+        # index.html, and without this the scan reports that shell as a
+        # CRITICAL database backup twenty times over.
+        baseline = await establish_baseline(fetch, base_url)
+        self.log(f"  baseline: {baseline.describe()}")
+
         async def probe(path: str) -> dict:
             async with semaphore:
-                result = await curl_with_status(f"{base_url}{path}", timeout=timeout)
+                status, body, ct = await fetch(path)
                 return {
                     "path": path,
-                    "status": int(result.get("status", 0) or 0),
-                    "body": str(result.get("body", "")),
+                    "status": status,
+                    "body": body,
+                    "sig": fingerprint(status, body, ct),
                 }
 
         tasks = [asyncio.create_task(probe(path)) for path in paths]
+        catch_all_hits = 0
         try:
             for task in asyncio.as_completed(tasks):
                 item = await task
-                finding = self._path_finding(base_url, item)
+                verdict, finding = self._path_finding(base_url, item, baseline)
+                if verdict == "catch_all":
+                    catch_all_hits += 1
                 if finding:
                     findings.append(finding)
         finally:
             for task in tasks:
                 if not task.done():
                     task.cancel()
+        if catch_all_hits:
+            self.log(
+                f"  {catch_all_hits}/{len(paths)} path(s) matched the site's "
+                "catch-all response and were not treated as exposures"
+            )
         return findings
 
-    def _path_finding(self, base_url: str, item: dict) -> dict | None:
+    def _path_finding(self, base_url: str, item: dict,
+                      baseline: Optional[Baseline] = None) -> tuple:
+        """Grade one probed path.
+
+        Returns (verdict, finding) where verdict is one of
+        `not_found` | `catch_all` | `no_content_match` | `finding` | `status_only`.
+
+        Two gates, both of which the previous version lacked:
+
+          1. If the response is the site's catch-all, the path does not exist
+             no matter what status came back.
+          2. A 200 also has to contain what the named artifact would contain.
+             Serving a 200 is not evidence; serving a `.git/config` is.
+        """
         status = item["status"]
         path = item["path"]
         body = item["body"]
+
         if status not in (200, 401, 403) or (status == 200 and len(body.strip()) < 20):
-            return None
+            return "not_found", None
+
+        if baseline is not None and status == 200:
+            if baseline.catch_all(item["sig"]):
+                return "catch_all", None
 
         for pattern, severity, title in PATH_RULES:
-            if pattern.search(path):
-                confidence = "CONFIRMED" if status == 200 else "FIRM"
-                public_note = "publicly accessible" if status == 200 else f"returns HTTP {status}"
-                return {
-                    "title": title,
-                    "severity": severity if status == 200 else "LOW",
-                    "confidence": confidence,
+            if not pattern.search(path):
+                continue
+            rule_key = pattern.pattern
+
+            if status in (401, 403):
+                # The resource exists and is protected. That is a much weaker
+                # statement than "exposed", and the old code graded it FIRM
+                # against a CRITICAL severity rule.
+                return "status_only", {
+                    "title": f"{title} (access denied)",
+                    "severity": "INFO",
+                    "confidence": "FIRM",
                     "category": "Information Disclosure",
-                    "description": f"{path} is {public_note}.",
+                    "description": (
+                        f"{path} returns HTTP {status}, so the resource appears to "
+                        "exist but is not publicly readable. Nothing is disclosed."
+                    ),
                     "evidence": [
                         f"URL: {base_url}{path}",
                         f"Status: {status}",
-                        f"Preview: {body[:200]}",
                     ],
-                    "remediation": "Remove the exposed resource or require authentication and network restrictions.",
+                    "remediation": "No action required unless it should not exist at all.",
                 }
-        return None
+
+            if not content_matches(rule_key, body):
+                return "no_content_match", None
+
+            return "finding", {
+                "title": title,
+                "severity": severity,
+                "confidence": "CONFIRMED",
+                "category": "Information Disclosure",
+                "description": (
+                    f"{path} is publicly accessible and its contents match the "
+                    f"expected {title.lower()}."
+                ),
+                "evidence": [
+                    f"URL: {base_url}{path}",
+                    f"Status: {status}",
+                    f"Content matched expected {title.lower()}",
+                    f"Preview: {body[:200]}",
+                ],
+                "remediation": "Remove the exposed resource or require authentication and network restrictions.",
+            }
+        return "not_found", None
 
 
 def _parse_headers(headers_text: str) -> dict[str, str]:
