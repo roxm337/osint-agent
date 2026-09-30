@@ -407,8 +407,11 @@ def test_severity_follows_the_content_not_the_path_name():
 
     for body, want, why in [
         ("[core]\n\trepositoryformatversion = 0\n", "LOW", "structure only"),
+        # A bare remote URL names the host, the org and the repo. That is real
+        # reconnaissance, but it hands over no secret, so it is HIGH and not
+        # CRITICAL — the top of the scale is for credentials in the URL.
         ('[remote "origin"]\n\turl = https://github.com/a/b.git\n',
-         "CRITICAL", "remote URL hands over the source location"),
+         "HIGH", "remote URL discloses the source location"),
         ('[remote "origin"]\n\turl = https://git:pw@github.com/a/b.git\n',
          "CRITICAL", "credentials in the remote URL"),
         ("ref: refs/heads/main\n", "HIGH", "repo confirmed, history fetchable"),
@@ -446,3 +449,54 @@ def test_exposure_findings_carry_the_content_not_just_the_status():
     assert finding["severity"] == "LOW"
     assert any("Preview:" in e for e in finding["evidence"]), \
         "the reader needs to see what was actually served"
+
+
+# --- git_exposure, the same bug in a second module ----------------------
+
+def test_a_200_on_dot_git_paths_is_not_evidence_of_a_dot_git_directory():
+    """`status in (200, 206) and len(body) > 20` passes on any SPA.
+
+    The gate was `path.endswith("HEAD") or len(body) > 20`. The first half
+    accepts `/.git/HEAD` on any 200 at all; the second accepts the 9393-byte
+    index.html that a catch-all server returns for every path. Result on the
+    authorised local Juice Shop: CRITICAL "Exposed Git Metadata", evidence
+    `200 http://localhost:3000/.git/config`, on a server that has no `.git`
+    directory — a response byte-identical to `/`.
+    """
+    from modules.git_exposure import CONTENT_HINTS
+
+    shell = ('<!--  ~ Copyright (c) 2014-2026 Bjoern Kimminich ~ -->\n'
+             '<html><body><h1>Juice Shop</h1>'
+             '<script>function main(){return 1}</script></body></html>')
+
+    for path in CONTENT_HINTS:
+        assert not CONTENT_HINTS[path].search(shell), \
+            f"the SPA shell must not pass as {path}"
+
+    # ...and the real artifacts still pass, so this is a gate and not a wall.
+    assert CONTENT_HINTS["/.git/HEAD"].search("ref: refs/heads/main\n")
+    assert CONTENT_HINTS["/.git/config"].search("[core]\n\trepositoryformatversion = 0\n")
+    assert CONTENT_HINTS["/.git/index"].search("DIRC" + "\x00" * 16)
+    assert CONTENT_HINTS["/.git/logs/HEAD"].search("a" * 40 + " Name <n> 1700000000 +0000\n")
+
+
+def test_git_severity_reflects_what_is_readable():
+    from modules.git_exposure import grade_git_severity as grade
+
+    core_only = [{"path": "/.git/config", "status": 200,
+                  "preview": "[core]\n\trepositoryformatversion = 0\n"}]
+    assert grade(core_only) == "MEDIUM", \
+        "structure only: nothing an anonymous visitor could not infer"
+
+    with_remote = [{"path": "/.git/config", "status": 200,
+                    "preview": '[remote "origin"]\n\turl = https://github.com/a/b.git\n'}]
+    assert grade(with_remote) == "HIGH"
+
+    with_creds = [{"path": "/.git/config", "status": 200,
+                   "preview": '[remote "origin"]\n\turl = https://git:ghp_x@github.com/a/b.git\n'}]
+    assert grade(with_creds) == "CRITICAL"
+
+    # HEAD names the branch and walks to the history; that outranks a config
+    # that only says repositoryformatversion.
+    assert grade([{"path": "/.git/HEAD", "status": 200,
+                   "preview": "ref: refs/heads/main\n"}]) == "HIGH"

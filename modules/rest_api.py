@@ -214,8 +214,10 @@ class RestAPIAudit(BaseModule):
 
             # Try to extract endpoint count
             endpoint_count = 0
+            served_spec = False
             try:
                 data = json.loads(body)
+                served_spec = True
                 endpoint_count = len(data.get("paths", {}))
                 # Check for security definitions
                 has_auth = bool(
@@ -244,19 +246,39 @@ class RestAPIAudit(BaseModule):
                 },
             )
 
+            # `url` is the effective URL after redirects. Following `/api-docs` to
+            # `/api-docs/` is normal, but reporting only the request URL makes
+            # the finding unreadable: a triager opens it, gets a 301, and has
+            # to guess where the documentation actually is.
+            final = str(r.get("url") or "").strip() or f"{base_url}{path}"
+            if served_spec:
+                how = f"{endpoint_count} endpoint definitions"
+                detail = f"Endpoints documented: {endpoint_count}"
+            else:
+                # Swagger UI and ReDoc serve HTML, so there is no `paths` key to
+                # count. Reporting "0 endpoint definitions" for a documentation
+                # playground states a fact about the app that the response does
+                # not support — it is an interactive UI over a spec served
+                # somewhere else.
+                how = ("an interactive documentation UI (Swagger UI/ReDoc); the "
+                       "endpoint count is not in this response")
+                detail = "Served an HTML documentation UI, not a JSON spec"
+            if final.rstrip("/") != f"{base_url}{path}".rstrip("/"):
+                detail += f"; served after redirect from {base_url}{path}"
+
             self.state.add_finding(
                 title=f"API Documentation Exposed: {path}",
                 severity="MEDIUM",
                 confidence="CONFIRMED",
                 category="API Security",
                 description=(
-                    f"OpenAPI/Swagger documentation at {base_url}{path} is publicly "
-                    f"accessible. Contains {endpoint_count} endpoint definitions. "
+                    f"OpenAPI/Swagger documentation at {final} is publicly "
+                    f"accessible, serving {how}. "
                     f"Authentication required: {'Yes' if has_auth else 'Unknown'}."
                 ),
                 evidence=[
-                    f"URL: {base_url}{path}",
-                    f"Endpoints documented: {endpoint_count}",
+                    f"URL: {final}",
+                    detail,
                 ]
                 + ([f"Internal server URLs: {internal_servers}"] if internal_servers else []),
                 remediation=(

@@ -76,10 +76,17 @@ def content_graded_severity(severity: str, rule_key: str, body: str) -> str:
         return severity
 
     if rule_key == r"/\.git/(config|HEAD|refs)":
-        if re.search(r"url\s*=\s*\S+://", body) or re.search(
-            r"^\s*(https?://)[^\s/@]+:[^\s/@]+@", body, re.M
-        ):
-            return "CRITICAL"        # remote URL, possibly with credentials
+        # CRITICAL is for credentials in the URL. A bare
+        # `url = https://github.com/acme/app.git` is a meaningful disclosure —
+        # it names the host, the org and the repository, which for a private
+        # repo is most of what an attacker needed — but it hands over no
+        # secret, and calling it CRITICAL spends the top of the scale on a
+        # fact about a URL.
+        if re.search(r"^\s*(?:url\s*=\s*)?(https?|git|ssh)://[^\s/@]+:[^\s/@]+@",
+                     body, re.M):
+            return "CRITICAL"        # credentials embedded in the remote
+        if re.search(r"url\s*=\s*\S+://", body):
+            return "HIGH"            # remote URL discloses the source location
         if re.search(r"^\s*ref:\s*\S", body, re.M):
             return "HIGH"            # refs/HEAD: repo confirmed, history fetchable
         return "LOW"                 # structure only
