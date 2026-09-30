@@ -1,7 +1,9 @@
 """Stage 4: Misconfiguration Probes — sensitive files, API docs, CI/CD, vendor paths."""
 
 import asyncio
+import re
 
+from core.site_profile import get_profile
 from modules.base import BaseModule
 from tools.wrappers import curl_with_status
 
@@ -101,6 +103,70 @@ FINDING_RULES = [
 ]
 
 
+def _shared_rules() -> list:
+    """FINDING_RULES re-expressed so core.site_profile can gate them.
+
+    The rules stay exactly as specific as they were — this module knows about
+    `.env.backup` and `wp-config.php~` in a way a generic list does not. What
+    changes is that matching a path no longer implies a finding: a match now
+    has to survive the catch-all comparison and the content assertion before
+    anything is filed. The pattern keys below are what those assertions are
+    written against, so the two stay in step.
+    """
+    rules = []
+    for paths, severity, title, _desc in FINDING_RULES:
+        joined = "|".join(re.escape(p) for p in paths)
+        rules.append((re.compile(joined), severity, title))
+    rules.append((re.compile(r"swagger|openapi|api-docs|redoc"), "MEDIUM",
+                  "API Documentation Exposed"))
+    rules.append((re.compile(r"graphql|gql|graphiql"), "MEDIUM",
+                  "GraphQL Endpoint Accessible"))
+    return rules
+
+
+SHARED_RULES = _shared_rules()
+
+# Rule key -> what the real artifact contains. Kept alongside the rules so a
+# path can never be declared exposed on the strength of a 200 alone.
+CONTENT_HINTS: dict[str, str] = {
+    r"/\.git/config": r"^\s*\[core\]",
+    r"/\.git/HEAD": r"^ref:\s*refs/",
+    r"/\.env": r"^[A-Z][A-Z0-9_]{2,}\s*=",
+    r"\.ssh/id_rsa|\.pem$|\.key$": r"-----BEGIN",
+    r"wp-config": r"define\s*\(\s*['\"]DB_NAME|table_prefix",
+    r"phpinfo": r"phpinfo\(\)|PHP Version",
+    r"actuator": r'"(?:_links|activeProfiles)"|Spring',
+    r"swagger|openapi|api-docs|redoc": r'"(?:openapi|swagger|info)"\s*:',
+    r"graphql|gql|graphiql": r"__schema|\"data\"\s*:",
+    r"docker|docker-compose": r"^\s*\{|image:|services:",
+    r"\.k8s|kubernetes|configmap": r"apiVersion:|kind:",
+    r"backup\.sql|\.sql\.gz|dump\.sql": r"CREATE TABLE|INSERT INTO|PRAGMA",
+    r"phpmyadmin|adminer": r"phpMyAdmin|Adminer|select\.php",
+    r"debug\.log|error_log": r"\[(?:error|warning|notice|fatal)\]",
+}
+
+
+def _hint_for(path: str) -> "re.Pattern[str] | None":
+    for key, pattern in CONTENT_HINTS.items():
+        if re.search(key, path):
+            return re.compile(pattern, re.I | re.M)
+    return None
+
+
+def _is_distinguishable(profile, status: int, body: str) -> bool:
+    """Is this response something other than the site's own answer to anything?
+
+    A profile that could not be established returns True, so a failed baseline
+    degrades to the old behaviour instead of silently disabling the module.
+    That is the right way round: a noisy scan is recoverable, a scan that
+    reports nothing looks like a clean target.
+    """
+    if profile is None:
+        return True
+    from core.response_fingerprint import fingerprint
+    return not profile.baseline.catch_all(fingerprint(status, body, ""))
+
+
 class MisconfigProbes(BaseModule):
     id = "misconfig_probes"
     name = "Misconfiguration Probes"
@@ -134,6 +200,11 @@ class MisconfigProbes(BaseModule):
         exposed_paths = []
         consecutive_empty = 0
 
+        profile = await self._establish_profile(base_url, timeout)
+        if profile is None:
+            self.log("  [!] Baseline could not be established; "
+                     "probing without catch-all filtering.")
+
         index = 0
         async for item in self._probe_paths(base_url, paths, concurrency, timeout):
             index += 1
@@ -145,7 +216,8 @@ class MisconfigProbes(BaseModule):
             else:
                 consecutive_empty = 0
 
-            self._analyze_result(base_url, path, status, body, findings_found, exposed_paths)
+            self._analyze_result(base_url, path, status, body, findings_found,
+                                 exposed_paths, profile)
 
             if index % progress_every == 0:
                 self.log(
@@ -202,9 +274,49 @@ class MisconfigProbes(BaseModule):
                 if not task.done():
                     task.cancel()
 
+    async def _establish_profile(self, base_url: str, timeout: int):
+        """Learn what this origin returns when nothing matches.
+
+        Root plus four control paths, via the same HTTP client the probes use,
+        so the baseline cannot drift away from how the module actually asks.
+        """
+        async def fetch(path: str):
+            r = await curl_with_status(base_url.rstrip("/") + path,
+                                       timeout=timeout,
+                                       follow_redirects=True)
+            return (r.get("status", 0), r.get("body", "") or "",
+                    r.get("content_type", "") or "")
+
+        try:
+            profile = await get_profile(base_url, fetch)
+        except Exception as exc:  # noqa: BLE001 - baseline is best-effort
+            self.log(f"  [!] baseline failed: {type(exc).__name__}")
+            return None
+        cov = profile.coverage()
+        self.log(f"  Baseline: {profile.baseline.describe()}")
+        if cov["probed"] and cov["judgable_pct"] == 0:
+            self.log("  [!] every control path returned the site default; "
+                     "exposure findings will be suppressed")
+        return profile
+
     def _analyze_result(self, base_url: str, path: str, status: int, body: str,
-                        findings_found: list[dict], exposed_paths: list[str]):
+                        findings_found: list[dict], exposed_paths: list[str],
+                        profile=None):
         if status == 200:
+            # A 200 proves the server answered, not that it answered with the
+            # thing we asked for. This used to be `len(body.strip()) > 50`,
+            # which any SPA shell satisfies, and it is how a target that
+            # returns one 9393-byte index.html for everything produced a
+            # critical "exposed git repository" finding.
+            hint = _hint_for(path)
+            if hint is not None and not hint.search(body or ""):
+                self.log(f"  [content-gate] {path}: 200 but not {path} content")
+                return
+
+            if profile is not None and not _is_distinguishable(profile, status, body):
+                self.log(f"  [catch-all] {path}: 200 but matches site baseline")
+                return
+
             has_content = len(body.strip()) > 50
 
             self.state.add_asset(

@@ -92,11 +92,20 @@ class Baseline:
     def catch_all(self, sig: Fingerprint) -> bool:
         """Is this response just the site answering 'anything'?
 
-        Three independent signals, because one is not enough:
-          * identical to the root,
-          * identical to a majority of control paths,
-          * same status, length and content-type as the root (weaker, and only
-            used when we have a root to compare against).
+        Two independent signals, because one is not enough:
+
+          * identical body to the root,
+          * matching the fingerprint that a majority of control paths produced,
+            which catches a catch-all that serves something other than its own
+            homepage.
+
+        The majority check needs at least two control paths before it will
+        claim anything: a single unlucky 404 must not be able to condemn every
+        real finding on the site.
+
+        Status and content type are deliberately not part of the comparison.
+        A real 404 and a real 200 often share both, so including them would
+        make distinct resources look identical and suppress true findings.
         """
         if self.root is not None and sig.body_hash == self.root.body_hash:
             return True
@@ -154,27 +163,106 @@ async def establish_baseline(fetch, base_url: str,
 
 CONTENT_ASSERTIONS: dict[str, "re.Pattern[str]"] = {
     r"/\.env": re.compile(r"^[A-Z][A-Z0-9_]{2,}\s*=", re.M),
-    r"/\.git/(config|HEAD)": re.compile(r"^\s*\[core\]|^ref:\s*refs/", re.M),
+    r"/\.git/(config|HEAD|refs)": re.compile(r"^\s*\[core\]|^ref:\s*refs/", re.M),
+    r"/\.svn/(entries|wc\.db)": None,          # wc.db is binary; see below
+    r"/\.DS_Store": None,                       # binary; see below
+    r"/\.aws/credentials": re.compile(
+        r"\[default\]|aws_access_key_id|aws_secret_access_key", re.I),
+    r"/\.ssh/id_(rsa|dsa|ecdsa)": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     r"wp-config": re.compile(r"define\s*\(\s*['\"]DB_NAME|table_prefix", re.I),
     r"debug\.log|error_log|server-status": re.compile(
         r"\[(?:error|warning|notice|fatal|debug)\]|Apache Server Status", re.I),
     r"phpinfo|info\.php": re.compile(r"phpinfo\(\)|PHP Version", re.I),
-    r"actuator/(env|heapdump)": re.compile(r'"(?:_links|activeProfiles)"|Spring', re.I),
-    r"swagger|api-docs": re.compile(r'"(?:openapi|swagger|info)"\s*:', re.I),
+    r"actuator/(env|heapdump|configprops|threaddump)": re.compile(
+        r'"(?:_links|activeProfiles|beans)"|Spring', re.I),
+    r"swagger|api-docs|openapi\.json": re.compile(r'"(?:openapi|swagger|info)"\s*:', re.I),
     r"graphql|graphiql": re.compile(r"__schema|\"data\"\s*:|\"errors\"\s*:", re.I),
     r"phpmyadmin|adminer": re.compile(r"phpMyAdmin|Adminer|select\.php", re.I),
-    r"backup\.sql": re.compile(
+    r"backup\.sql|\.sql\.gz|dump\.sql": re.compile(
         r"CREATE TABLE|INSERT INTO|-- MySQL dump|PRAGMA", re.I),
+    r"\.zip$|\.tar\.gz$|\.tgz$": re.compile(r"PK\x03\x04|\x1f\x8b", re.I),
+    r"id_rsa|\.pem$|\.key$|\.p12$|\.pfx$": re.compile(
+        r"-----BEGIN|\x30\x82", re.I),
+    r"/(?:config|configuration)\.(json|ya?ml|ini|xml)$": re.compile(
+        r"^\s*[\[{]|^[\w.-]+\s*[:=]", re.M),
+    r"adminer|/admin\.php|/admin/console": re.compile(
+        r"Adminer|admin_console|<title>.*[Aa]dmin", re.I),
 }
 
 
-def content_matches(rule_key: str, body: str) -> bool:
-    """Does the body look like the artifact this rule claims?
+class _Binary:
+    """Sentinel: the matched artifact is binary, so assert on content type."""
+    __slots__ = ()
 
-    Unknown rules return True, so a new rule is not silently disabled by
-    forgetting to add an assertion — it is merely unverified.
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<binary artifact>"
+
+
+BINARY = _Binary()
+
+_NOTHING = object()
+
+
+def _resolve(rule_or_path: str):
+    """Find the content assertion that governs this rule or path.
+
+    An exact key wins, so a caller that already knows its rule is never
+    second-guessed. Otherwise the input is treated as a path and every known
+    key is tried as a regex against it. The path fallback exists because
+    key-based lookup alone meant a renamed rule group silently stopped
+    verifying — an unrecognised key fell through to "assume fine", which is
+    the same failure this module exists to prevent, one level up.
     """
-    pattern = CONTENT_ASSERTIONS.get(rule_key)
-    if pattern is None:
+    if rule_or_path in CONTENT_ASSERTIONS:
+        pattern = CONTENT_ASSERTIONS[rule_or_path]
+        return BINARY if pattern is None else pattern
+
+    fallback = _NOTHING
+    for key, pattern in CONTENT_ASSERTIONS.items():
+        try:
+            hit = re.search(key, rule_or_path)
+        except re.error:
+            continue
+        if not hit:
+            continue
+        if pattern is None:
+            # Binary artifact. Keep looking for a text assertion that is more
+            # specific to this path, but remember this one as a fallback.
+            if fallback is _NOTHING:
+                fallback = BINARY
+        else:
+            return pattern
+    return fallback
+
+
+def content_matches(rule_or_path: str, body: str, content_type: str = "") -> bool:
+    """Does the body look like the artifact this rule or path claims?
+
+    Two kinds of answer:
+
+      * a text assertion — the body must contain what the artifact contains.
+      * `BINARY` — a text pattern cannot help (`wc.db`, `.DS_Store`), so the
+        signal is the content type. A binary file served as `text/html` is not
+        a binary file, it is the server answering with its default page.
+
+    Nothing matched, so the rule is unverified, and returns True: the
+    catch-all gate still applies, so this is a missing assertion rather than a
+    missing check. Silence here is recorded, not assumed away.
+    """
+    resolved = _resolve(str(rule_or_path or ""))
+    if resolved is BINARY:
+        return _is_not_html(content_type)
+    if resolved is _NOTHING:
         return True
-    return bool(pattern.search(str(body or "")))
+    return bool(resolved.search(str(body or "")))
+
+
+def _is_not_html(content_type: str) -> bool:
+    """For binary artifacts: is this plausibly not a rendered HTML page?
+
+    An absent content type gives us nothing, so we do not claim a match.
+    """
+    ct = _normalise_ct(content_type)
+    if not ct:
+        return False
+    return ct not in ("text/html", "application/xhtml+xml")

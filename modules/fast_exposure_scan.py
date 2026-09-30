@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from typing import Optional
 
 from core.response_fingerprint import (
@@ -12,6 +11,7 @@ from core.response_fingerprint import (
     establish_baseline,
     fingerprint,
 )
+from core.site_profile import PATH_RULES as SITE_PROFILE_RULES
 from modules.base import BaseModule
 from tools.wrappers import curl, curl_with_status
 
@@ -40,18 +40,13 @@ DEFAULT_PATHS = [
 ]
 
 
-PATH_RULES = [
-    (re.compile(r"/\.env"), "CRITICAL", "Exposed Environment File"),
-    (re.compile(r"/\.git/(config|HEAD)"), "CRITICAL", "Exposed Git Metadata"),
-    (re.compile(r"wp-config"), "CRITICAL", "Exposed WordPress Configuration"),
-    (re.compile(r"debug\.log|error_log|server-status"), "HIGH", "Sensitive Diagnostic Endpoint Exposed"),
-    (re.compile(r"phpinfo|info\.php"), "MEDIUM", "phpinfo Page Exposed"),
-    (re.compile(r"actuator/(env|heapdump)"), "CRITICAL", "Sensitive Spring Boot Actuator Exposed"),
-    (re.compile(r"swagger|api-docs"), "MEDIUM", "API Documentation Exposed"),
-    (re.compile(r"graphql|graphiql"), "MEDIUM", "GraphQL Endpoint Accessible"),
-    (re.compile(r"phpmyadmin|adminer"), "HIGH", "Database Admin Interface Exposed"),
-    (re.compile(r"backup\.sql"), "CRITICAL", "Database Backup Exposed"),
-]
+# One rule set for the whole tool. This used to be a second copy of these
+# ten rules, which is precisely how they drift out of step with the content
+# assertions written against them: a rule renamed here stopped being verified
+# there, silently, and an unverified rule fires on anything. `core.site_profile`
+# owns them; a module that wants a different set passes its own to
+# `grade_path_exposure` rather than redefining one.
+PATH_RULES = SITE_PROFILE_RULES
 
 SECURITY_HEADERS = {
     "strict-transport-security": "Strict-Transport-Security",

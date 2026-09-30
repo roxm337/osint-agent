@@ -2,8 +2,11 @@
 
 import json
 import re
+
+from core.response_fingerprint import fingerprint
+from core.site_profile import get_profile
 from modules.base import BaseModule
-from tools.wrappers import curl, curl_json, curl_with_status
+from tools.wrappers import curl_json, curl_with_status
 
 
 class RestAPIAudit(BaseModule):
@@ -41,6 +44,7 @@ class RestAPIAudit(BaseModule):
 
     async def run(self) -> str:
         base_url = f"https://{self.domain}"
+        self.profile = await self._profile(base_url)
 
         # 1. WordPress REST API
         await self._audit_wordpress_api(base_url)
@@ -53,6 +57,31 @@ class RestAPIAudit(BaseModule):
 
         self.state.complete_module(self.id)
         return "done"
+
+    async def _profile(self, base_url: str):
+        """Baseline for the origin, so a 200 means this endpoint exists.
+
+        An API host that returns its own page for every path is not rare — a
+        catch-all SPA in front of an API, or a misconfigured rewrite. Without
+        this, every probed endpoint becomes a CONFIRMED api_endpoint asset.
+        """
+        async def fetch(path: str):
+            r = await curl_with_status(base_url.rstrip("/") + path,
+                                       follow_redirects=True)
+            return (r.get("status", 0), r.get("body", "") or "",
+                    r.get("content_type", "") or "")
+
+        try:
+            return await get_profile(base_url, fetch)
+        except Exception:  # noqa: BLE001 - baseline is best-effort
+            return None
+
+    def _is_catch_all(self, status: int, body: str) -> bool:
+        """No profile means no verdict, so fall back to the old behaviour."""
+        if getattr(self, "profile", None) is None:
+            return False
+        return self.profile.baseline.catch_all(
+            fingerprint(status, body or "", ""))
 
     async def _audit_wordpress_api(self, base_url: str):
         """Audit WordPress REST API if present."""
@@ -106,7 +135,7 @@ class RestAPIAudit(BaseModule):
             status = r.get("status", 0)
             body = r.get("body", "")
 
-            if status == 200 and body:
+            if status == 200 and body and not self._is_catch_all(status, body):
                 self.state.add_asset(
                     "api_endpoint",
                     f"api:{full_url}",
@@ -264,11 +293,14 @@ class RestAPIAudit(BaseModule):
                                 "API documentation or sample responses.",
                 )
 
+            # Only a response that stands apart from the site's own default
+            # earns FIRM; anything the origin would have said anyway is TENTATIVE.
+            distinguishable = status == 200 and not self._is_catch_all(status, body)
             self.state.add_asset(
                 "api_endpoint",
                 f"api:{base_url}{path}",
                 f"{base_url}{path}",
-                confidence="FIRM" if status == 200 else "TENTATIVE",
+                confidence="FIRM" if distinguishable else "TENTATIVE",
                 sources=["rest api probe"],
                 attrs={"status": status, "type": "rest"},
             )
