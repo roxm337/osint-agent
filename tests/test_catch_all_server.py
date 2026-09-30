@@ -18,8 +18,6 @@ import asyncio
 import tempfile
 from pathlib import Path
 
-import pytest
-
 from modules.misconfig import MisconfigProbes
 from modules.rest_api import RestAPIAudit
 from state.manager import StateManager

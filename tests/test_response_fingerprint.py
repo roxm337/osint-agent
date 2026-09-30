@@ -114,10 +114,10 @@ def test_empty_baseline_never_claims_a_catch_all():
 @pytest.mark.parametrize("rule,body,expected", [
     (r"/\.env", "DB_PASSWORD=hunter2\nAPI_KEY=xyz", True),
     (r"/\.env", "<html>not an env file</html>", False),
-    (r"/\.git/(config|HEAD)", "[core]\n\trepositoryformatversion = 0", True),
-    (r"/\.git/(config|HEAD)", "<html>spa shell</html>", False),
-    (r"backup\.sql", "-- MySQL dump 10.13\nCREATE TABLE users", True),
-    (r"backup\.sql", "<html>spa shell</html>", False),
+    (r"/.git/config", "[core]\n\trepositoryformatversion = 0", True),
+    (r"/.git/config", "<html>spa shell</html>", False),
+    (r"/backup.sql", "-- MySQL dump 10.13\nCREATE TABLE users", True),
+    (r"/backup.sql", "<html>spa shell</html>", False),
     (r"phpinfo|info\.php", "phpinfo()\nPHP Version 8.2.0", True),
     (r"phpinfo|info\.php", "<html>spa shell</html>", False),
     (r"phpmyadmin|adminer", "<title>phpMyAdmin</title>", True),
@@ -125,7 +125,7 @@ def test_empty_baseline_never_claims_a_catch_all():
     (r"graphql|graphiql", '{"data":{"user":null}}', True),
     (r"graphql|graphiql", "<html>spa shell</html>", False),
     (r"actuator/(env|heapdump)", '{"_links":{"self":{"href":"/actuator"}}}', True),
-    (r"actuator/(env|heapdump)", "<html>spa shell</html>", False),
+    (r"/actuator/env", "<html>spa shell</html>", False),
 ])
 def test_content_assertions(rule, body, expected):
     assert content_matches(rule, body) is expected
