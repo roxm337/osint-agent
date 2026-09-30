@@ -323,6 +323,11 @@ class Orchestrator:
         proposed = graph.propose_test_edges(
             max_edges=self.max_actions, risk_ceiling=str(self.max_risk))
         plan = getattr(graph, "probe_plan", {})
+        # Re-save: the first write happens before planning, so without this the
+        # persisted graph has no `probe_plan` and no answer to the only
+        # question anyone asks about a quiet scan — what was tried, and why
+        # the rest was not.
+        graph.save(str(self.output_dir / self.target / "attack_graph.json"))
         if proposed:
             print(f"  Proposed {len(proposed)} probe(s) on testable surface "
                   f"(risk ceiling {plan.get('risk_ceiling')}, "

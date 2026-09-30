@@ -419,19 +419,29 @@ class AttackGraph:
         return "".join(parts)
 
     def to_dict(self) -> dict:
-        return {
+        # `attrs` and `probe_plan` are persisted because without them the
+        # saved graph cannot be audited. Everything needed to explain a result
+        # — which parameter a surface had, which action was chosen, and why
+        # the other 39 surfaces were skipped — lives in exactly those two
+        # fields, so dropping them made the artifact unreadable after the
+        # fact.
+        out = {
             "nodes": [
                 {"id": n.id, "label": n.label, "type": n.node_type,
-                 "confidence": n.confidence}
+                 "confidence": n.confidence, "attrs": n.attrs}
                 for n in self.nodes.values()
             ],
             "edges": [
                 {"source": e.source_id, "target": e.target_id,
                  "type": e.edge_type, "likelihood": e.likelihood,
-                 "impact": e.impact}
+                 "impact": e.impact, "action_id": e.action_id,
+                 "attrs": e.attrs}
                 for e in self.edges
             ],
         }
+        if self.probe_plan:
+            out["probe_plan"] = self.probe_plan
+        return out
 
     def save(self, path: str | Path):
         Path(path).write_text(json.dumps(self.to_dict(), indent=2))
