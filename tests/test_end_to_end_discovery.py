@@ -387,3 +387,62 @@ def test_an_empty_baseline_condemns_nothing():
     baseline = Baseline()
     assert not baseline.catch_all(fingerprint(200, SHELL, "text/html"))
     assert baseline.root is None
+
+
+# --- severity has to describe the leak, not the filename ---------------
+
+def test_severity_follows_the_content_not_the_path_name():
+    """`/.git/config` is CRITICAL in the rule table. It is not always CRITICAL.
+
+    A `.git/config` containing only `[core] repositoryformatversion = 0`
+    discloses nothing an anonymous visitor could not already infer from the
+    host being on GitHub at all. Grading it CRITICAL is the sort of inflation
+    that gets a correct report sent back unread — the sibling of the bug this
+    file keeps hitting, one level up: treating the name of an artifact as
+    proof of what it contains.
+    """
+    from modules.fast_exposure_scan import content_graded_severity as grade
+    G = r"/\.git/(config|HEAD|refs)"
+    E = r"/\.env"
+
+    for body, want, why in [
+        ("[core]\n\trepositoryformatversion = 0\n", "LOW", "structure only"),
+        ('[remote "origin"]\n\turl = https://github.com/a/b.git\n',
+         "CRITICAL", "remote URL hands over the source location"),
+        ('[remote "origin"]\n\turl = https://git:pw@github.com/a/b.git\n',
+         "CRITICAL", "credentials in the remote URL"),
+        ("ref: refs/heads/main\n", "HIGH", "repo confirmed, history fetchable"),
+    ]:
+        assert grade("CRITICAL", G, body) == want, why
+
+    for body, want in [
+        ("DB_PASS=hunter2\n", "CRITICAL"),
+        # A template is not a credential. `\s` would match the newline and
+        # let the pattern slide past the empty value onto the next key.
+        ("DB_PASS=\nAPI_KEY=\n", "HIGH"),
+        ("DB_PASS=\n", "HIGH"),
+        ("DEBUG=false\n", "CRITICAL"),
+    ]:
+        assert grade("CRITICAL", E, body) == want, body
+
+    # Never upgrade, and never touch a rule that was not inflated to begin with.
+    assert grade("LOW", r"/\.DS_Store", "junk") == "LOW"
+
+
+def test_exposure_findings_carry_the_content_not_just_the_status():
+    """End to end through the grading path: a 200 alone proves nothing."""
+    from core.response_fingerprint import fingerprint
+    from modules.fast_exposure_scan import FastExposureScan
+
+    m = FastExposureScan.__new__(FastExposureScan)
+    base = "http://t"
+
+    verdict, finding = m._path_finding(base, {
+        "path": "/.git/config", "status": 200,
+        "body": "[core]\n\trepositoryformatversion = 0\n",
+        "sig": fingerprint(200, "[core]\n\trepositoryformatversion = 0\n", ""),
+    })
+    assert verdict == "finding"
+    assert finding["severity"] == "LOW"
+    assert any("Preview:" in e for e in finding["evidence"]), \
+        "the reader needs to see what was actually served"

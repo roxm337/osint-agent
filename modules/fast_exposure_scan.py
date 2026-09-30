@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Optional
 
 from core.response_fingerprint import (
@@ -54,6 +55,49 @@ SECURITY_HEADERS = {
     "x-frame-options": "X-Frame-Options",
     "x-content-type-options": "X-Content-Type-Options",
 }
+
+
+def content_graded_severity(severity: str, rule_key: str, body: str) -> str:
+    """Grade by what leaked, not by what the path is called.
+
+    `/.git/config` earns CRITICAL from the rule table because, at its worst,
+    it hands over the remote URL, credentials embedded in that URL, and the
+    commit history that makes every other file fetchable. A `.git/config`
+    holding only `[core] repositoryformatversion = 0` leaks nothing an
+    anonymous visitor did not already know from the host being on GitHub at
+    all, and reporting that as CRITICAL is how a program that is right about
+    the facts still gets ignored.
+
+    Downgrade, never upgrade: the content gate proves the artifact exists, not
+    how much of it is sensitive. Under-claiming costs a triager one question;
+    over-claiming costs the report its credit.
+    """
+    if severity not in ("CRITICAL", "HIGH"):
+        return severity
+
+    if rule_key == r"/\.git/(config|HEAD|refs)":
+        if re.search(r"url\s*=\s*\S+://", body) or re.search(
+            r"^\s*(https?://)[^\s/@]+:[^\s/@]+@", body, re.M
+        ):
+            return "CRITICAL"        # remote URL, possibly with credentials
+        if re.search(r"^\s*ref:\s*\S", body, re.M):
+            return "HIGH"            # refs/HEAD: repo confirmed, history fetchable
+        return "LOW"                 # structure only
+
+    if rule_key == r"/\.env":
+        # A .env with nothing on the right-hand side is a template, not a
+        # secret: "FOO=" is a key name, not a credential.
+        #
+        # `[ \t]*` rather than `\s*`. \s matches the newline, so a file of
+        # nothing but `DB_PASS=\nAPI_KEY=\n` let the pattern skip the empty
+        # value, slide across the line break, and "find" a value on the next
+        # key - precisely the case this is meant to catch.
+        if not re.search(r"^[A-Za-z_][A-Za-z0-9_]*[ \t]*=[ \t]*\S", body, re.M):
+            return "HIGH"
+        return severity
+
+    return severity
+
 
 
 class FastExposureScan(BaseModule):
@@ -289,7 +333,7 @@ class FastExposureScan(BaseModule):
 
             return "finding", {
                 "title": title,
-                "severity": severity,
+                "severity": content_graded_severity(severity, rule_key, body),
                 "confidence": "CONFIRMED",
                 "category": "Information Disclosure",
                 "description": (
