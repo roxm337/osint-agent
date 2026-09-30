@@ -410,3 +410,124 @@ for p in .env .git/config wp-config.php actuator/env backup.sql phpmyadmin/; do
 done
 curl -s http://localhost:3000/totally/bogus | md5sum   # identical md5 to /
 ```
+
+---
+
+## 9. Second pass — measured, 2026-09-30
+
+Commits under test: `9764a95`, `e574de7`, `092d18a`, `26894ab`, `2636254`
+(545 tests passing, 28 skipped). Same target, same rule: nothing is believed
+until `curl` agrees.
+
+### 9.1 Precision — 3 findings, 3 real, 0 false
+
+Twelve stage-4/5 modules, unauthenticated and then with an admin JWT, sharing
+one state directory so later modules inherit earlier discovery:
+
+| Severity | Confidence | Module | Finding | Verified by |
+|---|---|---|---|---|
+| LOW | FIRM | `fast_exposure_scan` | Missing CSP and HSTS | `curl -D-` returns neither header; `X-Content-Type-Options` and `X-Frame-Options` *are* present, and the finding does not claim they are missing |
+| MEDIUM | CONFIRMED | `rest_api_audit` | API documentation exposed | `curl -L /api-docs/` serves Swagger UI |
+| MEDIUM | TENTATIVE | `js_analysis` | 13 DOM sink candidates | 26 `innerHTML` and 1 `document.write` in the 1.2 MB bundle; graded TENTATIVE because no source was traced to any sink |
+
+Plus, from the attack-graph path: one CONFIRMED SQL injection at
+`/rest/products/search?q=`. Independently reproduced by hand —
+`q=' UNION SELECT NULL--` returns `SQLITE_ERROR: near "UNION"`, a 200 with a
+6-character JSON body, against a 200 with a 13 KB body for `q=test`.
+
+**Precision: 4 findings, 4 real, 0 false positives.** The two that matter most
+are the two that would have been false a commit earlier — see 9.3.
+
+A separate fixture confirms the same module finds real exposures. A throwaway
+server serving a genuine `/.env` and a genuine `/.git/config` among eighteen
+catch-alls yields 3 findings, 3 confirmed by `curl`, and the eighteen
+catch-alls yield nothing.
+
+### 9.2 Recall — 1 of 116, and it is worth being precise about why
+
+**1 confirmed finding against 116 challenges: 0.9%.**
+
+The one hit is SQL injection at `/rest/products/search`, which eleven separate
+Juice Shop challenges are built on (Database Schema, User Credentials, Login
+Support Team, Password Strength, and others). The framework proved the
+injection point exists; it did not exploit it, so it solves none of the eleven
+as written.
+
+Three structural limits, in the order they bind:
+
+1. **The planner can only aim at a named query parameter.** The persisted
+   `probe_plan` now records the reason, which is the point of persisting it:
+   40 surfaces considered, 1 probe proposed, 78 rejections, every one of them
+   "no parameter on the surface". The target's own bundle contains three
+   literal `path?param=` strings. A planner that can only express "inject into
+   `?q=`" is bounded by that expression, not by what the application offers.
+
+2. **A 1.2 MB bundle does not mean wide parameter coverage.** `main.js`
+   contains 37 query-parameter-shaped tokens and 42 API paths. Only three of
+   them are a path and a parameter in the same literal, so only three are
+   extractable without resolving the code around them.
+
+3. **Most of the 116 need a session or a browser.** Authentication is *not*
+   the blocker here, which is the surprise: re-running with a valid admin JWT
+   changed nothing. `/api/Users` returns 200 with the token and 401 without,
+   so the credentialed surface is strictly larger — but no module in the set
+   consumes the session to widen itself.
+
+Honest summary: the framework finds the vulnerability class when a target
+happens to hand it a `?param=`. It does not yet find the challenge. Closing
+that means solving the code around a bundle, not adding wordlists.
+
+### 9.3 The defect worth remembering
+
+`git_exposure` gated on `status in (200, 206) and (path.endswith("HEAD") or
+len(body) > 20)`. Against Juice Shop that produced **CRITICAL "Exposed Git
+Metadata", evidence `200 http://localhost:3000/.git/config`** — on a server
+with no `.git` directory, whose response is byte-identical to `/`.
+
+This is the same defect `fast_exposure_scan` was fixed for, in a second
+module. That is the lesson, and it is not about git: the earlier fix was
+applied where the bug happened to be found rather than as a property of the
+codebase. Every module that grades a response needs the gate; the fact that
+one module has it is not evidence that the codebase does.
+
+Both directions are now tested. The Juice Shop SPA yields 0 findings and names
+all four rejected paths in the log. A server serving a real `/.git/config`
+still yields CRITICAL, with the real first line as evidence instead of a
+status code.
+
+### 9.4 Severity graded on content, after this audit
+
+`/.git/config` no longer earns CRITICAL by existing:
+
+| Body | Severity | Why |
+|---|---|---|
+| `[core] repositoryformatversion = 0` | LOW / MEDIUM | structure; discloses nothing an anonymous visitor could not infer |
+| `url = https://github.com/a/b.git` | HIGH | names host, org and repository — real reconnaissance, no secret |
+| `url = https://git:ghp_x@github.com/a/b.git` | CRITICAL | credentials in the remote URL |
+| `ref: refs/heads/main` | HIGH | branch named, history walkable |
+| `FOO=` / `FOO=\nBAR=` | HIGH | a template, not a credential |
+
+The `.env` check needs `[ \t]*` and not `\s*`. `\s` matches the newline, so a
+file of nothing but `DB_PASS=\nAPI_KEY=\n` let the pattern skip the empty
+value, slide across the line break, and "find" a value on the next key —
+precisely the case the check exists to catch.
+
+Public identifiers are not secrets. An OAuth client ID is a public client by
+design (RFC 8252, OAuth 2.0 Security BCP); so is a Twilio Account SID and a
+Sentry DSN. `js_analysis` was reporting one as HIGH credential exposure. They
+are kept as recon in a documented `PUBLIC_BY_DESIGN` set and kept out of the
+severity grading.
+
+### 9.5 Still open, in the order it costs the most
+
+- **No per-module wall clock.** `open_redirect` ran for 7 minutes at 0% CPU
+  with no sockets and no output. Not a hang, but indistinguishable from one,
+  and it has no progress signal.
+- **A parameter-only planner.** See 9.2. This is the largest single gap
+  between what is found and what exists.
+- **Sessions are accepted but not used for coverage.** Auth is configured,
+  passed to every request, and no module widens its surface because of it.
+- **`idor_differ` and `mass_assignment` ran and produced nothing**, with no
+  distinction recorded between "tested and clear" and "could not test".
+- **Unauthenticated `test_anonymous` is off by default**, so a large share of
+  the IDOR surface is deliberately untested.
