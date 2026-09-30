@@ -94,7 +94,7 @@ class ContentDiscovery(BaseModule):
             self.state.skip_module(self.id, "ffuf not installed")
             return "skipped"
 
-        base_url = f"https://{self.domain}"
+        base_url = self.base_url
         words = self.config.get("wordlists", {}).get("content_discovery", [])
         if not words:
             self.state.skip_module(self.id, "no content discovery wordlist")

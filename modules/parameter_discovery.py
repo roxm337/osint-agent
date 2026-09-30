@@ -129,7 +129,7 @@ class ParameterDiscovery(BaseModule):
                 if value.startswith(("http://", "https://")) and value not in targets:
                     targets.append(value)
         if not targets:
-            targets.append(f"https://{self.domain}")
+            targets.append(self.base_url)
         return targets
 
 

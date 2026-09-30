@@ -18,7 +18,7 @@ class VisualRecon(BaseModule):
 
         targets = self._targets()
         if not targets:
-            targets = [f"https://{self.domain}"]
+            targets = [self.base_url]
 
         output_dir = self.state.state_dir / "screenshots"
         result = await gowitness_scan(targets[:50], str(output_dir), timeout=300)

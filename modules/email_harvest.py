@@ -20,7 +20,7 @@ class EmailHarvest(BaseModule):
         self.log(f"Harvesting emails from {self.domain}")
 
         # 1. Scrape homepage
-        urls_to_scrape = [f"https://{self.domain}"]
+        urls_to_scrape = [self.base_url]
         # Get known pages from subdomains and sitemap
         webapps = self.state.get_assets_by_type("webapp")
         for wa in webapps:
@@ -43,7 +43,7 @@ class EmailHarvest(BaseModule):
                     all_emails.add(e)
 
         # 2. WP REST API for more emails (if WP detected)
-        wp_json = await curl(f"https://{self.domain}/wp-json/wp/v2/pages?per_page=100",
+        wp_json = await curl(f"{self.base_url}/wp-json/wp/v2/pages?per_page=100",
                               output="body")
         body = wp_json.get("body", "")
         if body:

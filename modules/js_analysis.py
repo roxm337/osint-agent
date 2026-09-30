@@ -3,6 +3,8 @@
 import re
 from modules.base import BaseModule
 from tools.wrappers import curl_with_status, bash
+from core.response_fingerprint import establish_baseline, fingerprint
+from core.surface import script_urls_from_html
 
 
 # 43+ secret regex patterns
@@ -73,6 +75,33 @@ SECRET_PATTERNS = [
 ]
 
 
+# Identifiers that are public by design and cannot be kept secret.
+#
+# These are not secrets and must not be reported as credential exposure. An
+# OAuth client ID is published by the authorisation server, embedded in every
+# app that uses the flow, and carries no authority on its own — RFC 8252 and
+# the OAuth 2.0 Security BCP both require it to be a public client. The same
+# is true of a Twilio Account SID (the secret is the Auth Token) and a Sentry
+# DSN (it authenticates event submission, nothing else).
+#
+# Reporting these as HIGH credential exposure is the same class of error as
+# calling a 404 page a leaked database backup: a pattern that reliably matches
+# real code is not evidence of a real problem. They are kept, because knowing
+# an app's OAuth client and Sentry project is genuinely useful recon, but they
+# are reported as INFO with a note explaining why they are not a finding.
+PUBLIC_BY_DESIGN = {
+    "google_oauth": "OAuth client IDs are public clients by design; the "
+                    "security of the flow rests on the client secret and "
+                    "redirect URI validation, not on hiding this.",
+    "twilio_account_sid": "Account SID is an account identifier; the Auth "
+                          "Token is the credential.",
+    "sentry_dsn": "DSNs are embedded in client applications by design and "
+                  "only authorise event submission.",
+    "firebase_url": "The Firebase database URL is not a credential; "
+                    "access is controlled by its security rules.",
+}
+
+
 def extract_endpoints(js_content: str, base_url: str) -> list:
     """Extract API endpoints and interesting paths from JS source."""
     patterns = [
@@ -136,7 +165,7 @@ class JSAnalysis(BaseModule):
     depends_on = ["wayback_machine", "tech_detection"]
 
     async def run(self) -> str:
-        base_url = f"https://{self.domain}"
+        base_url = self.base_url
         self.log("Analyzing JavaScript files for secrets and endpoints...")
 
         # Collect JS files from multiple sources
@@ -151,12 +180,17 @@ class JSAnalysis(BaseModule):
         main_result = await curl_with_status(base_url)
         body = main_result.get("body", "")
         if body:
-            # Extract script src tags
-            for match in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', body, re.I):
-                if match.startswith("http"):
-                    js_urls.add(match)
-                elif match.startswith("/"):
-                    js_urls.add(f"{base_url}{match}")
+            # Resolve every <script src> against the page it was loaded from.
+            #
+            # The old code handled only absolute URLs and paths beginning with
+            # "/", so a page written `<script src="main.js">` — a plain
+            # relative reference, and the most common form there is — yielded
+            # nothing at all. That is why this module reported 0 files
+            # analysed against a target shipping a 1.2 MB bundle, and it was
+            # invisible in the output because "0 files" and "no scripts
+            # referenced" look the same in a stats dict.
+            for src in script_urls_from_html(body, base_url):
+                js_urls.add(src)
 
         # Common JS guess paths
         js_guess_paths = [
@@ -165,9 +199,53 @@ class JSAnalysis(BaseModule):
             "/dist/bundle.js", "/build/app.js", "/public/app.js",
             "/static/bundle.js", "/js/bundle.js", "/assets/index.js",
         ]
-        for path in js_guess_paths:
+
+        # Establish what this site serves at a path that is not a script,
+        # before judging any guess as JavaScript.
+        #
+        # The old gate was `status == 200 and "function" in body`, which a
+        # modern SPA passes for every path: its catch-all index.html contains
+        # the word "function" somewhere in a boot script. So `/app.js`,
+        # `/bundle.js` and `/js/main.js` were all "found" on a target that
+        # serves none of them, each 9 KB of HTML, and each was then analysed
+        # as a bundle — reporting the application's own shell as its
+        # JavaScript. Comparing against the catch-all body is what separates a
+        # real bundle from the shell it is being mistaken for.
+        # Three-tuple, in the order `establish_baseline` documents:
+        # `(status, body, content_type)`. Returning two here made the unpack
+        # raise, the helper's `except` swallowed it, and the baseline came
+        # back empty — `root=none controls=0` — so the catch-all gate below
+        # matched nothing and the module silently fell back to guessing. A
+        # helper that returns "I could not measure" and a helper that returns
+        # "everything is catch-all" must not look the same to the caller.
+        async def probe(path: str):
             r = await curl_with_status(f"{base_url}{path}")
-            if r.get("status") == 200 and "function" in r.get("body", ""):
+            ct = ""
+            for line in str(r.get("headers", "")).splitlines():
+                if line.lower().startswith("content-type:"):
+                    ct = line.split(":", 1)[1].strip()
+                    break
+            return (int(r.get("status", 0) or 0),
+                    str(r.get("body", "") or ""),
+                    ct)
+
+        baseline = await establish_baseline(probe, base_url)
+        self.log(f"  baseline: {baseline.describe()}")
+        if baseline.root is None:
+            self.log("  baseline unavailable — cannot tell a real bundle "
+                     "from the catch-all shell; guessing at script paths is "
+                     "unsafe, so only referenced scripts will be analysed.")
+
+        # Only guess at paths at all if we can recognise a miss. Without a
+        # baseline, every guess "succeeds" against a catch-all and the module
+        # would collect the site's own HTML shell as JavaScript.
+        if baseline.root is not None:
+            for path in js_guess_paths:
+                status, candidate, ct = await probe(path)
+                if status != 200 or not candidate:
+                    continue
+                if baseline.catch_all(fingerprint(status, candidate, ct)):
+                    continue
                 js_urls.add(f"{base_url}{path}")
 
         target_js = [
@@ -182,6 +260,7 @@ class JSAnalysis(BaseModule):
         all_dom_sinks = []
         source_maps = []
         analyzed = 0
+        skipped_catch_all = 0
 
         for js_url in target_js:
             result = await curl_with_status(js_url)
@@ -190,6 +269,20 @@ class JSAnalysis(BaseModule):
 
             content = result.get("body", "")
             if not content or len(content) < 50:
+                continue
+
+            # A script src that resolves to the catch-all shell is not a
+            # bundle. The page tags it as JavaScript, but what arrives is the
+            # same HTML every other path returns, and analysing it as source
+            # fills state with the site's own markup as discovered endpoints.
+            ct = ""
+            for line in str(result.get("headers", "")).splitlines():
+                if line.lower().startswith("content-type:"):
+                    ct = line.split(":", 1)[1].strip()
+                    break
+            if baseline.catch_all(fingerprint(int(result.get("status", 0) or 0),
+                                               content, ct)):
+                skipped_catch_all += 1
                 continue
 
             analyzed += 1
@@ -250,6 +343,14 @@ class JSAnalysis(BaseModule):
             if key not in seen_secrets:
                 seen_secrets.add(key)
                 unique_secrets.append(s)
+
+        # Split out the identifiers that are public by design before grading.
+        # They stay visible as recon, but they must not be graded as credential
+        # exposure: a HIGH "secret" that the protocol requires you to publish
+        # is a false positive that costs a triager an hour.
+        public_hits = [s for s in unique_secrets if s["type"] in PUBLIC_BY_DESIGN]
+        unique_secrets = [s for s in unique_secrets
+                          if s["type"] not in PUBLIC_BY_DESIGN]
 
         # Create secret findings by severity
         for severity in ["CRITICAL", "HIGH", "MEDIUM"]:
@@ -331,6 +432,7 @@ class JSAnalysis(BaseModule):
             attrs={
                 "js_files_analyzed": analyzed,
                 "total_js_urls": len(target_js),
+                "skipped_catch_all": skipped_catch_all,
                 "secrets_found": len(unique_secrets),
                 "endpoints_found": len(unique_endpoints),
                 "source_maps_found": len(source_maps),

@@ -43,7 +43,7 @@ class RestAPIAudit(BaseModule):
     ]
 
     async def run(self) -> str:
-        base_url = f"https://{self.domain}"
+        base_url = self.base_url
         self.profile = await self._profile(base_url)
 
         # 1. WordPress REST API

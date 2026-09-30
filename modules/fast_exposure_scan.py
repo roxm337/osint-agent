@@ -127,7 +127,7 @@ class FastExposureScan(BaseModule):
         raw = str(self.config.get("target", {}).get("raw_url", "")).strip()
         if raw.startswith(("http://", "https://")):
             return raw.rstrip("/")
-        return f"https://{self.domain}".rstrip("/")
+        return self.base_url.rstrip("/")
 
     async def _check_headers(self, base_url: str, timeout: int) -> list[dict]:
         result = await curl(base_url, output="headers", timeout=timeout)

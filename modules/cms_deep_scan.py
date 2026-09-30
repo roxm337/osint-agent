@@ -238,7 +238,7 @@ class CMSDeepScan(BaseModule):
 
         targets = self._targets()
         if not targets:
-            targets = [(f"https://{self.domain}", "")]
+            targets = [(self.base_url, "")]
 
         if not any(tool_available(name) for name in TOOLS):
             self.state.skip_module(self.id, "CMS scanners not installed")
@@ -441,7 +441,7 @@ class CMSDeepScan(BaseModule):
         }
 
     def _host(self, targets: list) -> str:
-        return targets[0][0] if targets else f"https://{self.domain}"
+        return targets[0][0] if targets else self.base_url
 
     def _targets(self) -> list:
         targets = []

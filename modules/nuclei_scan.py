@@ -54,7 +54,7 @@ class NucleiScan(BaseModule):
             self.state.skip_module(self.id, "nuclei not installed")
             return "skipped"
 
-        target_url = f"https://{self.domain}"
+        target_url = self.base_url
         rate_limit = self.config.get("rate_limits", {}).get("scan", {}).get("per_minute", 10)
 
         # Determine technology-specific tags from detected tech

@@ -271,3 +271,119 @@ def test_gzipped_chunked_bodies_are_read_to_completion():
     # Draining gets the whole thing, marker included.
     assert run(drain()) == full, "draining must recover the whole body"
     assert http_engine.DEFAULT_MAX_BODY >= len(full)
+
+
+# --- the scheme/port bug that silenced every module ----------------------
+
+def test_base_url_preserves_the_port_and_scheme():
+    """25 modules built `https://{domain}`, which drops the port.
+
+    `target.domain` is a hostname. Anything not on 443 was dialled on 443,
+    so against `localhost:3000` every module fetched nothing and reported an
+    empty result that looked identical to "nothing to find".
+    """
+    from orchestrator import Orchestrator
+    import tempfile
+    for typed, expected in [
+        ("localhost:3000", "http://localhost:3000"),
+        ("http://localhost:3000", "http://localhost:3000"),
+        ("https://euro2c.com", "https://euro2c.com"),
+        # A bare hostname stays HTTPS: that is what public targets are, and
+        # what this codebase assumed before.
+        ("euro2c.com", "https://euro2c.com"),
+        ("[::1]:8080", "http://[::1]:8080"),
+    ]:
+        o = Orchestrator(target=typed, output_dir=tempfile.mkdtemp(),
+                         config_path="config.example.yaml", mode="auto")
+        assert o.base_url == expected, \
+            f"{typed!r} must resolve to {expected}, got {o.base_url}"
+
+
+def test_modules_receive_the_resolved_url_not_the_users_literal():
+    """The CLI must normalise before modules read `target.raw_url`.
+
+    `-t localhost:3000` put the scheme-less string in the config. A module
+    that works when called directly then reported 0 files analysed under the
+    CLI, which reads as "the target has no JavaScript" rather than "the
+    module dialled the wrong port".
+    """
+    from orchestrator import Orchestrator
+    import tempfile
+    o = Orchestrator(target="localhost:3000", output_dir=tempfile.mkdtemp(),
+                     config_path="config.example.yaml", mode="auto")
+    tgt = o.config["target"]
+    assert tgt["raw_url"] == "http://localhost:3000"
+    assert tgt["scheme"] == "http"
+    assert tgt["target_input"] == "localhost:3000", "keep what the user typed"
+
+    from modules.base import BaseModule
+    class M(BaseModule):
+        pass
+    m = M(o.state, o.config)
+    assert m.base_url == "http://localhost:3000", \
+        "a module must resolve the same URL the CLI did"
+
+
+def test_base_url_tolerates_a_bare_string_target():
+    """Some tests overwrite `module.target` with a URL string."""
+    from modules.base import BaseModule
+    from state.manager import StateManager
+    import tempfile
+    class M(BaseModule):
+        pass
+    m = M(StateManager(tempfile.mkdtemp()),
+          {"target": {"domain": "example.test", "base_url": "https://example.test"}})
+    m.target = "https://example.test"          # a string, not a dict
+    assert m.base_url == "https://example.test"
+
+
+# --- the guess-path gate that found the SPA's own HTML ------------------
+
+SHELL = ('<html><head><title>App</title></head><body><div id="root"></div>'
+         '<script src="main.js"></script></body></html>')
+SHELL_BUNDLE = 'const search="/rest/products/search?q=";fetch(search+term);'
+
+
+def test_a_catch_all_shell_is_not_mistaken_for_a_javascript_bundle():
+    """`status == 200 and "function" in body` passes on every SPA path.
+
+    The gate ran before this on `/app.js`, `/bundle.js` and `/js/main.js` of a
+    target that serves none of them: each returned the site's catch-all
+    shell, which contains the word "function" in a boot script, so each was
+    collected and analysed as source.
+
+    Driven by a fake fetch rather than the live target, so the assertion is
+    about the gate's logic and not about what a particular server is serving
+    today.
+    """
+    from core.response_fingerprint import establish_baseline, fingerprint
+
+    async def fetch(path):
+        # Everything resolves to the shell except the real bundle.
+        body = SHELL_BUNDLE if path.endswith("main.js") else SHELL
+        return 200, body, "text/html"
+
+    baseline = run(establish_baseline(fetch, "http://t/"))
+    assert baseline.root is not None and baseline.control_paths >= 2
+
+    # What `/app.js` actually returns: the shell, with a JavaScript content
+    # type because that is what the page asked for.
+    shell = fingerprint(200, SHELL, "application/javascript")
+    assert baseline.catch_all(shell), "the catch-all shell must be recognised"
+
+    real = fingerprint(200, SHELL_BUNDLE, "application/javascript")
+    assert not baseline.catch_all(real), "a real bundle must not be condemned"
+
+
+def test_an_empty_baseline_condemns_nothing():
+    """No root means no opinion.
+
+    `catch_all` must not be usable as a gate when there is nothing to compare
+    against. Callers are expected to check `baseline.root` first; this pins
+    the reason that matters.
+    """
+    from core.response_fingerprint import Baseline, fingerprint
+
+    baseline = Baseline()
+    assert not baseline.catch_all(fingerprint(200, SHELL, "text/html"))
+    assert baseline.root is None

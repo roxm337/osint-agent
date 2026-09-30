@@ -40,7 +40,7 @@ class GraphQLAudit(BaseModule):
     depends_on = ["tech_detection"]
 
     async def run(self) -> str:
-        base_url = f"https://{self.domain}"
+        base_url = self.base_url
         self.log("Probing for GraphQL endpoints...")
 
         graphql_paths = self.config.get("wordlists", {}).get("graphql_paths", [

@@ -23,7 +23,7 @@ class SitemapExploit(BaseModule):
     ]
 
     async def run(self) -> str:
-        base_url = f"https://{self.domain}"
+        base_url = self.base_url
         self.log("Checking Yoast/standard sitemaps...")
 
         all_urls = []

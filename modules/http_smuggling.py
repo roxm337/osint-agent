@@ -39,7 +39,7 @@ class HTTPSmuggling(BaseModule):
 
         targets = self._targets()
         if not targets:
-            targets = [f"https://{self.domain}"]
+            targets = [self.base_url]
 
         if not tool_available("smuggler"):
             self.state.skip_module(self.id, "smuggler not installed")

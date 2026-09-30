@@ -35,6 +35,30 @@ class BaseModule:
         configure_http_session(config)
         configure_oob(config)
 
+    @property
+    def base_url(self) -> str:
+        """The target as a fetchable URL: correct scheme, port preserved.
+
+        `target.domain` is a hostname. It carries neither scheme nor port, so
+        a module that built `https://{domain}` dialled 443 on the wrong port
+        for anything that is not a default-HTTPS site, and 25 modules did
+        exactly that. Against a target on `localhost:3000` every one of them
+        got nothing at all.
+
+        Prefers the scheme the user actually supplied, and only assumes HTTPS
+        when they did not say.
+        """
+        # `target` is normally a dict, but modules are handed loose fixtures
+        # and some tests overwrite `module.target` with a bare URL string, so
+        # this must not assume it can call `.get()` on it.
+        target = self.target if isinstance(self.target, dict) else {}
+        for key in ("base_url", "raw_url"):
+            raw = str(target.get(key) or "").strip()
+            if "://" in raw:
+                return raw.rstrip("/")
+        scheme = str(target.get("scheme") or "").strip().rstrip(":")
+        return f"{scheme or 'https'}://{self.domain}".rstrip("/")
+
     async def run(self) -> str:
         """Run the module. Returns 'done' or 'skipped'.
 

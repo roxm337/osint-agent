@@ -124,7 +124,7 @@ class TechDetection(BaseModule):
 
     async def run(self) -> str:
         self.log(f"Detecting tech stack for {self.domain}")
-        base_url = f"https://{self.domain}"
+        base_url = self.base_url
 
         tech = {
             "server": "",

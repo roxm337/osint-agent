@@ -38,7 +38,7 @@ class OriginDiscovery(BaseModule):
 
     async def run(self) -> str:
         self.log("Discovering real origin IP behind CDN...")
-        base_url = f"https://{self.domain}"
+        base_url = self.base_url
 
         cdn_detected = None
         origin_candidates = []

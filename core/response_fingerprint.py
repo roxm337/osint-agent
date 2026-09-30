@@ -141,16 +141,44 @@ async def establish_baseline(fetch, base_url: str,
     """
     baseline = Baseline()
     try:
-        status, body, ct = await fetch("/")
+        result = await fetch("/")
+        # A malformed return from `fetch` is a bug in the caller, not evidence
+        # about the target, so it is raised rather than swallowed. A module
+        # whose probe returned a 2-tuple instead of a 3-tuple used to get back
+        # an empty baseline and no indication why: `root=none controls=0`,
+        # printed and ignored, and the caller went on to guess.
+        if not isinstance(result, (tuple, list)) or len(result) != 3:
+            raise TypeError(
+                f"establish_baseline needs fetch() to return "
+                f"(status, body, content_type); got "
+                f"{type(result).__name__} of length "
+                f"{len(result) if hasattr(result, '__len__') else '?'}"
+            )
+        status, body, ct = result
         baseline.root = fingerprint(status, body, ct)
+    except TypeError:
+        raise
     except Exception:
         return baseline
 
     for path in (control_paths if control_paths is not None else CONTROL_PATHS):
         try:
-            status, body, ct = await fetch(path)
+            result = await fetch(path)
         except Exception:
             continue
+        if not isinstance(result, (tuple, list)) or len(result) != 3:
+            # Same contract as the root fetch, and for the same reason: a
+            # silently empty control set leaves `dominant` empty, and
+            # `catch_all` then needs `control_paths >= 2` before it will call
+            # anything a catch-all, so every real finding on the site survives
+            # a gate that is not actually running.
+            raise TypeError(
+                f"establish_baseline needs fetch() to return "
+                f"(status, body, content_type); got "
+                f"{type(result).__name__} of length "
+                f"{len(result) if hasattr(result, '__len__') else '?'}"
+            )
+        status, body, ct = result
         baseline.control_paths += 1
         baseline.dominant[fingerprint(status, body, ct).body_hash] += 1
     return baseline

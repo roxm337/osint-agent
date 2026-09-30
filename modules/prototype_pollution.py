@@ -227,7 +227,7 @@ class PrototypePollution(BaseModule):
 
     def _base_url(self) -> str:
         return str(self.target.get("base_url")
-                   or (f"https://{self.domain}" if self.domain else ""))
+                   or (self.base_url if self.domain else ""))
 
     def _absolute(self, path: str) -> str:
         path = (path or "").strip()

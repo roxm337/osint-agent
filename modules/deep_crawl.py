@@ -65,7 +65,7 @@ class DeepCrawl(BaseModule):
     async def run(self) -> str:
         targets = self._targets()
         if not targets:
-            targets = [f"https://{self.domain}"]
+            targets = [self.base_url]
 
         if not tool_available("katana") and not tool_available("hakrawler"):
             self.state.skip_module(self.id, "katana/hakrawler not installed")

@@ -25,7 +25,7 @@ class LoginEnum(BaseModule):
             self.state.skip_module(self.id, "target is not WordPress")
             return "skipped"
 
-        base_url = f"https://{self.domain}"
+        base_url = self.base_url
         self.log("Testing login user enumeration...")
 
         emails = self.state.get_assets_by_type("email")

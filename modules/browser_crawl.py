@@ -21,7 +21,7 @@ class BrowserCrawl(BaseModule):
             self.state.skip_module(self.id, "playwright not installed")
             return "skipped"
 
-        targets = self._targets() or [f"https://{self.domain}"]
+        targets = self._targets() or [self.base_url]
         crawl_cfg = self.config.get("crawl", {}).get("browser", {})
         max_targets = int(crawl_cfg.get("max_targets", 8))
         wait_ms = int(crawl_cfg.get("wait_ms", 1500))

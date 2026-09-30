@@ -28,6 +28,18 @@ logger = logging.getLogger("osint-agent")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
+def _explicit_port(host: str) -> bool:
+    """Does this bare `host[:port]` name a port the user typed?
+
+    Deliberately not `":" in host`: an IPv6 literal contains colons and is not
+    a port at all, and treating `[::1]:8080` as portless would send it to
+    HTTPS on 443.
+    """
+    if host.startswith("["):
+        return "]" in host and host.split("]", 1)[1].startswith(":")
+    return ":" in host
+
+
 class Orchestrator:
     """Main orchestrator. Runs all modules in stage order."""
 
@@ -46,7 +58,15 @@ class Orchestrator:
 
         # Set target
         self.config["target"]["domain"] = self.domain
-        self.config["target"]["raw_url"] = target
+        # Normalise to a fetchable URL before modules see it. `target` is
+        # whatever the user typed, so `-t localhost:3000` reached every module
+        # as the scheme-less string "localhost:3000"; each then fell back to
+        # `https://{domain}` and dialled 443, which is why a module that works
+        # when called directly reported 0 files analysed under the CLI. Store
+        # the resolved form and keep the literal in `target_input`.
+        self.config["target"]["target_input"] = target
+        self.config["target"]["raw_url"] = self.base_url
+        self.config["target"]["scheme"] = urlparse(self.base_url).scheme
         self.config["target"]["mode"] = mode
 
         # State
@@ -196,9 +216,23 @@ class Orchestrator:
         request, so `localhost:3000` would otherwise be dialled as
         `http://localhost/` — port 80, nothing there, a silent empty scan.
         """
-        raw = self.config["target"].get("raw_url") or self.domain
+        target = self.config.get("target") or {}
+        # `target_input` is what the user literally typed, so it has to be
+        # checked before `raw_url`: during __init__ this property is read
+        # before `raw_url` has been rewritten, and picking up a stale value
+        # from the config file is how `localhost:3000` became something else.
+        raw = str(target.get("target_input") or target.get("raw_url") or "").strip()
+        if not raw:
+            return f"https://{self.domain}"
         if "://" not in raw:
-            raw = f"http://{raw}"
+            # A bare hostname is assumed HTTPS, which is what every public
+            # target is and what the rest of this codebase has always assumed.
+            # A bare host:port is assumed HTTP, because a non-default port is
+            # almost always a development or staging service, and assuming
+            # TLS there is how `-t localhost:3000` dialled 443 and found
+            # nothing.
+            scheme = "http" if _explicit_port(raw) else "https"
+            raw = f"{scheme}://{raw}"
         return raw.rstrip("/")
 
     async def _seed_surface(self):

@@ -16,7 +16,7 @@ class MobileAssets(BaseModule):
     depends_on = ["tech_detection"]
 
     async def run(self) -> str:
-        base_url = f"https://{self.domain}"
+        base_url = self.base_url
         self.log("Discovering Android/iOS app associations...")
 
         android_apps = []
