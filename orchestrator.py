@@ -210,6 +210,30 @@ class Orchestrator:
             print(f"    [{meta.risk.value:12s}] {meta.id:30s} {meta.description[:60]}")
         print()
 
+        # Propose probes before looking for chains. Edges built only from
+        # already-confirmed vulns meant a clean scan produced zero chains, so
+        # the executor was never aimed at anything and `--execute` had nothing
+        # to prove. A (url, param) pair is worth testing before we know
+        # anything is wrong with it: the action is the oracle.
+        proposed = graph.propose_test_edges(
+            max_edges=self.max_actions, risk_ceiling=str(self.max_risk))
+        plan = getattr(graph, "probe_plan", {})
+        if proposed:
+            print(f"  Proposed {len(proposed)} probe(s) on testable surface "
+                  f"(risk ceiling {plan.get('risk_ceiling')}, "
+                  f"{plan.get('surfaces_considered')} surface(s) considered)")
+        elif plan.get("surfaces_considered"):
+            # Say why, rather than letting "0 chains" stand in for "nothing
+            # was even attempted". A scan that tested nothing and a scan that
+            # found nothing must not look alike.
+            print(f"  No probes proposed at risk ceiling "
+                  f"{plan.get('risk_ceiling')}, over "
+                  f"{plan['surfaces_considered']} testable surface(s):")
+            for reason, count in sorted(plan.get("not_proposed", {}).items()):
+                print(f"    - {reason} ({count})")
+            print("  Raise with --max-risk MEDIUM to run detection actions.")
+            print()
+
         # Find exploit chains
         chains = graph.find_chains(max_depth=4, min_score=0.3)
 

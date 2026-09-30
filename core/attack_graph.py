@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from urllib.parse import parse_qsl, urlparse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -42,6 +43,8 @@ class AttackPath:
 
 class AttackGraph:
     """Attack graph that extends the asset/finding graph with exploit transitions."""
+
+    probe_plan: dict = {}
 
     def __init__(self, state: StateManager):
         self.state = state
@@ -188,12 +191,161 @@ class AttackGraph:
                         likelihood: float, impact: float):
         if source in self.nodes and target in self.nodes:
             self.edges.append(AttackEdge(
-                source_id=source,
-                target_id=target,
+                source_id=source, target_id=target,
                 edge_type=edge_type,
-                likelihood=likelihood,
-                impact=impact,
+                likelihood=likelihood, impact=impact,
             ))
+
+    # ── surface-driven planning ────────────────────────────────────────────
+    #
+    # Everything above this line builds edges from vulns that have already been
+    # confirmed, which is backwards for an autonomous hunt. On a target where
+    # no detector fired, that produced 24 nodes, 3 edges and 0 chains, so the
+    # executor was never aimed at anything and `--execute` could only ever
+    # confirm a hypothesis a human had already formed.
+    #
+    # A `(url, param)` pair is a legitimate target before anything is known to
+    # be wrong with it. The action is the oracle: `web.sqli.detect` against a
+    # parameter either finds SQL injection or reports the parameter clean, and
+    # both outcomes are worth having. So the graph proposes the test, the
+    # executor runs it, and a clean result is recorded as a clean result
+    # rather than as silence.
+
+    PROBE_ACTIONS: list[str] = [
+        "web.sqli.detect",
+        "web.xss.reflected",
+    ]
+
+    def propose_test_edges(self, max_edges: int = 100,
+                           risk_ceiling: str = "LOW") -> list[AttackEdge]:
+        """Propose an exploit edge for every testable surface on the graph.
+
+        Bounded on purpose. An unbounded planner multiplies a noisy recon into
+        a noisy attack, and the cost of a wasted probe is not the same as the
+        cost of a wasted report.
+
+        The risk ceiling is honoured rather than worked around. Every injection
+        action in the library is MEDIUM or above, so at the default LOW ceiling
+        this proposes nothing — which is the correct answer, and the reason is
+        recorded in `self.probe_plan` so the caller can say so out loud. The
+        previous behaviour was to return an empty list indistinguishable from
+        "there was nothing to test", which is how a scan of a real application
+        reported zero chains and no explanation.
+
+        Returns only the edges it created.
+        """
+        from actions.registry import ActionRegistry, RiskLevel
+
+        # Explicit rank: RiskLevel values are the strings "LOW"/"MEDIUM"/...
+        # and comparing those lexicographically puts MEDIUM below LOW, which
+        # would let a high-risk probe through a low ceiling.
+        rank = {r.name: i for i, r in enumerate(RiskLevel)}
+        try:
+            ceiling = rank[str(risk_ceiling).upper()]
+        except KeyError:
+            ceiling = rank["LOW"]
+
+        candidates: list[tuple[str, str]] = []  # (action_id, source node id)
+        considered = 0
+        blocked: dict[str, int] = {}
+
+        for nid, node in self.nodes.items():
+            if node.node_type not in ("url", "parameter", "api_endpoint"):
+                continue
+            url, param = self._surface(node)
+            if not url:
+                continue
+            considered += 1
+            armed = False
+            for action_id in self.PROBE_ACTIONS:
+                entry = ActionRegistry.get(action_id)
+                if entry is None:
+                    blocked["action not registered"] = \
+                        blocked.get("action not registered", 0) + 1
+                    continue
+                meta = entry[0] if isinstance(entry, tuple) else entry
+                if meta.risk.value not in rank or rank[meta.risk.value] > ceiling:
+                    blocked[f"{action_id} is {meta.risk.value}, above the "
+                            f"{str(risk_ceiling).upper()} ceiling"] = \
+                        blocked.get(f"{action_id} is {meta.risk.value}, above "
+                                    f"the {str(risk_ceiling).upper()} ceiling", 0) + 1
+                    continue
+                # An action that needs a parameter cannot be aimed at a URL
+                # that has none, and a url-only action is wasted on a bare
+                # parameter node.
+                if "param" in meta.requires and not param:
+                    blocked["no parameter on the surface"] = \
+                        blocked.get("no parameter on the surface", 0) + 1
+                    continue
+                candidates.append((action_id, nid))
+                armed = True
+                break  # one probe per surface keeps the budget honest
+            if not armed and not candidates:
+                continue
+
+        created: list[AttackEdge] = []
+        for action_id, nid in candidates[:max_edges]:
+            node = self.nodes[nid]
+            goal_id = f"goal:probe_{nid}"
+            if goal_id not in self.nodes:
+                self.nodes[goal_id] = AttackNode(
+                    id=goal_id,
+                    label=f"Prove or clear {node.label}",
+                    node_type="goal",
+                    confidence="TENTATIVE",
+                    attrs={"proposal": True, "action_id": action_id},
+                )
+            edge = AttackEdge(
+                source_id=nid,
+                target_id=goal_id,
+                edge_type="exploit",
+                # A hypothesis, not an observation: the whole point is that we
+                # do not know yet, so the prior has to say so.
+                likelihood=0.3,
+                impact=0.9,
+                action_id=action_id,
+                attrs={"proposed": True},
+            )
+            self.edges.append(edge)
+            created.append(edge)
+
+        self.probe_plan = {
+            "risk_ceiling": str(risk_ceiling).upper(),
+            "surfaces_considered": considered,
+            "probes_proposed": len(created),
+            "capped_at": max_edges,
+            "not_proposed": blocked,
+        }
+        return created
+
+    def _surface(self, node: AttackNode) -> tuple[str, str]:
+        """The (url, param) an action could be aimed at, if any.
+
+        Mirrors `ChainExecutor._build_params` deliberately. If the two disagree
+        about where a parameter lives, the graph will propose probes the
+        executor then reports as unarmable, which looks like a broken planner
+        rather than a missing edge.
+        """
+        attrs = node.attrs or {}
+        url = ""
+        for key in ("url", "value", "endpoint"):
+            candidate = str(attrs.get(key, "")).strip()
+            if candidate.startswith(("http://", "https://")):
+                url = candidate
+                break
+        if not url and str(node.label or "").startswith(("http://", "https://")):
+            url = str(node.label).strip()
+        param = ""
+        if str(node.node_type) == "parameter":
+            param = str(node.label or "").strip()
+        elif attrs.get("param"):
+            param = str(attrs["param"]).strip()
+        if url and not param:
+            query = urlparse(url).query
+            parsed = parse_qsl(query)
+            param = parsed[0][0] if parsed else ""
+        return url, param
+
 
     def find_chains(self, max_depth: int = 4,
                     min_score: float = 0.1) -> list[AttackPath]:
