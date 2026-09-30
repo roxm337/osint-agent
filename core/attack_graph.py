@@ -41,6 +41,15 @@ class AttackPath:
     summary: str = ""
 
 
+# Node types the planner will aim a probe at. Kept as one list, shared with
+# the surface seeder, because the two used to disagree: recon and the seeder
+# write `endpoint` nodes while this only accepted `url`/`parameter`/
+# `api_endpoint`, so a freshly seeded target had 48 endpoints and the planner
+# reported zero surfaces considered. Nothing was proposed, nothing was
+# skipped, and the run printed no explanation at all.
+TESTABLE_NODE_TYPES = ("url", "parameter", "api_endpoint", "endpoint")
+
+
 class AttackGraph:
     """Attack graph that extends the asset/finding graph with exploit transitions."""
 
@@ -250,7 +259,7 @@ class AttackGraph:
         blocked: dict[str, int] = {}
 
         for nid, node in self.nodes.items():
-            if node.node_type not in ("url", "parameter", "api_endpoint"):
+            if node.node_type not in TESTABLE_NODE_TYPES:
                 continue
             url, param = self._surface(node)
             if not url:

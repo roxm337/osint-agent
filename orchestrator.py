@@ -13,9 +13,11 @@ import logging
 from state.manager import StateManager
 from modules import MODULE_REGISTRY, get_all_module_ids
 from tools.wrappers import (
-    close_engine, configure_http_limiter, configure_http_session, engine_stats,
+    close_engine, configure_http_limiter, configure_http_session, curl_with_status,
+    engine_stats,
 )
-from core.attack_graph import AttackGraph
+from core.attack_graph import AttackGraph, AttackPath
+from core.surface import seed_surface
 from core.budget_manager import BudgetManager, BudgetExceededError
 from actions import ActionRegistry, ActionContext, list_actions
 from actions.registry import ActionMeta, RiskLevel
@@ -185,6 +187,69 @@ class Orchestrator:
 
         self.state.save()
 
+    @property
+    def base_url(self) -> str:
+        """The target as a fetchable URL, port included.
+
+        `self.domain` is `urlparse(...).hostname`, which drops the port. That
+        is the right shape for a directory name and the wrong shape for a
+        request, so `localhost:3000` would otherwise be dialled as
+        `http://localhost/` — port 80, nothing there, a silent empty scan.
+        """
+        raw = self.config["target"].get("raw_url") or self.domain
+        if "://" not in raw:
+            raw = f"http://{raw}"
+        return raw.rstrip("/")
+
+    async def _seed_surface(self):
+        """Add declared API surface to state when recon has not found any.
+
+        Reads the target's own JavaScript rather than guessing at common
+        paths. A guess that happens to be right is indistinguishable from a
+        guess that was never checked, and a guess that is wrong generates
+        findings about an endpoint the target does not have.
+        """
+        if self.state.assets.get("nodes"):
+            return None
+
+        base = self.base_url
+        async def fetch_text(url):
+            result = await curl_with_status(url, timeout=20)
+            return int(result.get("status", 0) or 0), str(result.get("body", "") or "")
+
+        print(f"  No surface in state — reading API surface from {base}")
+        try:
+            seed = await seed_surface(fetch_text, base)
+        except Exception as exc:  # noqa: BLE001 - seeding must never abort a run
+            print(f"  Surface seeding failed: {exc}")
+            return None
+
+        for url, param, source in seed.seeded_params(base):
+            self.state.add_asset(
+                asset_type="endpoint", key=url, value=url,
+                confidence="CONFIRMED", sources=[source],
+                attrs={"url": url, "param": param},
+            )
+        for url in seed.urls(base, limit=40):
+            self.state.add_asset(
+                asset_type="endpoint", key=url, value=url,
+                confidence="CONFIRMED", sources=["surface-seed: declared in bundle"],
+                attrs={"url": url},
+            )
+
+        s = seed.summary()
+        self.state.save()
+        param_pairs = len(seed.seeded_params(base))
+        print(f"  Seeded {param_pairs} parameterised endpoint(s) and "
+              f"{s['api_paths']} path(s) from {s['scripts_fetched']} script(s)")
+        if s["injectable_params"]:
+            print(f"  Declared parameter(s): {', '.join(s['injectable_params'])}")
+        if s["truncated"]:
+            print("  Surface truncated at the seeder's limits.")
+        if not seed.paths:
+            print("  No API surface declared in the target's scripts — nothing to probe.")
+        return seed
+
     async def run_pentest(self):
         """Post-OSINT pentesting mode: build attack graph, discover chains, execute actions."""
         print(f"\n{'='*60}")
@@ -194,6 +259,12 @@ class Orchestrator:
 
         # Init budget
         self.budget = BudgetManager(self.config)
+
+        # A graph built only from prior recon is empty on a fresh target, and
+        # an empty graph reports zero findings while looking indistinguishable
+        # from a clean one. Read the surface out of the target's own assets
+        # before giving up on it.
+        await self._seed_surface()
 
         # Build attack graph from current state
         graph = AttackGraph(self.state)
@@ -237,9 +308,38 @@ class Orchestrator:
         # Find exploit chains
         chains = graph.find_chains(max_depth=4, min_score=0.3)
 
+        if not chains and proposed:
+            # `find_chains` BFS's from assets to goal nodes and multiplies
+            # likelihood by impact per edge. A proposed probe edge is scored
+            # 0.3 * 0.9 = 0.27, which is under the 0.3 floor, so every
+            # planner-created edge was discarded here and the run reported
+            # "1 probe proposed / 0 chains / 0 actions run". The edges exist
+            # precisely to be executed, so build a one-hop path for each.
+            # The hypothesis is still marked as such on the edge; this only
+            # decides that it is worth spending a request on.
+            chains = [
+                AttackPath(
+                    nodes=[graph.nodes[e.source_id],
+                           graph.nodes[e.target_id]],
+                    edges=[e],
+                    score=round(e.likelihood * e.impact, 3),
+                    summary=f"{graph.nodes[e.source_id].label} --[{e.edge_type}]--> "
+                            f"{graph.nodes[e.target_id].label}",
+                )
+                for e in proposed
+                if e.source_id in graph.nodes and e.target_id in graph.nodes
+            ]
+            if chains:
+                print(f"  Built {len(chains)} probe chain(s) from the "
+                      f"{len(proposed)} proposed edge(s).")
+
         if not chains:
-            print("  No exploit chains found. Run more OSINT modules first.")
-            print("  Tip: use --active for vuln scanning modules.")
+            print("  No exploit chains found.")
+            if not proposed:
+                print("  Nothing was proposed and nothing was skipped: the "
+                      "graph holds no testable surface.")
+                print("  Tip: run recon with --active first, or check the "
+                      "seeder output above.")
             chains_found = 0
         else:
             chains_found = len(chains)
@@ -282,6 +382,14 @@ class Orchestrator:
         print(f"  Executing chains (risk ceiling: {ceiling.value}, "
               f"max {self.max_actions} actions)")
         report = await executor.execute(chains, max_chains=self.max_chains)
+
+        # Persist what the executor just proved. `ChainExecutor` writes into
+        # `state.findings` in memory, but the only `save()` on this path ran
+        # before execution, so a run that proved a SQL injection printed
+        # `PROVEN web.sqli.detect -> FINDING-0001` and then left an empty
+        # `findings.json` on disk. The console showed a result that no report,
+        # no re-run and no scoring pass could ever see.
+        self.state.save()
 
         for outcome in report.ran:
             if outcome.finding_id:

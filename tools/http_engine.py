@@ -351,7 +351,28 @@ class HttpEngine:
                     # body: aiohttp's get_encoding() inspects an already-read
                     # body and raises if the stream was consumed instead.
                     encoding = _charset_from(resp.headers.get("Content-Type", ""))
-                    raw = await resp.content.read(cap + 1)
+
+                    # Read in a loop until the stream is actually done.
+                    #
+                    # A single `read(cap + 1)` is not "give me up to cap bytes".
+                    # On a chunked, gzipped response aiohttp returns whatever
+                    # one decompressed chunk produced and stops, so a
+                    # 1.2 MB bundle came back as 60 KB — with no truncation
+                    # flag, because 60 KB is under the cap. Every consumer
+                    # downstream then reasoned about a body that was missing
+                    # its own endpoints: JS analysis found nothing to parse,
+                    # content assertions compared against half a page, and
+                    # differential oracles diffed two truncated responses and
+                    # called them equal. A silent short read is worse than a
+                    # refused one, so drain to EOF and only then decide.
+                    buf = bytearray()
+                    while len(buf) <= cap:
+                        chunk = await resp.content.read(64 * 1024)
+                        if not chunk:
+                            break
+                        buf += chunk
+                    raw = bytes(buf)
+
                     truncated = len(raw) > cap
                     if truncated:
                         raw = raw[:cap]

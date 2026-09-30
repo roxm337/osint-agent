@@ -283,7 +283,27 @@ class ChainExecutor:
 
     @staticmethod
     def _node(node_id, chain):
-        return chain.nodes.get(node_id) if hasattr(chain, "nodes") else None
+        """Find a node in a chain, whether it stores nodes as a list or a map.
+
+        `AttackPath.nodes` is a `list[AttackNode]`, so `.get()` on it raises
+        `AttributeError` rather than returning None. That made every chain
+        built by `find_chains` fail at `_select_action`, which is the first
+        thing execution does — so no chain could ever be armed, and the error
+        surfaced as a crash instead of a skipped probe.
+
+        Both shapes are accepted because this function is also used with
+        hand-built stand-ins in tests, and a helper that only works for one of
+        them is how the disagreement stayed invisible.
+        """
+        nodes = getattr(chain, "nodes", None)
+        if nodes is None:
+            return None
+        if isinstance(nodes, dict):
+            return nodes.get(node_id)
+        for node in nodes:
+            if getattr(node, "id", None) == node_id:
+                return node
+        return None
 
     def _select_action(self, edge: AttackEdge, chain) -> list:
         """Candidate actions to prove this edge, best first.
@@ -432,6 +452,21 @@ class ChainExecutor:
             remediation=_remediation_for(planned.action_id),
             asset_keys=[],
             verified=True,
+            # The proof, not just the claim. A verified finding that does not
+            # record which url, which parameter and what the action actually
+            # returned is not reportable: the title is the only place the
+            # target appeared, and `url`/`param` were being dropped on the
+            # floor, so a triager had nothing to reproduce from.
+            verification={
+                "action_id": planned.action_id,
+                "selected_because": planned.reason,
+                "url": planned.url,
+                "param": planned.params.get("param", ""),
+                "params": {k: v for k, v in planned.params.items()
+                           if k in ("url", "param", "baseline_url", "test_url")},
+                "risk": planned.risk,
+                "raw_evidence": evidence,
+            },
         )
         return EdgeOutcome(
             edge=planned.edge, action_id=planned.action_id, status="ran",
