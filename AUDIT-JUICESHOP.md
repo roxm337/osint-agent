@@ -110,6 +110,64 @@ same trap is in `misconfig_probes` and `cms_deep_scan`.
 triager who submits even two of these burns their relationship with the program.
 For a paid bug-bounty workflow this is worse than finding nothing.
 
+#### Status: FIXED in `fc26eb1`
+
+The specific defect was one line. `_path_finding` had exactly one body check:
+
+```python
+if status not in (200, 401, 403) or (status == 200 and len(body.strip()) < 20):
+    return None
+# ...then, for any matching rule:
+confidence = "CONFIRMED" if status == 200 else "FIRM"
+```
+
+A 9393-byte shell passes `len < 20`, so a 200 was proof of exposure.
+
+`core/response_fingerprint.py` now provides the shared primitive that `9dd9c44`
+lacked — which is precisely why that fix never propagated: the logic was a
+private method in one module with nothing to import. A finding now needs two
+independent things:
+
+1. The response must be distinguishable from the site's own catch-all,
+   established by fingerprinting `/` plus four control paths. Three agreeing
+   controls are required before a catch-all is claimed, so one unlucky 404
+   cannot condemn a real finding.
+2. The body must contain what the artifact would contain. A real `.env` has
+   assignments, a real `.git/config` has `[core]`, a real dump has `CREATE
+   TABLE`. Serving 200 is not evidence; serving the artifact is.
+
+A `403` no longer claims CRITICAL exposure — access denied discloses nothing, so
+it is `INFO`.
+
+Replaying the recorded run through the fixed code:
+
+```
+baseline: root=c283ecae8fe2a5a1 dominant={'c283ecae8fe2a5a1': 4} controls=4
+verdicts: {'catch_all': 20}
+BEFORE fix: 20 findings (7 CRITICAL, 4 HIGH, 9 MEDIUM), all false
+AFTER  fix:  0 findings
+```
+
+A genuinely exposed `.env` is still reported `CRITICAL`/`CONFIRMED` — pinned by
+`test_a_real_exposed_env_file_is_still_reported`, so the fix removes noise
+without removing signal. 35 tests, 5/5 mutations caught.
+
+#### Still unfixed — 10 modules with the same trust-a-200 pattern
+
+```
+modules/misconfig.py       modules/git_exposure.py     modules/login_enum.py
+modules/cloud_enum.py      modules/waf_module.py       modules/rest_api.py
+modules/js_analysis.py     modules/social_media.py     modules/graphql_module.py
+modules/base.py
+```
+
+`git_exposure` and `misconfig` are the highest risk — they probe exactly the
+paths that fired here. None produced a finding on Juice Shop, but only because
+the target was already down for part of the run and because they happened to
+return something under the length threshold. This is the same bug waiting to
+happen on the next SPA that returns 200 with a shorter shell.
+
+
 ### 3.2 CRITICAL — the attack graph never produces a chain
 
 On a target with a confirmed SQLi:
@@ -189,7 +247,41 @@ Checking MX/SOA for `localhost` never returns. No guard for non-domain targets.
 
 ---
 
-## 4. Process defects
+## 4. The other half of the question: can it FIND real critical/high bugs?
+
+Precision was the headline above, but a tool that only removes noise is not a
+weapon. The honest position from this run:
+
+**The action library can find real bugs. The autonomous path cannot reach it.**
+
+| Question | Answer | Evidence |
+|---|---|---|
+| Can the executor prove a real SQLi? | **Yes** | CONFIRMED, independently verified: `SQLITE_ERROR` + working tautology |
+| Can it find it *by itself*? | **No** | 0 chains, 0 actions, 0 findings from `--pentest --execute` |
+| Can it prove a class it is pointed at? | **Yes, for 2 of 15** | `sqli.detect` proved it; `blind_detect` and `xss.reflected` correctly reported clean |
+| Can the detection modules find Juice Shop's known criticals? | **No** | `sqli_scan`, `xss_scan`, `idor_differ`, `mass_assignment`, `prototype_pollution` all returned 0 findings on a target that has all of them |
+
+The gap is **recall**, and it is not a tuning problem. The executor needs a
+`(url, param, category)` triple; the detectors were supposed to supply it and
+supplied the wrong categories instead. Nothing is wired end to end, so
+`--execute` has never found anything by itself.
+
+Ground truth for the recall measurement comes from `/api/Challenges`, which
+enumerates the application's own known vulnerabilities. That comparison is
+**not yet done** — the Docker daemon died partway through this run and the
+target is down. It is the next thing to do, and it needs the target back.
+
+Predicted result, to be measured rather than assumed: low precision (now fixed)
+and low recall, with recall limited almost entirely by the missing
+authenticated-session support. Juice Shop's highest-value bugs — IDOR on
+`/rest/products`, mass assignment on the user profile, access control on
+`/rest/admin/users` — are all **behind authentication**, and the tool is
+effectively unauthenticated. That is the single largest reason it cannot find
+critical and high bugs in real webapps today.
+
+---
+
+## 5. Process defects
 
 | Defect | Consequence |
 |---|---|
@@ -202,7 +294,7 @@ Checking MX/SOA for `localhost` never returns. No guard for non-domain targets.
 
 ---
 
-## 5. What a real red-teaming weapon needs that this does not have
+## 6. What a real red-teaming weapon needs that this does not have
 
 Ordered by how much they block a bounty payout.
 
@@ -260,7 +352,7 @@ Ordered by how much they block a bounty payout.
 
 ---
 
-## 6. Recommended order of work
+## 7. Recommended order of work
 
 1. **Shared response-baselining HTTP client** (§5.1) — kills the 22 false
    positives, the single biggest trust problem.
@@ -280,7 +372,7 @@ Items 1–4 are what separate this from a recon toy: they make the tool's output
 
 ---
 
-## 7. Reproducing this audit
+## 8. Reproducing this audit
 
 ```bash
 # per-module timings and deltas
