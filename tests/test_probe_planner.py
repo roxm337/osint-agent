@@ -14,8 +14,6 @@ surface, and — the part that matters more — it records why it did not, so
 import tempfile
 from pathlib import Path
 
-import pytest
-
 from core.attack_graph import AttackGraph, AttackNode
 from state.manager import StateManager
 
