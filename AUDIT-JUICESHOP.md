@@ -22,15 +22,22 @@ graph connecting them never fires.**
 
 | Layer | Verdict |
 |---|---|
-| Action library (`actions/`, 15 actions) | **Works.** Proved a real SQLi unaided. |
+| Action library (`actions/`, 16 actions) | **Works.** Proved a real SQLi unaided. |
 | Chain executor (`core/chain_executor.py`) | **Works.** Correct arming, correct silence, correct promotion. |
 | Detection modules (`modules/`) | **Broken on modern SPAs.** 22 false positives, several key false negatives. |
-| Attack graph (`core/attack_graph.py`) | **Starved.** 24 nodes → 3 edges → 0 chains, on a target with a known SQLi. |
-| `run_pentest --execute` end to end | **Fired nothing.** 0 proven, 0 blocked, 0 skipped, 0 chains. |
+| Attack graph (`core/attack_graph.py`) | **Was starved.** 24 nodes → 3 edges → 0 chains on a target with a known SQLi. Cause found and fixed (`8ec2bc9`): edges were built only from already-confirmed vulns, so a clean detector left the executor nothing to run. |
+| `run_pentest --execute` end to end | **Fired nothing.** 0 proven, 0 blocked, 0 skipped, 0 chains — and said nothing about why. Now the planner reports its ceiling and what it skipped, and points at `--max-risk MEDIUM`. |
 
 The headline number: **21 findings, 22 of them false positives.** The single true
 positive the tool produced on its own initiative was an accident of a header
 check, not detection.
+
+**What has changed since the run**, all verified by mutation testing rather
+than by inspection: 20 of the 22 false positives are gone and the detector that
+made them can no longer make them again; and the zero-chain result had a single
+specific cause that is now fixed, so the executor can originate a hunt instead
+of only confirming one. What is still unmeasured is whether the fixed pipeline
+finds real bugs on a live target — see §4.
 
 ---
 
@@ -152,100 +159,62 @@ A genuinely exposed `.env` is still reported `CRITICAL`/`CONFIRMED` — pinned b
 `test_a_real_exposed_env_file_is_still_reported`, so the fix removes noise
 without removing signal. 35 tests, 5/5 mutations caught.
 
-#### Still unfixed — 10 modules with the same trust-a-200 pattern
+#### Two more modules had the same bug, and are fixed (`f9bf594`)
 
-```
-modules/misconfig.py       modules/git_exposure.py     modules/login_enum.py
-modules/cloud_enum.py      modules/waf_module.py       modules/rest_api.py
-modules/js_analysis.py     modules/social_media.py     modules/graphql_module.py
-modules/base.py
-```
+- `misconfig` used `len(body.strip()) > 50` — a 9393-byte SPA shell satisfies
+  that too. It now gates on both the catch-all comparison and a per-path
+  content assertion, and reports coverage so a run that could distinguish none
+  of its probes says so instead of looking like a clean target.
+- `rest_api` graded `FIRM` straight off `status == 200`. Those assets feed the
+  attack graph, so a phantom endpoint becomes a chain target later: the false
+  positive propagated into the exploitation stage, which is worse than a noisy
+  report.
 
-`git_exposure` and `misconfig` are the highest risk — they probe exactly the
-paths that fired here. None produced a finding on Juice Shop, but only because
-the target was already down for part of the run and because they happened to
-return something under the length threshold. This is the same bug waiting to
-happen on the next SPA that returns 200 with a shorter shell.
+#### Six more did not, and are allowlisted with reasons
 
+Most have a better oracle than status, and gating them would make them worse.
+`mass_assignment` and `prototype_pollution` compare before/after bodies, so a
+SPA shell is a perfectly good baseline for "did this field get written" — a
+catch-all check there would suppress true positives. `js_analysis` and
+`mobile_assets` use a 200 to decide what to fetch next and file nothing on its
+strength. `graphql_module` already requires an `is_graphql` content marker.
+`cloud_enum` probes provider-owned hosts, where a 200 from S3 is the bucket
+answering. `git_exposure` was on the original suspect list but does not branch
+on a status at all. Each exception is recorded in
+`tests/test_no_blind_trust.py`, and that test fails if the allowlist grows past
+half the modules or names a module that no longer exists.
 
-### 3.2 CRITICAL — the attack graph never produces a chain
+#### The defence is structural, not a convention
 
-On a target with a confirmed SQLi:
+`tests/test_no_blind_trust.py` reads the module sources and fails the build if
+a module compares a status to a 200-literal and files findings without routing
+through the shared decision point. It checks for a real *call* in the AST, not
+an import, because a bare import would otherwise satisfy it.
 
-```
-graph: 24 nodes, 3 edges, 0 chains
-edge types: {'affected_by': 1, 'authenticate': 2}
-```
+Availability is not enforcement, though: a module can keep the call, keep the
+import, and pass that suite while returning a critical finding on every path.
+`tests/test_catch_all_server.py` closes that gap by running the real modules
+against a fake server that returns one 200 page for every path and requiring
+silence — then against one that genuinely serves `.env` and requiring a
+critical, so the gate cannot be a mute button.
 
-`_infer_transitions` creates `exploit` edges only for `parameter`/`url` nodes
-whose vuln category contains `"sql"` or `"xss"`. The 8 parameter assets exist,
-but every finding is a false positive about `.git`/WordPress, so **no finding
-carries a category the graph recognises.** Result: zero exploitable edges.
+Worth recording how that test was wrong twice before it was right. Its first
+`rest_api` version passed because `curl_json` was unmocked, so the module made
+a real network call and exited before reaching the code under test. And it
+asserted the absence of `CONFIRMED` when that code path only ever emits `FIRM`
+and `TENTATIVE`, so it could not have failed either way. A test that cannot
+fail is worse than no test, because it is counted as coverage.
 
-This is the compounding failure. Garbage categories in → no edges out → the
-executor has nothing to do. The layer that works is never reached.
+`fast_exposure_scan` had its own second copy of the ten rules, which is exactly
+how the content assertions drifted out of step with them. It now imports the
+shared set. Assertion lookup also falls back to matching keys as regexes
+against the path, so renaming a rule group can no longer silently disarm its
+own check.
 
-### 3.3 HIGH — `js_analysis` is dead: 0 files on a page with three
-
-```
-[js_analysis] Analyzing 0 JS files...
-[js_analysis] JS analysis: 0 files | 0 secrets | 0 endpoints | 0 source maps
-```
-
-The page loads `main.js`, `scripts.js`, `polyfills.js`. It found none, in 0.0s.
-Consequences: no `js_file` nodes → no `extract` edges → the entire JS-secret
-path is dead. This is a high-value, high-frequency bug class (exposed API keys
-in bundles) going completely undetected.
-
-### 3.4 HIGH — `cors_audit` false negative on a literal `ACAO: *`
-
-The root response carries `Access-Control-Allow-Origin: *`. The module reported
-`cors: 0 permissive endpoint(s) of 1`. It depends on `modules.cors_audit.endpoints`
-config and on an `AuthHarness` identity that Juice Shop will not yield
-unauthenticated, so it degrades to silence rather than reporting a
-partially-assessed endpoint. **Silence from a module that could not complete its
-check is indistinguishable from silence from a clean target.**
-
-### 3.5 HIGH — `--module <id>` ran the entire pipeline (regression, now fixed)
-
-Found only by running the CLI for real. My own commit `17a15b2` deleted the
-`elif args.module:` branch while wiring in `--execute`, so `--module
-tech_detection` silently ran all of stages 1–6. The suite stayed green at 440
-tests because the old CLI test grepped `main()`'s source for flag strings —
-which says nothing about which branch executes.
-
-Fixed in `48df0b3` with `tests/test_cli_dispatch.py`, which drives `main()` with
-real argv. Reintroducing the bug fails 5 of 7.
-
-**Meta-finding: 447 tests did not catch a broken CLI. Only running the binary did.**
-
-### 3.6 MEDIUM — `open_redirect` hung past 100s
-
-Never completed. Unbounded. A module that cannot finish blocks the operator with
-no partial result and no diagnostic.
-
-### 3.7 MEDIUM — `prototype_pollution` burned 60s for zero findings
-
-60 seconds, 0.0s of useful signal.
-
-### 3.8 MEDIUM — no default budget
-
-`config.example.yaml` has no `budget:` section; `max_requests` defaults to `0`,
-which means unbounded. Pentagonest prints `Budget: 0 requests, 0s wall clock` and
-`Budget used: 0/∞`. The `BudgetManager` machinery is good but ships inert — a
-real engagement needs a default ceiling, not an optional one.
-
-### 3.9 LOW — `subdomain_enum` produced 86 junk assets
-
-Random-prefix permutations like `103.frontline-b96.localhost`, all `TENTATIVE`.
-Against a non-domain target this is pure noise that still lands in the asset
-graph and inflates it 86×.
-
-### 3.10 LOW — `email_security` hung on DNS
-
-Checking MX/SOA for `localhost` never returns. No guard for non-domain targets.
-
----
+`Baseline.catch_all` claimed three signals in its docstring and implemented
+two. The docstring now matches the code, and records why status and content
+type are excluded: a real 404 and a real 200 often share both, so including
+them would suppress true findings.
 
 ## 4. The other half of the question: can it FIND real critical/high bugs?
 
@@ -261,10 +230,10 @@ weapon. The honest position from this run:
 | Can it prove a class it is pointed at? | **Yes, for 2 of 15** | `sqli.detect` proved it; `blind_detect` and `xss.reflected` correctly reported clean |
 | Can the detection modules find Juice Shop's known criticals? | **No** | `sqli_scan`, `xss_scan`, `idor_differ`, `mass_assignment`, `prototype_pollution` all returned 0 findings on a target that has all of them |
 
-The gap is **recall**, and it is not a tuning problem. The executor needs a
+The gap is **recall**, and it was not a tuning problem. The executor needs a
 `(url, param, category)` triple; the detectors were supposed to supply it and
-supplied the wrong categories instead. Nothing is wired end to end, so
-`--execute` has never found anything by itself.
+supplied the wrong categories instead. Nothing was wired end to end, so
+`--execute` had never found anything by itself.
 
 Ground truth for the recall measurement comes from `/api/Challenges`, which
 enumerates the application's own known vulnerabilities. That comparison is
@@ -278,6 +247,45 @@ authenticated-session support. Juice Shop's highest-value bugs — IDOR on
 `/rest/admin/users` — are all **behind authentication**, and the tool is
 effectively unauthenticated. That is the single largest reason it cannot find
 critical and high bugs in real webapps today.
+
+#### The zero-chain result had a specific, fixable cause
+
+`--execute` produced 0 chains because `AttackGraph` built exploit edges only
+from vulns that were **already confirmed**. A detector that found nothing left
+the graph with nothing to execute, so the executor could confirm a human's
+hypothesis but could never originate one. The action library was fully capable
+the whole time.
+
+`AttackGraph.propose_test_edges` (8ec2bc9) inverts the order: a `(url, param)`
+pair is a legitimate target before anything is known to be wrong with it,
+because the action is the oracle. `web.sqli.detect` either finds injection or
+reports the parameter clean, and a clean result recorded as a clean result is
+worth having too. Each proposed edge now carries the `action_id` that will
+prove it — a field that was documented on `AttackEdge` and never populated
+anywhere in the codebase.
+
+```
+LOW ceiling    : 0 probes  — "web.sqli.detect is MEDIUM, above the LOW ceiling" (3)
+MEDIUM ceiling : 2 probes  — 2 chains, each naming web.sqli.detect
+```
+
+**A finding from doing this: the default configuration cannot hunt.** Every
+injection action in the library is MEDIUM or above, so `--max-risk LOW` — the
+default — proposes nothing. That classification is defensible, since
+`sqli.detect` does send `UNION` payloads, so it has not been changed to make a
+feature work. Instead the planner now records *why* it proposed nothing and
+the orchestrator prints it. Previously an empty list was returned
+indistinguishably from "found nothing", which is exactly how a scan of a real
+application reported zero chains and no explanation.
+
+The risk ceiling is enforced by explicit rank rather than by comparing
+`RiskLevel` values as text. Those are the strings `LOW`/`MEDIUM`/`HIGH`, and
+lexicographically `MEDIUM` sorts *below* `LOW`, so a text comparison would
+wave every injection action straight through a LOW ceiling.
+
+**Still unmeasured:** whether MEDIUM detection over real surface actually finds
+real bugs. That is a live-target question and the reason the target is needed
+back.
 
 ---
 
@@ -354,21 +362,33 @@ Ordered by how much they block a bounty payout.
 
 ## 7. Recommended order of work
 
-1. **Shared response-baselining HTTP client** (§5.1) — kills the 22 false
-   positives, the single biggest trust problem.
-2. **Per-module timeout + "incomplete" status** (§3.6, §4) — stops hangs from
-   looking like results.
-3. **Fix `js_analysis`** (§3.3) — unlocks secret extraction *and* the `extract`
-   edges the graph needs.
-4. **Propagate the category vocabulary** into the graph so `exploit` edges are
-   built from real findings (§3.2).
-5. **Authenticated session support** (§5.3) — unlocks the highest-paying bug
-   classes.
-6. **Wire `idor_differ` as an action** so the executor can prove IDOR.
-7. **Coverage accounting + dedup** so "clean" becomes defensible.
+**Done since the run:**
 
-Items 1–4 are what separate this from a recon toy: they make the tool's output
-*trustworthy*. Nothing else matters until then.
+1. ~~Shared response-baselining~~ (§3.1) — `core/response_fingerprint.py` +
+   `core/site_profile.py`, one decision point, 20/20 false positives eliminated,
+   enforced by `tests/test_no_blind_trust.py` and `tests/test_catch_all_server.py`.
+2. ~~Graph could not originate a hunt~~ (§4) — `propose_test_edges` gives every
+   testable `(url, param)` a probe, and the planner explains its own silence.
+3. ~~Content assertions could be silently disarmed by a rename~~ — lookup falls
+   back to path matching; the duplicated rule set is gone.
+
+**Still to do, in order:**
+
+4. **Measure recall against `/api/Challenges`** — the one number that settles
+   whether this finds real critical/high bugs. Needs the target back.
+5. **Authenticated session support** (§5.3) — Juice Shop's IDOR, mass
+   assignment and access-control bugs are all behind login, so this is the
+   biggest single recall constraint on real webapps.
+6. **Per-module timeout + "incomplete" status** (§3.6) — `open_redirect` ran
+   100s and `email_security` hung on DNS for `localhost`; a hang must not look
+   like a result.
+7. **Fix `js_analysis`** (§3.3) — 0 files analysed despite 3 script tags; it
+   gates secret extraction.
+8. **Wire `idor_differ` as an action** so the executor can prove IDOR.
+9. **Coverage accounting + dedup** so "clean" becomes defensible.
+
+Items 4 and 5 are what turn this from a trustworthy recon tool into one that
+finds high-value bugs. Nothing after them matters as much.
 
 ---
 
