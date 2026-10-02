@@ -531,3 +531,155 @@ severity grading.
   distinction recorded between "tested and clear" and "could not test".
 - **Unauthenticated `test_anonymous` is off by default**, so a large share of
   the IDOR surface is deliberately untested.
+
+---
+
+## 10. Third pass — the parameter-only planner, and what fixing it cost
+
+Section 9.2 recorded the largest gap: the planner proposed one probe on a
+target with 116 challenges. The cause was that the surface seeder read
+query-parameter literals out of a bundle, and the target's access-control
+surface is not written that way.
+
+### 10.1 What the bundle actually says
+
+A minified Angular service does not write its object URLs in one piece. It
+stores a base in a class field and splices the identifier on in a method:
+
+```js
+class o{host=this.hostServer+`/api/Users`;
+        get(e){return this.http.get(`${this.host}/${e}`)}}
+```
+
+Read literally that is a collection path and an orphan id. Twelve such
+templates were recoverable and every one of them was invisible.
+
+The identifier is not unique. Every service class names its own field `host`,
+so the first implementation keyed a dict on it, collapsed twenty classes into
+whichever was assigned last, and recovered exactly one template
+(`/rest/chat/{id}`) while hiding the other eleven. Scope by position instead:
+a class field is assigned before the methods that use it, so the nearest
+preceding assignment of the same name is the right one.
+
+All twelve, each confirmed to resolve on the running target:
+
+```
+/api/Addresss/{id}    /api/BasketItems/{id}   /api/Cards/{id}
+/api/Deliverys/{id}   /api/Feedbacks/{id}     /api/Hints/{id}
+/api/Products/{id}    /api/Quantitys/{id}     /api/Users/{id}
+/rest/order-history/{id}/delivery-status
+/rest/products/{id}/reviews
+/rest/track-order/{id}
+```
+
+Six collection endpoints are called with parameters whose names are not in the
+bundle (`/api/Challenges`, `/api/Feedbacks`, `/api/Products`, `/api/Recycles`,
+`/api/SecurityQuestions`, `/api/Users`). Not injectable by name, but they
+prove the endpoint takes parameters, which is worth recording.
+
+Proposed probes: **1 → 13**, on the same 52 testable surfaces.
+
+### 10.2 Three defects that turning them on exposed
+
+**The injector did not fill the placeholder.** `inject_param` appended
+`?id=1'` to `/api/Users/{id}`, leaving the hole open. The request hit the
+catch-all, and nine probes reported "no SQLi detected" — on a URL that was
+never an endpoint. It now fills the path segment, URL-encoded.
+
+**The template regex truncated, inventing URLs.** It stopped at the first
+interpolation, so `${this.host}/${e}/x/${i}` became `/rest/chat/{id}`. Two of
+the twelve were reported as two phantoms:
+
+| reported | actual | status |
+|---|---|---|
+| `/rest/products/{id}` | `/rest/products/{id}/reviews` | 500 vs **200** |
+| `/rest/order-history/{id}` | `/rest/order-history/{id}/delivery-status` | 500 vs 500 |
+
+**The differential oracle reported input rejection as SQL injection.** With a
+path segment under test it promptly "proved" injection on two endpoints that
+only refused a malformed id:
+
+| target | baseline | payload `'` | what actually happened |
+|---|---|---|---|
+| `/api/Products/{id}` | 200 | **404** `{"message":"Not Found"}` | id no longer exists |
+| `/api/Deliverys/{id}` | 200 | **400** `{"status":"error"}` | id is not a UUID |
+
+A fingerprint cannot tell a query that ran from a value the server declined,
+and both look like divergence. A 2xx→4xx transition with no database
+signature in the body is now recorded as input rejection and the probe
+continues; a 4xx that *does* carry one is still an injection, because the
+payload reached the query before the error was rendered. Cleared probes now
+report their reason:
+
+```
+skip  web.sqli.detect: no SQLi detected; 8 payload(s) rejected as invalid input (HTTP 400)
+skip  web.sqli.detect: no SQLi detected; 8 payload(s) rejected as invalid input (HTTP 404)
+```
+
+So "tested and safe" can no longer be read as "never reached an endpoint".
+
+### 10.3 The 13 DOM sinks were noise
+
+Section 9.4 reported 13 tentative DOM XSS sink candidates. All 13 are
+Mermaid writing its own generated SVG. `innerHTML` appears hundreds of times
+in a normal SPA and almost none of those assignments are exploitable, so the
+count was a finding-shaped number with nothing in it. That number is
+retracted.
+
+Tracing the written value back to a source an attacker picks yields **0
+flows** on this bundle, which is the correct answer: the app reads no
+`location.search` or `location.hash` directly (Angular's router does), and both
+`document.cookie` uses are Angular's own cookie service. `onmessage=` is an
+entry point rather than a sink — pairing it with `message-event.data` reported
+every WebSocket listener as a flow, which is what the first version of the
+tracer found.
+
+### 10.4 Sessions: three identities, and what they still cannot prove
+
+`_base_url()` rebuilt the target root from `target.domain`, which is host-only
+by design, so `localhost:3000` became `http://localhost` — port 80, connection
+refused. All identities came back UNVERIFIED and the module declined to guess.
+The surface seeder was also pentest-only, so the modules never received the
+derived templates:
+
+| | before | after |
+|---|---|---|
+| identities verified | 0 of 3 | **3 of 3** |
+| object endpoints under test | 0 | **12** |
+
+**Still zero findings from zero probes, and that is not fixed.** 1191
+references were attributed to known accounts, but both customers see an
+identical view of every enumerated collection, so `victim_own - attacker_own`
+is empty. The real IDOR is a per-user basket — `/rest/basket/7` returns bob's
+basket (`UserId: 27`) to alice with HTTP 200 — and no collection lists
+baskets, so the shape is never enumerated. This needs per-account collection
+discovery, and it is not implemented. Recorded as open rather than as a pass.
+
+### 10.5 Deadlines
+
+A module had no wall-clock limit, so `open_redirect` decided how long the
+pipeline took: 7 minutes at 0% CPU with no sockets and no output, with every
+module queued behind it unreached and the final report looking complete.
+`module_timeout` (default 300s) stops it and records `timeout`, so partial
+coverage is distinguishable from none.
+
+### 10.6 Where this leaves the numbers
+
+| | pass 2 | pass 3 |
+|---|---|---|
+| probes proposed | 1 | **13** |
+| object-reference surfaces | 0 | **12** |
+| edges proven | 1 | 1 |
+| findings | 4 | 1 |
+| false positives | 0 | **0** |
+| recall | 1/116 | **1/116** |
+
+Recall has not moved, and the honest reading is that nothing here has solved a
+challenge. The single proven finding is the same `/rest/products/search?q=`
+SQL injection as before. What changed is that twelve access-control surfaces
+are now reachable at all, three sessions work, and the two false positives
+that briefly appeared while wiring the injector up were eliminated rather
+than reported.
+
+The count dropped from 4 findings to 1 because the DOM sink count was
+withdrawn, not because coverage fell.
