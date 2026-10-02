@@ -92,6 +92,13 @@ llm:
   temperature: 0.1
   max_tokens: 2000
 
+# Wall-clock ceiling for a single module, in seconds. A module that exceeds it
+# is recorded as `timeout` and the run continues. Without this the slowest
+# module decides how long the pipeline takes: `open_redirect` once ran for
+# seven minutes in silence before the modules queued behind it were reached.
+# 0 or absent falls back to 300.
+module_timeout: 300
+
 rate_limits:
   default:
     concurrent: 5

@@ -50,6 +50,7 @@ class Orchestrator:
         self.output_dir = Path(output_dir)
         self.config = self._load_config(config_path)
         self.mode = mode  # auto | llm | module
+        self._surface_seeded = False
 
         # Extract domain from URL if target is a full URL
         parsed = urlparse(target if "://" in target else f"//{target}")
@@ -118,6 +119,14 @@ class Orchestrator:
         print(f"  Mode: {self.mode.upper()}")
         print(f"  Output: {self.output_dir / self.target}")
         print(f"{'='*60}\n")
+
+        # The surface seeder read the target's own bundles before the modules
+        # ran. It used to be pentest-only, so in a normal pipeline the module
+        # that most needs it never saw it: `idor_differ` reported "Testing 0
+        # object endpoint(s)" on a target whose entire access-control surface
+        # is object references. The derived templates are the input that makes
+        # two-session comparison possible at all.
+        await self._seed_surface()
 
         module_ids = get_all_module_ids()
 
@@ -486,6 +495,13 @@ class Orchestrator:
 
     async def _run_module(self, module_id: str):
         """Internal: instantiate and run a module."""
+        # Seed once per process, whichever entry point got us here. `--module`
+        # skips `run_all`, so without this a single-module invocation never
+        # sees the object references the seeder derives from the bundle.
+        if not getattr(self, "_surface_seeded", False):
+            self._surface_seeded = True
+            await self._seed_surface()
+
         entry = MODULE_REGISTRY[module_id]
         module_class = entry["class"]
         module = module_class(self.state, self.config)
@@ -498,8 +514,20 @@ class Orchestrator:
         print(f"\n[{module.stage}] {module.name} ({module_id})")
         print(f"  Detectability: {entry['detectability']}")
 
+        # A module with no deadline is a module that decides how long the run
+        # takes. `open_redirect` once held the pipeline for seven minutes
+        # without producing a line of output, which reads as a hang and, worse,
+        # silently ends the run before the modules after it are reached.
+        deadline = self.config.get("module_timeout", 300)
         try:
-            result = await module.run()
+            deadline = float(deadline)
+        except (TypeError, ValueError):
+            deadline = 300.0
+        if deadline <= 0:
+            deadline = 300.0
+
+        try:
+            result = await asyncio.wait_for(module.run(), timeout=deadline)
 
             if result == "done":
                 print(f"  ✓ Complete")
@@ -508,6 +536,14 @@ class Orchestrator:
             elif result == "blocked":
                 print(f"  ✗ Blocked")
             self.state.finish_module_run(run_id, result or "unknown")
+        except asyncio.TimeoutError:
+            # Say the coverage is partial. A timeout recorded as "done" or
+            # silently dropped both understate the gap in the same direction.
+            print(f"  ⏱ Timed out after {deadline:.0f}s — coverage from this "
+                  f"module is incomplete")
+            self.state.finish_module_run(
+                run_id, "timeout",
+                f"exceeded {deadline:.0f}s module deadline")
         except Exception as e:
             print(f"  ✗ Error: {e}")
             import traceback

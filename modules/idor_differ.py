@@ -476,6 +476,24 @@ class IdorDiffer(BaseModule):
             else:
                 self.log("No object-reference endpoints found.")
                 return "skipped"
+        else:
+            # Collection-derived shapes are *added*, not held in reserve. The
+            # bundle gave 12 object references, which made this branch skip
+            # entirely — and the collections the sessions actually enumerate
+            # are where the cross-account records live. `/rest/basket/{id}` is
+            # never named in the bundle, and it is exactly the one that leaks
+            # another account's basket. 1191 references were attributed to
+            # known accounts and then never tested, because the only template
+            # that could address them had been suppressed.
+            extra = self._templates_from_collections(collections)
+            if extra:
+                seen = {t.url_template or t.url for t in templates}
+                added = [t for t in extra
+                         if (t.url_template or t.url) not in seen]
+                if added:
+                    templates = templates + added
+                    self.log(f"Added {len(added)} collection-derived object "
+                             f"endpoint(s) to {len(seen)} from the bundle")
 
         # Kept for _self_markers(), which needs a page describing the caller.
         self._templates = list(templates)
@@ -527,6 +545,27 @@ class IdorDiffer(BaseModule):
         for url in self._cfg().get("endpoints", []) or []:
             if isinstance(url, str) and url.startswith("http"):
                 add(url, "configured")
+
+        # Object-reference templates assembled from a bundle's service classes
+        # (`/api/Users/{id}`) carry no observed id, so `add` skips them and the
+        # module found nothing to test on a target whose entire
+        # access-control surface is of that shape. `url_for` fills `{id}`
+        # directly, so a template needs no sample to be probeable.
+        for asset in self.state.get_assets_by_type("endpoint"):
+            attrs = asset.get("attrs") or {}
+            if not attrs.get("object_ref"):
+                continue
+            template = str(attrs.get("template") or "")
+            url = str(asset.get("value") or "")
+            if "{id}" not in template or not url.startswith(("http://", "https://")):
+                continue
+            key = _template_key(template)
+            if key in templates:
+                continue
+            templates[key] = ObjectTemplate(
+                url=url, kind="numeric", source="bundle-template",
+                url_template=url,
+            )
 
         # A URL with no ID in it is a collection, not an object, so these
         # seeds do not become templates; they feed collection discovery.
@@ -994,9 +1033,20 @@ class IdorDiffer(BaseModule):
         without saying why. A configured `base_url` or `scheme` wins, and
         http is used when the target is a bare address such as 127.0.0.1.
         """
-        configured = str(self.target.get("base_url") or "").strip()
-        if configured:
-            return configured.rstrip("/")
+        # `raw_url` is what the orchestrator actually dialled, scheme and port
+        # included. The fallback below rebuilds the root from `target.domain`,
+        # which is host-only by design, so it produced `http://localhost` — port
+        # 80, connection refused — and every identity came back UNVERIFIED with
+        # the module then declining to guess. Two sessions against
+        # `localhost:3000` were impossible until this read `raw_url`.
+        #
+        # The fallback is still needed: a fixture may configure only
+        # `target.domain` as `127.0.0.1:9001`, where there is no scheme at all
+        # and https would simply fail to connect.
+        for key in ("base_url", "raw_url"):
+            configured = str(self.target.get(key) or "").strip()
+            if "://" in configured:
+                return configured.rstrip("/")
 
         host = str(self.domain or "").strip().rstrip("/")
         if not host:

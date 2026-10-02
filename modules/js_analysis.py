@@ -157,6 +157,141 @@ def extract_dom_sinks(js_content: str, source: str = "") -> list[dict]:
     return sinks[:200]
 
 
+# Where an attacker-supplied string can enter a page without a server render.
+DOM_SOURCE_PATTERNS = [
+    ("location.search", r"\blocation\.search\b"),
+    ("location.hash", r"\blocation\.hash\b"),
+    ("location.href", r"\blocation\.(?:href|pathname)\b"),
+    ("document.URL", r"\bdocument\.(?:URL|documentURI|baseURI)\b"),
+    ("document.referrer", r"\bdocument\.referrer\b"),
+    ("document.location", r"\bdocument\.location\b"),
+    ("window.name", r"\bwindow\.name\b"),
+    ("document.cookie", r"\bdocument\.cookie\b"),
+    ("URLSearchParams", r"\bURLSearchParams\b"),
+    ("message-event.data", r"\b[A-Za-z_$][A-Za-z0-9_$]{0,12}\.data\b"),
+    ("localStorage", r"\blocalStorage\.(?:getItem|item)\b"),
+    ("sessionStorage", r"\bsessionStorage\.(?:getItem|item)\b"),
+    ("atob", r"\batob\s*\("),
+]
+
+# `q = <up to 160 chars>` — how a minifier hoists a source into a variable.
+_ASSIGN = re.compile(r"\b([A-Za-z_$][A-Za-z0-9_$]{0,20})\s*=\s*([^;]{0,160})")
+_STMT_END = re.compile(r"[;{}\n]")
+_IDENT = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]{0,20}")
+_VALUE_LEN = 200
+_HOIST_WINDOW = 700
+
+
+def _nearest_source(text: str) -> str | None:
+    """The closest attacker-controlled source in `text`, if there is one."""
+    best: tuple[int, str] | None = None
+    for src_name, src_pattern in DOM_SOURCE_PATTERNS:
+        for src in re.finditer(src_pattern, text, flags=re.I):
+            if best is None or src.start() > best[0]:
+                best = (src.start(), src_name)
+    return best[1] if best else None
+
+
+def _taints(name: str, before: str) -> str | None:
+    """Follow one assignment backwards: does `name` hold a DOM source?
+
+    A single-statement trace misses almost every real case, because a
+    minifier hoists the read into a variable first:
+
+        var q=location.hash.slice(1);el.innerHTML=q
+
+    With a statement boundary in between, the source is already out of scope
+    of the sink and the flow is invisible. Resolving one assignment back is
+    enough for the pattern that actually occurs; deeper chains are not
+    followed, and that limit is why this is a triage aid, not a verdict.
+    """
+    best: tuple[int, str] | None = None
+    window_start = max(0, len(before) - _HOIST_WINDOW)
+    for assign in _ASSIGN.finditer(before, window_start):
+        if assign.group(1) != name:
+            continue
+        src = _nearest_source(assign.group(2))
+        if src is None:
+            continue
+        if best is None or assign.start() > best[0]:
+            best = (assign.start(), src)
+    return best[1] if best else None
+
+
+# Handler registrations are entry points, not sinks. They stay in the sink
+# inventory — they are worth knowing about — but pairing them with
+# `message-event.data` reports every WebSocket listener in every application
+# as a flow: `this.ws.onmessage=function(e){a.onData(e.data)}` is where
+# untrusted data *arrives*, and the sink is wherever `onData` writes it.
+NOT_SINKS = {"postMessage-handler", "onmessage-handler", "postMessage-send"}
+
+
+def extract_dom_flows(js_content: str, source: str = "") -> list[dict]:
+    """Sinks whose feeding expression reads an attacker-controlled source.
+
+    A sink inventory cannot be triaged. `innerHTML` appears a few hundred
+    times in a normal SPA and almost none of the assignments are
+    exploitable, so "13 DOM sinks" is neither a finding nor actionable —
+    it just tells a reviewer to go read the bundle. The difference between the
+    13 that matter and the ones that do not is whether the value written came
+    from somewhere an attacker picks.
+
+    A flow is source-reachable, not an exploit: sanitisation, encoding or a
+    framework escape may sit in between. These are the sinks worth reading
+    first, which is the part the inventory did not provide.
+    """
+    flows: list[dict] = []
+    seen: set[tuple[str, str, int]] = set()
+
+    for sink_name, pattern in DOM_SINK_PATTERNS:
+        if sink_name in NOT_SINKS:
+            continue
+        for match in re.finditer(pattern, js_content, flags=re.I):
+            # The value written to the sink, up to the end of the statement.
+            value = js_content[match.end():match.end() + _VALUE_LEN]
+            value = value.split(";", 1)[0]
+            before = js_content[max(0, match.start() - _HOIST_WINDOW):match.start()]
+
+            src = _nearest_source(value)
+            if src is None:
+                # The expression may name a variable that was assigned the
+                # source in an earlier statement. Follow each one, and take
+                # the latest assignment so `x` is judged by its final value.
+                nearest: tuple[int, str] | None = None
+                for ident in set(_IDENT.findall(value)):
+                    found = _taints(ident, before)
+                    if found is None:
+                        continue
+                    pos = before.rfind(ident + "=")
+                    if pos < 0:
+                        pos = 0
+                    if nearest is None or pos > nearest[0]:
+                        nearest = (pos, found)
+                if nearest is None:
+                    continue
+                src = nearest[1]
+
+            if src in seen or (sink_name, src, match.start()) in seen:
+                continue
+            seen.add((sink_name, src, match.start()))
+            statement = re.sub(
+                r"\s+", " ", before[before.rfind(";", 0, match.start() - len(before)) + 1:]
+                + js_content[match.start() - len(before):match.end() + _VALUE_LEN]
+            ).strip()
+            flows.append({
+                "sink": sink_name,
+                "src": src,
+                "source": source,
+                "offset": match.start(),
+                "statement": statement[:240],
+                "snippet": re.sub(
+                    r"\s+", " ",
+                    js_content[max(0, match.start() - 80):match.end() + 140],
+                ).strip()[:240],
+            })
+    return flows[:200]
+
+
 class JSAnalysis(BaseModule):
     id = "js_analysis"
     name = "JavaScript Analysis"
@@ -258,6 +393,7 @@ class JSAnalysis(BaseModule):
         all_secrets = []
         all_endpoints = []
         all_dom_sinks = []
+        all_dom_flows = []
         source_maps = []
         analyzed = 0
         skipped_catch_all = 0
@@ -317,6 +453,7 @@ class JSAnalysis(BaseModule):
 
             # DOM-XSS sink discovery
             all_dom_sinks.extend(extract_dom_sinks(content, js_url))
+            all_dom_flows.extend(extract_dom_flows(content, js_url))
 
         # Check source maps (may expose original source)
         for map_url in source_maps[:5]:
@@ -421,6 +558,60 @@ class JSAnalysis(BaseModule):
                     for sink in unique_dom_sinks[:12]
                 ],
                 remediation="Trace controllable sources to sinks, sanitize untrusted input, and enforce CSP.",
+            )
+
+        seen_flows = set()
+        unique_dom_flows = []
+        for flow in all_dom_flows:
+            key = (flow["sink"], flow["src"], flow["source"], flow["offset"])
+            if key not in seen_flows:
+                seen_flows.add(key)
+                unique_dom_flows.append(flow)
+
+        for flow in unique_dom_flows[:200]:
+            self.state.add_asset(
+                "dom_flow",
+                f"dom_flow:{flow['source']}:{flow['offset']}",
+                f"{flow['src']} -> {flow['sink']}",
+                confidence="TENTATIVE",
+                sources=["js_analysis"],
+                attrs=flow,
+            )
+
+        if unique_dom_flows:
+            # Reported separately from the sink inventory. The inventory says
+            # "this bundle writes to innerHTML"; this says "this particular
+            # assignment reads location.hash and writes it to innerHTML",
+            # which is the difference between a reviewer opening one file and
+            # a reviewer opening a few hundred.
+            pairs = sorted({f"{f['src']} -> {f['sink']}"
+                            for f in unique_dom_flows})
+            self.state.add_finding(
+                title=f"Attacker-Controlled Source Reaches a DOM Sink: "
+                      f"{len(unique_dom_flows)} flow(s)",
+                severity="HIGH",
+                confidence="TENTATIVE",
+                category="Client-Side Attack Surface",
+                description=(
+                    f"{len(unique_dom_flows)} assignment(s) read a source an "
+                    f"attacker can choose (URL, referrer, cookie, storage, "
+                    f"postMessage data) and write it to a DOM sink. A flow is "
+                    f"source-reachable in the same statement, not a confirmed "
+                    f"XSS: sanitisation, encoding or a framework escape may sit "
+                    f"in between. These are the sinks worth reading first."
+                ),
+                evidence=[
+                    f"{f['src']} -> {f['sink']} in "
+                    f"{f['source'].split('/')[-1]} at offset {f['offset']}: "
+                    f"{f['statement'][:150]}"
+                    for f in unique_dom_flows[:12]
+                ],
+                remediation=(
+                    "Do not write untrusted values to DOM sinks. Encode for the "
+                    "HTML context, prefer textContent over innerHTML, and "
+                    "enforce CSP."
+                ),
+                attrs={"flows": pairs[:40]},
             )
 
         self.state.add_asset(

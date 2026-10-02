@@ -25,9 +25,13 @@ real thing rather than by reading it:
 import asyncio
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from core.attack_graph import AttackGraph
 from core.surface import extract_from_script, script_urls_from_html, seed_surface
+from modules import MODULE_REGISTRY
 from state.manager import StateManager
 
 # A cut-down version of a real SPA bundle: an ES module that imports a chunk,
@@ -617,3 +621,108 @@ def test_a_refused_id_is_not_reported_as_injection():
     # Same status, different body: the query ran and returned something else.
     # This is the real Juice Shop signature and must survive.
     assert _refused(ok200, {"status": 200, "body": '{"status":"error"}'}) is False
+
+
+async def _noop():
+    return None
+
+
+def test_a_module_that_overruns_is_recorded_as_a_timeout(monkeypatch):
+    """The slowest module used to decide how long the whole run takes.
+
+    `open_redirect` held the pipeline for seven minutes with no output, and
+    the modules queued behind it were never reached. The failure is silent in
+    the worst way: the run finishes, the report looks complete, and the gap is
+    indistinguishable from "nothing there".
+
+    So the deadline has to (a) stop the module and (b) leave a record that
+    says coverage was partial.
+    """
+    from orchestrator import Orchestrator
+
+    class Slow:
+        stage = 1
+        name = "slow"
+
+        async def run(self):
+            await asyncio.sleep(30)
+            return "done"
+
+    orch = Orchestrator.__new__(Orchestrator)
+    # The module timeout is the subject of this test, not the surface seeder,
+    # so stub it out rather than teaching the fake state about assets.
+    orch._seed_surface = _noop
+    orch.state = SimpleNamespace(
+        module={"runs": []},
+        begin_module_run=lambda *a, **k: (orch.state.module["runs"].append(
+            {"id": "r1", "status": "running"}), "r1")[1],
+        finish_module_run=lambda rid, status, error="": orch.state.module["runs"][
+            0].update({"status": status, "error": error}),
+        block_module=lambda *a, **k: None,
+        save=lambda: None,
+    )
+    orch.config = {"module_timeout": 0.25}
+
+    with monkeypatch.context() as mp:
+        mp.setitem(MODULE_REGISTRY, "slow_stub",
+                   {"class": lambda *a: Slow(), "detectability": "none",
+                    "stage": 1})
+        asyncio.run(Orchestrator._run_module(orch, "slow_stub"))
+
+    run = orch.state.module["runs"][0]
+    assert run["status"] == "timeout", run
+    assert "0.25s" in run["error"] or "0s" in run["error"], run
+
+
+def test_a_dom_sink_only_counts_when_a_source_feeds_it():
+    """A sink inventory cannot be triaged; `innerHTML` is everywhere.
+
+    The previous run reported "13 DOM XSS Sink Candidates" and every one of
+    them turned out to be Mermaid's diagram library writing its own generated
+    SVG — code where nothing is attacker-controlled. That is a finding-shaped
+    number with no finding in it.
+
+    Trace backwards to the start of the statement feeding the sink and look for
+    a source an attacker picks. The positive and the library case must fall
+    on opposite sides of that line.
+    """
+    from modules.js_analysis import extract_dom_flows
+
+    vulnerable = (
+        "function show(){var q=location.hash.slice(1);"
+        "document.getElementById('r').innerHTML=q;}"
+    )
+    flows = extract_dom_flows(vulnerable, "app.js")
+    assert flows, "a hash read written to innerHTML is a flow"
+    assert flows[0]["src"] == "location.hash"
+    assert flows[0]["sink"] == "innerHTML"
+
+    # A library rendering its own string: a sink, and nothing more.
+    library = (
+        "g.innerHTML=nodes.map(function(x){return tag(x)}).join(' ');"
+    )
+    assert extract_dom_flows(library, "mermaid.js") == []
+
+    # The nearest preceding source wins: `b.data` taints this assignment, not
+    # an unrelated location.hash earlier in the same window.
+    mixed = "var h=location.hash;var p=e.data;el.innerHTML=p;"
+    got = extract_dom_flows(mixed, "app.js")
+    assert [f["src"] for f in got] == ["message-event.data"], got
+
+
+def test_a_message_listener_is_an_entry_point_not_a_sink():
+    """`ws.onmessage=function(e){a.onData(e.data)}` is where data arrives.
+
+    Paired with the `message-event.data` source this reports every WebSocket
+    and postMessage listener in every application as a flow — it found exactly
+    one "flow" in the Juice Shop bundle and that one was this. The sink is
+    wherever `onData` writes the value, not the line that receives it.
+    """
+    from modules.js_analysis import NOT_SINKS, extract_dom_flows
+
+    ws = "this.ws.onmessage=function(e){a.onData(e.data)}"
+    assert extract_dom_flows(ws, "socket.js") == []
+    assert "onmessage-handler" in NOT_SINKS
+
+    # The same value written to a sink is still a flow.
+    assert extract_dom_flows("el.innerHTML=e.data", "app.js")
