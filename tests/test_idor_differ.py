@@ -35,6 +35,7 @@ from modules.idor_differ import (
     IdorDiffer,
     ObjectTemplate,
     _absent_ref,
+    _collection_candidates,
     _extract_object_ids,
     _extract_refs,
     _identity_markers,
@@ -438,6 +439,22 @@ class TestHelpers:
         # request a URL the application never serves.
         assert "9" not in out.replace("https://", "")
         assert out == "https://t/api/77/x?id=77"
+
+    def test_collection_candidates_only_derive_from_fetchable_urls(self):
+        """Trimming a value that has no scheme of its own yields garbage.
+
+        `//api.ipinfodb.com/v3/ip-country` trims to `//api.ipinfodb.com/v3`,
+        and `/api/SecurityQuestions` trims to `/api` — neither is a URL the
+        engine can send, and both were being sent.
+        """
+        assert _collection_candidates("//api.ipinfodb.com/v3/ip-country/?key=1") == []
+        assert _collection_candidates("/api/SecurityQuestions") == []
+        assert _collection_candidates("s3://bucket/object/key") == []
+        assert _collection_candidates("main.js") == []
+        # An absolute http URL still gives the parent collection.
+        assert _collection_candidates("http://127.0.0.1:3000/api/invoices/100") == [
+            "http://127.0.0.1:3000/api/invoices"
+        ]
 
     def test_object_ids_extracted_from_json(self):
         body = '{"data":[{"id":"1042"},{"order_id":"1043"},{"amount":9}]}'
@@ -1029,6 +1046,29 @@ class TestCollectionDiscovery:
         env.config["modules"]["idor"]["max_collections"] = 5
         assert await env.run_module() in ("done", "skipped")
         assert env.findings() == [], "a 404 is not an endpoint"
+
+    @served
+    async def test_an_unfetchable_asset_value_does_not_end_the_run(self, env):
+        """One protocol-relative asset took the module down mid-enumeration.
+
+        Every module writes URL-ish strings into state, and the differ walks
+        them verbatim. `//host/path` reaches aiohttp with `URL.port is None`,
+        whose `assert port is not None` raises an AssertionError that no
+        handler in the engine catches — the run ended with status `error`,
+        zero probes, and zero findings on a target with a working cross-account
+        read. A value that cannot be fetched must be dropped, not sent.
+        """
+        env.state.add_asset(
+            "api_endpoint", "api://api.ipinfodb.com/v3/ip-country",
+            "//api.ipinfodb.com/v3/ip-country/?key=1")
+        env.state.add_asset(
+            "api_endpoint", "api:/api/SecurityQuestions", "/api/SecurityQuestions")
+        env.config["modules"]["idor"]["endpoints"] = [
+            f"{env.base}/api/invoices/100", f"{env.base}/api/invoices/200"]
+
+        assert await env.run_module() == "done"
+        assert any("IDOR" in f["title"] for f in env.findings()), \
+            "the run died before it could report the vulnerable endpoint"
 
 
 # ── Object shapes with no listing endpoint ───────────────────────

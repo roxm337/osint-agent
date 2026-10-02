@@ -623,6 +623,78 @@ def test_a_refused_id_is_not_reported_as_injection():
     assert _refused(ok200, {"status": 200, "body": '{"status":"error"}'}) is False
 
 
+def test_a_path_resource_change_is_not_reported_as_injection():
+    """Both sides 200, no database error, and a body that shrank 92%.
+
+    `/rest/products/{id}/reviews` with `1'` in the segment resolves to a
+    product that does not exist; the server answers `200 {"data":[]}`. The
+    refusal check only fires on a 4xx, so this sailed through and came back
+    CONFIRMED — a missing row wearing an injection's confidence label. The
+    gate is the path: a query parameter cannot change which row the route
+    looks up, so the same divergence there is still evidence.
+    """
+    from actions.web.sqli import _db_signature, _path_probe
+
+    url = "http://h/rest/products/{id}/reviews"
+    assert _path_probe(url, "id") is True
+    assert _path_probe("http://h/rest/products/search?q=x", "q") is False
+    assert _path_probe("http://h/api/Users/{id}?expand=1", "expand") is False
+
+    base = {"status": 200, "body": '{"status":"success","data":[{"author":"a"}]}'}
+    test = {"status": 200, "body": '{"status":"success","data":[]}'}
+    assert _db_signature(base, test) is False, "a shrunk list is not a database error"
+
+    # What a real injection looks like: a 5xx carrying the engine's own words.
+    assert _db_signature(base, {"status": 500, "body": "boom"}) is True
+    assert _db_signature(base, {"status": 200, "body": 'SQLITE_ERROR: unrecognized token'}) is True
+
+
+def test_detect_sqli_confirms_a_query_but_not_a_path(monkeypatch):
+    """Same divergence, opposite verdicts, decided by where the payload sits.
+
+    The two calls differ only in whether the parameter is a path placeholder,
+    which is the whole distinction: `q=x'` runs against a query, `1'` in a
+    segment merely fails to name a row.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    import actions.web.sqli as sqli
+
+    def _verdict(conf):
+        return SimpleNamespace(confidence=SimpleNamespace(value=conf),
+                               evidence={})
+
+    class _Diff:
+        async def compare_urls(self, base, test, method="GET"):
+            return (_verdict("CONFIRMED"),
+                    {"status": 200, "body": '{"data":[{"author":"admin"}]}'},
+                    {"status": 200, "body": '{"data":[]}'})
+
+    class _Rep:
+        async def check(self, fn):
+            return _verdict("CONFIRMED")
+
+    class _Oracle:
+        differential = _Diff()
+        reproducibility = _Rep()
+
+    monkeypatch.setattr(sqli, "VerificationOracle", _Oracle)
+
+    path = asyncio.run(sqli.detect_sqli(SimpleNamespace(
+        params={"url": "http://h/rest/products/{id}/reviews", "param": "id"})))
+    assert path.success is False, "a changed path resource must not be a finding"
+    assert "path segment" in path.error, path.error
+    assert path.data["path_divergences"], "the cleared payload must be recorded"
+
+    query = asyncio.run(sqli.detect_sqli(SimpleNamespace(
+        params={"url": "http://h/rest/products/search?q=x", "param": "q"})))
+    assert query.success is True, "a query differential must still confirm"
+    assert query.confidence == "CONFIRMED"
+    assert query.evidence["path_divergences"] == [], \
+        "nothing was cleared for a query parameter"
+
+
 async def _noop():
     return None
 
@@ -726,3 +798,67 @@ def test_a_message_listener_is_an_entry_point_not_a_sink():
 
     # The same value written to a sink is still a flow.
     assert extract_dom_flows("el.innerHTML=e.data", "app.js")
+
+
+# ── What counts as a DOM-XSS finding ──────────────────────────────
+
+
+def _analyse_js(monkeypatch, js_body: str):
+    """Run JSAnalysis over one fake script and return the state it wrote."""
+    import modules.js_analysis as js_mod
+    from modules.js_analysis import JSAnalysis
+
+    tmpdir = Path(tempfile.mkdtemp())
+    state = StateManager(str(tmpdir / "run" / "example.com"))
+    state.add_asset("js_file", "js:http://example.com/library.js",
+                    "http://example.com/library.js")
+
+    async def fake_fetch(url, *args, **kwargs):
+        if url.endswith("library.js"):
+            return {"status": 200, "body": js_body,
+                    "headers": "Content-Type: application/javascript"}
+        if url.rstrip("/").endswith("example.com"):
+            return {"status": 200,
+                    "body": "<html><body>application shell</body></html>",
+                    "headers": "Content-Type: text/html; charset=utf-8"}
+        return {"status": 404, "body": "", "headers": ""}
+
+    monkeypatch.setattr(js_mod, "curl_with_status", fake_fetch)
+    result = asyncio.run(
+        JSAnalysis(state, {"target": {"domain": "example.com"},
+                           "modules": {}}).run())
+    return result, state
+
+
+LIBRARY_SINK = (
+    "// a diagram library writing markup it just generated itself\n"
+    "function render(nodes){var h='';for(var i=0;i<nodes.length;i++)"
+    "{h+=nodes[i].html;}el.innerHTML=h;}"
+)
+
+
+def test_a_sink_with_no_traced_flow_is_inventory_not_a_finding(monkeypatch):
+    """The sink count was a finding-shaped number with nothing in it.
+
+    The audit measured 13 of them on a real bundle and every one was Mermaid
+    writing its own SVG. Sinks stay in state as inventory; only a traced
+    source-to-sink flow is reported.
+    """
+    result, state = _analyse_js(monkeypatch, LIBRARY_SINK)
+
+    assert result == "done"
+    assert state.get_assets_by_type("dom_sink"), "the sink list is still recorded"
+    assert state.findings["findings"] == [], \
+        [f["title"] for f in state.findings["findings"]]
+
+
+def test_a_traced_flow_is_still_reported(monkeypatch):
+    vulnerable = (
+        "function show(){var q=location.hash.slice(1);"
+        "document.getElementById('r').innerHTML=q;}"
+    )
+    result, state = _analyse_js(monkeypatch, vulnerable)
+
+    assert result == "done"
+    titles = [f["title"] for f in state.findings["findings"]]
+    assert any("DOM Sink" in t for t in titles), titles

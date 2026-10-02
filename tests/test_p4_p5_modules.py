@@ -72,6 +72,58 @@ def test_xss_scan_detects_unsanitized_reflection_without_dalfox(monkeypatch):
     assert state.findings["findings"][0]["confidence"] == "FIRM"
 
 
+def test_xss_scan_does_not_report_an_escaped_reflection(monkeypatch):
+    """The false positive this module produced on the benchmark target.
+
+    `/redirect?to=` answers with an error page that entity-encodes its input,
+    so the payload came back as `&lt;sVg/onLOad=...&gt;`. The check unescaped
+    the whole body before looking for the payload, which turned the encoding
+    defending against it into evidence that it had landed unsanitized: four
+    HIGH "Reflected XSS Candidate" findings, none of them executable.
+    """
+    import html as html_mod
+
+    import modules.xss_scan as xss_module
+
+    monkeypatch.setattr(xss_module, "tool_available", lambda name: False)
+    monkeypatch.setattr(xss_module, "_playwright_available",
+                        lambda: _async_value(False))
+
+    async def fake_curl(url, **kwargs):
+        from urllib.parse import parse_qs, urlparse, unquote
+
+        value = unquote(parse_qs(urlparse(url).query).get("q", [""])[0])
+        # What the target actually does: an error page with the input escaped.
+        return {"status": 406,
+                "body": f"<html><title>Error: {html_mod.escape(value)}</title>"
+                        f"</html>"}
+
+    monkeypatch.setattr(xss_module, "curl", fake_curl)
+    tmpdir = Path(tempfile.mkdtemp())
+    state = StateManager(str(tmpdir / "run" / "example.com"))
+    state.add_asset(
+        "parameter",
+        "param:https://example.com/search:q",
+        "q",
+        attrs={"url": "https://example.com/search"},
+    )
+
+    result = asyncio.run(XSSScan(state, {"target": {"domain": "example.com"}}).run())
+
+    assert result == "done"
+    assert state.findings["findings"] == [], \
+        "an entity-encoded reflection is a defence, not a finding"
+
+
+def test_looks_unsanitized_never_unescapes_the_body():
+    from modules.xss_scan import _looks_unsanitized
+
+    payload = "<sVg/onLOad=document.body.append(`deadbeef`.repeat(2))>"
+    escaped = payload.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    assert _looks_unsanitized(f"<title>{escaped}</title>", payload, "deadbeef") is False
+    assert _looks_unsanitized(f"<body>{payload}</body>", payload, "deadbeef") is True
+
+
 def test_xss_scan_browser_confirmation(monkeypatch):
     import modules.xss_scan as xss_module
 

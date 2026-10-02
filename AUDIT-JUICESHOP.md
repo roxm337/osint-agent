@@ -683,3 +683,242 @@ than reported.
 
 The count dropped from 4 findings to 1 because the DOM sink count was
 withdrawn, not because coverage fell.
+
+## 11. Fourth pass — a clean instance, and who was running the probes
+
+Section 10 ended with a planner that could finally reach the access-control
+surface. This pass reran everything on an instance that had never been
+touched, reported the module suite and the pentest half separately, and
+turned up the one thing neither earlier pass checked: whether the probes
+that produced the real finding were being executed at all.
+
+### 11.1 Reproducing this pass
+
+```bash
+docker rm -f goofy_hugle
+docker run -d --name goofy_hugle -p 3000:3000 bkimminich/juice-shop:latest
+python3 /tmp/setup_js.py      # alice uid 25 / basket 6, bob uid 26 / basket 7
+curl -s localhost:3000/api/Challenges          # 0 solved; registration solves 0
+
+.venv/bin/python -u orchestrator.py -t localhost:3000 -c /tmp/js-e2e/peers.yaml \
+  -o /tmp/bench8 > /tmp/bench8.log 2>&1                    # module suite, 11m53s
+
+.venv/bin/python -u orchestrator.py -t localhost:3000 -c /tmp/js-e2e/peers.yaml \
+  -o /tmp/bench8  --pentest --execute --max-risk MEDIUM \
+  > /tmp/bench8-pentest.log 2>&1                            # before 11.4
+.venv/bin/python -u orchestrator.py -t localhost:3000 -c /tmp/js-e2e/peers.yaml \
+  -o /tmp/bench11 --pentest --execute --max-risk MEDIUM \
+  > /tmp/bench11-pentest.log 2>&1                           # same state, after 11.4
+```
+
+Passwords are deliberately strong (`AlicePass2026!`, `BobPass2026!xx`) so that
+"Password Strength" stays unsolved and cannot be counted as ours.
+
+### 11.2 The module suite, fifteen findings
+
+36 modules completed, 11 skipped with a stated reason each, 0 blocked, 2 hit
+the 300s deadline (`dns_takeover`, `nuclei_scan` — both logged as
+incomplete coverage, not as clean). 336 assets, 11m53s, **15 findings**:
+
+| Finding | Sev | Module | Verdict |
+|---|---|---|---|
+| IDOR: alice reads bob's basket 7, and bob reads alice's basket 6 (0014, 0015) | HIGH | idor_differ | **true — this is "View Basket"** |
+| Missing security headers (0002) | MEDIUM | tech_detection | true — HSTS over http is moot |
+| `/api-docs` exposed (0008) | MEDIUM | rest_api_audit | true |
+| Missing HSTS/CSP (0009) | LOW | fast_exposure_scan | true but a duplicate of 0002 |
+| MySQL / PostgreSQL / PHP-FPM on 127.0.0.1:3306, 5432, 9000 (0005–0007) | CRITICAL | port_scan | out of scope — other containers |
+| Archived `/-/admin/stats` (0001) | LOW | wayback_machine | false — an archived `http://localhost/...` URL |
+| No SPF / no DMARC "on localhost" (0003, 0004) | HIGH | email_security | false — category error |
+| Public S3 bucket `testlocalhost` (0010) | MEDIUM | cloud_enum | false — a real, unrelated 2016 bucket, 74 images |
+| "API-like path" `https://ethereum-sepolia.blockpi.network/v1/rpc/public` (0011) | INFO | deep_crawl | false — third-party endpoint |
+| 73 DOM XSS sinks (0012) | MEDIUM | browser_crawl | false — class retracted in §10.3 |
+| Sensitive parameter names (0013) | MEDIUM | parameter_discovery | false — `w.soundcloud.com` player params and other containers' ports |
+
+**5 true (one of them a duplicate), 3 out of scope, 7 false.** Two of the
+five, `/api-docs` and the missing headers, are real but worth nothing on
+this target; the only finding with a payoff is the IDOR pair.
+
+IDOR in detail, because it is the whole result: two verified sessions, 24
+object endpoints from the bundle plus 1 derived, **60 collection endpoints**
+discovered, **794 references attributed** to a known account, ownership
+scoped to **9 endpoints / 1138 references**, and **2 findings from 2 probes**
+— one cross-account read per direction on `/rest/basket/{id}`:
+
+```
+  [idor_differ]   alice: verified — verified against http://localhost:3000/rest/basket/6 (HTTP 200)
+  [idor_differ]   bob: verified — verified against http://localhost:3000/rest/basket/7 (HTTP 200)
+  [idor_differ]   ownership scoped to 9 object endpoint(s), 1138 reference(s)
+  [idor_differ] 2 finding(s) from 2 probe(s)
+```
+
+The other eight object endpoints returned 0 attributed and were left alone
+rather than reported.
+
+### 11.3 Recall: 1/116 by finding, 3/116 by the server
+
+Same definition as §9.2 — confirmed findings that map to a challenge — the
+number does not move: **1/116**. What changed is the nature of that one. In
+pass 3 it was a SQL injection that mapped to eleven challenges and solved
+none of them as written. Here it is an IDOR that Juice Shop itself records:
+
+| Challenge | Counted by | What produced it | Finding? |
+|---|---|---|---|
+| View Basket | both | `idor_differ` cross-account read of `/rest/basket/{id}` | FINDING-0014 / 0015 |
+| Exposed Metrics | server only | `content_discovery` ffuf hit `GET /metrics` → 200, 26192 bytes (EVIDENCE-0145) | **none** |
+| Error Handling | server only | `idor_differ` fetching `/rest/basket/{id}/coupon/{id}` → authenticated 500 `Unexpected path` | **none** |
+
+So the server acknowledges **3/116** at the end of the run, and the finding
+ledger accounts for 1 of them. Two challenges were solved by probes that
+raised no finding at all — the module asked the question, the answer was
+recorded nowhere, and the only reason the mapping is knowable is that the
+challenge list is queryable. Nothing in the framework logs which module
+solved what; that gap is listed in §11.8.
+
+### 11.4 The plan was printed, and then not executed
+
+The pentest half of bench8 proposed **25 probes on 145 surfaces** (202
+rejections, every one of them "no parameter on the surface"), then found
+**38 chains** at score ≥ 0.3 and executed a window of 10:
+
+```
+  Proposed 25 probe(s) on testable surface (risk ceiling MEDIUM, 145 surface(s) considered)
+  Found 38 exploit chains (score >= 0.3):
+  Executing chains (risk ceiling: MEDIUM, max 25 actions)
+    PROVEN  verify.reproducible -> FINDING-0016 [CONFIRMED]     # dead wayback URL on port 80
+    ...
+  Edges proven: 4  (4 proven, 0 blocked by risk, 0 skipped, 6 unarmable)
+```
+
+Not one of the 25 probes ran. Two defects, one of them the reason the other
+never showed up before:
+
+1. **A proposed edge scores 0.27 and the chain floor is 0.3.** `find_chains`
+   multiplies likelihood by impact (0.3 × 0.9), so every planner-created edge
+   sat underneath the filter. Arming them happened in a branch that ran only
+   when `chains` came back *empty* — which is what happened in every earlier
+   pass, because the graph then held nothing else. The moment the seeder
+   found an S3 bucket and archived JavaScript, the graph returned 38 chains,
+   the arming branch was skipped, and the plan became output text.
+2. **The executor's window is `--max-chains 10`, applied to the list it is
+   handed.** Even with the plan spliced in, 25 probes and 38 graph chains
+   into a 10-chain window would have lost 15 probes to whatever scored
+   highest — here, `verify.reproducible` against `http://localhost/...` URLs
+   that do not exist.
+
+The probes are now spliced in unconditionally, deduplicated, and lead the
+queue; the window is `--max-chains + number of planned probes`, because the
+action budget is what bounds cost and the window only decides whose request
+is spent first. `probe_chains_first()` in `orchestrator.py` is the merge,
+tested both ways (`tests/test_chain_executor.py`).
+
+Same state, same target, after the fix:
+
+```
+  Proposed 25 probe(s) on testable surface (risk ceiling MEDIUM, 145 surface(s) considered)
+  Built 25 probe chain(s) from the 25 proposed edge(s), ahead of 38 graph chain(s).
+  Chains to execute: 63 (25 planned probe(s), 38 at score >= 0.3):
+    PROVEN  web.sqli.detect -> FINDING-0020 [CONFIRMED]
+  Edges proven: 1  (1 proven, 0 blocked by risk, 28 skipped, 6 unarmable)
+```
+
+25 actions spent, all 25 on the plan, one injection proven, zero new junk —
+the four archived-JavaScript chains that had crowded the plan out could not
+be reached any more because the budget was already consumed by probes.
+
+The finding is real, which had to be checked rather than assumed:
+
+```
+$ curl -s -o /dev/null -w '%{http_code}' "http://localhost:3000/rest/products/search?q=x"
+200
+$ curl -s "http://localhost:3000/rest/products/search?q=x'"
+500   Error: SQLITE_ERROR: unrecognized token: "x'%'"
+```
+
+### 11.5 A path segment that was not an injection
+
+The first post-fix run proved **two** injections, and `curl` agreed with one:
+
+| proven target | baseline | payload `'` | what actually happened |
+|---|---|---|---|
+| `/rest/products/search?q=` | 200 / 7462 B | **500** `SQLITE_ERROR: unrecognized token` | true positive |
+| `/rest/products/{id}/reviews` | 200 / 395 B | 200 / **30 B** `{"data":[]}` | a product id that does not exist |
+
+The refusal gate added in §10.2 only fires on a 2xx→4xx transition, so two
+200s slipped past it: the payload changed *which row the router looked up*,
+the server returned an empty list for the row that is not there, and the
+differential read a 92% body-length change as injection at CONFIRMED
+confidence. `_path_probe()` now asks whether the parameter is a path
+placeholder, and such a divergence is only reported when one side carries a
+database signature or a 5xx (`_db_signature()`); a query parameter cannot
+change which row the route resolves, so that path is untouched.
+
+After the gate, same state: **1 proven**, and the cleared probes say why
+instead of "no SQLi detected" — `8 payload(s) changed the path segment's
+resource with no database signature (HTTP 200)` on one endpoint, `1
+payload(s)` on another, counting only the payloads that actually diverged.
+
+### 11.6 Fixed this pass, with the test that pins it
+
+| defect | where | test |
+|---|---|---|
+| `-c` replaced the whole config, so wordlists vanished and `misconfig_probes` reported "Checking 0 of 0 paths" as green | `orchestrator._load_config` deep-merges over `config.yaml` | `tests/test_config_layering.py` (5) |
+| sqlmap parser matched any line containing "GET parameter", so rejections became CRITICAL | `tools/external.parse_sqlmap_text` positives vs negations | `tests/test_external_tools.py` |
+| XSS finding ran `html.unescape` over a 406 error page and "found" the escaped payload | `modules/xss_scan._looks_unsanitized` works on the raw body | `tests/test_p4_p5_modules.py` |
+| a 200 on a sensitive path was a "WAF Gap" on a target with no WAF | `modules/waf_module` baselines the profile, skips catch-alls, files a gap only if a WAF was seen | `tests/test_waf_module.py` (3) |
+| VirusTotal "malicious" on 127.0.0.1 | `modules/vt_enrich._reputable` skips non-global addresses | `tests/test_keyed_enrichment.py` |
+| "Exchange Owa" from the substring `owa` inside a bundle | `modules.tech_detect.pattern_in` requires word boundaries for short tokens | `tests/test_p1_modules.py` |
+| `idor_differ` AssertionError on protocol-relative assets; `Invalid IPv6 URL` crashes from bare-host asset values | `tools/http_engine`, `modules/idor_differ`, `threat_intel`, `browser_crawl` | `tests/test_idor_differ.py`, `tests/test_http_engine.py` |
+| DOM sink count filed as a finding with no traced flow, and `add_finding(attrs=)` raising `TypeError` | `modules/js_analysis` (the retraction itself is §10.3) | `tests/test_end_to_end_discovery.py` |
+| **25 probes planned, 0 executed** (§11.4) | `probe_chains_first()` + window `max_chains + probe_count` | `tests/test_chain_executor.py` |
+| **path segment reported as SQL injection** (§11.5) | `actions/web/sqli.py` `_path_probe` / `_db_signature` | `tests/test_end_to_end_discovery.py` |
+
+Suite: **590 passed, 28 skipped** — 25 of those tests were written for this
+pass, 8 of them in the two new files (`tests/test_config_layering.py`,
+`tests/test_waf_module.py`).
+
+### 11.7 Where this leaves the numbers
+
+| | pass 2 | pass 3 | pass 4 |
+|---|---|---|---|
+| probes proposed | 1 | 13 | **25** (of 145 surfaces) |
+| probes actually executed | 1 | ≥1 | **25 of 63** |
+| object-reference surfaces | 0 | 12 | **60 collections / 25 object endpoints** |
+| edges proven | 1 | 1 | **1** (+4 junk before §11.4) |
+| findings (module suite) | 4 | 1 | **15** |
+| false positives | 0 | 0 | **7** |
+| recall (finding → challenge) | 1/116 | 1/116 | **1/116** |
+| challenges the server counted | 0/116 | 0/116 | **3/116** |
+
+The recall line did not move and it would be dishonest to dress it up: on a
+target with 116 documented objectives, a full module suite plus an executing
+planner still accounts for one of them by finding, three by side effect.
+What is new is that the machinery behind the number now runs — the plan is
+executed rather than printed, the findings that are wrong are wrong for
+reasons already named, and the one finding that pays is confirmed by the
+server rather than by our own classifier.
+
+### 11.8 Still open
+
+- **Archived `http://localhost/...` URLs.** Wayback really has them (CDX
+  agrees), they are not this target, and `verify.reproducible` still
+  CONFIRMs them if it reaches them — four such findings (0016–0019) live in
+  bench8's state. §11.4 only stops them crowding out the plan; it does not
+  make them correct.
+- **Domain-collision classes beyond wayback**: `cloud_enum`'s
+  `testlocalhost` bucket, `email_security`'s SPF/DMARC "on localhost",
+  `parameter_discovery`'s third-party player parameters, `deep_crawl`'s
+  external RPC URL. All four need an in-scope check that treats `localhost`
+  as a hostname rather than a domain.
+- **`browser_crawl`'s DOM sink count** still ships as MEDIUM/TENTATIVE after
+  §10.3 retracted the same finding in `js_analysis`.
+- **Two modules always hit 300s** (`dns_takeover`, `nuclei_scan`) and report
+  `requests: 0`; the subprocess `requests` counter is never fed, so a
+  module.json request count of 0 means "we do not know", not "we did not
+  ask".
+- **`record_request()` has no caller.** The budget's request counter stays 0
+  however many requests go out, so bench11 printed `Budget used: 0/∞`
+  beside `HTTP: 341 requests`, and a configured `max_requests` limit could
+  never trip.
+- **No challenge-solve logging.** §11.3's attribution table was assembled by
+  hand from ffuf output, an idor_differ log line and `curl`; the framework
+  cannot tell you that it solved anything.

@@ -410,3 +410,53 @@ class TestWrapperDelegation:
     def test_engine_stats_when_engine_never_started(self):
         assert wrappers.engine_stats()["requests"] == 0
 
+
+
+# ── URLs the connector cannot materialise ─────────────────────────
+
+
+class TestUnfetchableUrls:
+    """A URL yarl cannot give a port must fail closed rather than raise.
+
+    `api://host/x`, `//host/x` and `/path` all arrive at the connector with
+    `req.port is None`, and its `assert port is not None` raises an
+    AssertionError — not a ValueError, not an aiohttp.ClientError — which
+    escapes every handler in `request()` and took a whole module down
+    mid-run on one protocol-relative asset value.
+    """
+
+    @staticmethod
+    async def _probe(url: str) -> dict:
+        engine = HttpEngine()
+        try:
+            return await engine.request(url)
+        finally:
+            await engine.close()
+
+    def test_foreign_scheme_protocol_relative_and_bare_path_are_refused(self):
+        for url in ("api://api.ipinfodb.com/v3/ip-country/?key=1",
+                    "//api.ipinfodb.com/v3",
+                    "/api/SecurityQuestions",
+                    "s3://bucket/object",
+                    "http://localhost:/8094/api"):
+            result = asyncio.run(self._probe(url))
+            assert result["status"] == 0, (url, result)
+            if "localhost:/8094" in url:
+                # Well-formed http with an empty port is still a real request;
+                # it must fail at connect, not at the URL check.
+                assert not result["error"].startswith("unsupported_url"), result
+                continue
+            assert result["error"].startswith("unsupported_url:"), (url, result)
+
+    def test_a_normal_url_is_still_sent(self):
+        async def body():
+            engine = HttpEngine()
+            try:
+                return await engine.request("http://127.0.0.1:9/never-reached",
+                                            timeout=1.0)
+            finally:
+                await engine.close()
+
+        result = asyncio.run(body())
+        assert result["status"] == 0
+        assert not result["error"].startswith("unsupported_url"), result

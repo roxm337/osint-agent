@@ -72,6 +72,63 @@ def test_threat_intel_records_reputation_finding(monkeypatch):
     assert state.get_assets_by_type("threat_intel")[0]["attrs"]["urlhaus_hits"] == 1
 
 
+def test_host_from_value_survives_a_product_annotation():
+    """One asset value must not be able to end the module.
+
+    CPython 3.14's `urlparse` raises "Invalid IPv6 URL" for a netloc whose
+    brackets do not pair, and `tech_detect` was storing vendor fingerprints
+    as `http://host:3000 [exchange_owa]`. That single string killed the run
+    before it queried a single source — status `error`, no enrichment at all.
+    """
+    from modules.threat_intel import _host_from_value
+
+    assert _host_from_value("http://localhost:3000 [exchange_owa]") == "localhost"
+    assert _host_from_value("https://Example.com/path") == "example.com"
+    assert _host_from_value("example.com") == "example.com"
+    for unparseable in ("[not-a-url", "host]path", "http://[::1"):
+        assert isinstance(_host_from_value(unparseable), str)
+
+
+def test_a_short_token_pattern_needs_word_boundaries():
+    """`'OWA'` matched as a substring of a minified bundle identified a
+    single-page app as "Exchange Owa" (MEDIUM, FIRM), which it is not."""
+    from modules.tech_detect import pattern_in
+
+    assert pattern_in("OWA", "Outlook Web App (OWA) sign in") is True
+    assert pattern_in("OWA", "b.showall=e.map") is False, \
+        "'owa' inside another word is not the product"
+    assert pattern_in("tmui", "GET /tmui/login.jsp") is True
+    # Patterns carrying their own separators keep substring matching: a
+    # boundary rule would reject `kbn-` in front of a version number.
+    assert pattern_in("kbn-", "/app/kbn-7.10.2/bundles.js") is True
+    assert pattern_in("BIG-3", "F5 BIG-3 management") is True
+
+
+def test_threat_intel_runs_with_a_bracketed_webapp_asset(monkeypatch):
+    async def fake_urlhaus_host(host):
+        return {"query_status": "no_results"}
+
+    async def fake_threatfox_ioc(ioc):
+        return {"query_status": "no_result"}
+
+    async def fake_ip_api(query):
+        return {"status": "success", "query": query, "as": "AS64500"}
+
+    monkeypatch.setattr(threat_module, "urlhaus_host", fake_urlhaus_host)
+    monkeypatch.setattr(threat_module, "threatfox_ioc", fake_threatfox_ioc)
+    monkeypatch.setattr(threat_module, "ip_api", fake_ip_api)
+
+    tmpdir = Path(tempfile.mkdtemp())
+    state = StateManager(str(tmpdir / "run" / "example.com"))
+    state.add_asset("webapp", "vendor:https://example.com:exchange_owa",
+                    "https://example.com [exchange_owa]")
+    config = {"target": {"domain": "example.com"}}
+
+    result = asyncio.run(ThreatIntel(state, config).run())
+
+    assert result == "done"
+
+
 def test_subdomain_source_recorder_filters_scope():
     tmpdir = Path(tempfile.mkdtemp())
     state = StateManager(str(tmpdir / "run" / "example.com"))

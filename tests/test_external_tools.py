@@ -152,6 +152,39 @@ def test_parse_sqlmap_text_without_a_connection_line_keeps_no_url():
     assert parse_sqlmap_text("POST parameter 'q' is injectable")[0]["url"] == ""
 
 
+def test_parse_sqlmap_text_ignores_lines_that_reject_the_parameter():
+    """The four CRITICAL findings this parser produced on the benchmark target.
+
+    The rule used to be "the line mentions a GET or POST parameter", which is
+    most of what sqlmap prints while deciding a parameter is *not* worth
+    testing. All four lines below came from one run against `to` on
+    `/redirect` — sqlmap rejecting it — and each was filed as FIRM SQL
+    injection.
+    """
+    text = "\n".join([
+        "[14:34:14] [INFO] testing if GET parameter 'to' is dynamic",
+        "[14:34:14] [WARNING] GET parameter 'to' does not appear to be dynamic",
+        "[14:34:14] [WARNING] heuristic (basic) test shows that GET "
+        "parameter 'to' might not be injectable",
+        "[14:34:14] [INFO] skipping GET parameter 'to'",
+    ])
+
+    assert parse_sqlmap_text(text) == []
+
+
+def test_parse_sqlmap_text_still_reports_a_real_hit_amid_the_noise():
+    text = "\n".join([
+        "[14:34:14] [INFO] testing if GET parameter 'q' is dynamic",
+        "[14:34:14] [INFO] GET parameter 'q' is vulnerable",
+        "[14:34:14] [INFO] skipping GET parameter 'to'",
+    ])
+
+    results = parse_sqlmap_text(text)
+
+    assert [r["evidence"] for r in results] == \
+        ["[14:34:14] [INFO] GET parameter 'q' is vulnerable"]
+
+
 def test_sqlmap_scan_leaves_oast_off_by_default(monkeypatch):
     """No interactsh server, no behaviour change: the argv must be identical to
     what it was before OAST existed, or every existing run shifts under it."""

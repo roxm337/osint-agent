@@ -495,6 +495,84 @@ def test_cli_exposes_execute_flag():
         assert flag in src, f"{flag} is not exposed on the CLI"
 
 
+# --- the plan must outrank the graph ------------------------------------
+
+def test_proposed_probes_lead_when_the_graph_already_has_chains():
+    """The 25-probes-printed-and-never-run regression.
+
+    `find_chains` is called with a 0.3 floor and scores a path by multiplying
+    likelihood by impact, so a proposed probe edge (0.3 * 0.9) sits at 0.27
+    underneath it. Arming those edges happened only when the chain search
+    returned nothing, so the moment the graph held any chain at all — a
+    bucket the seeder found, archived JavaScript — the plan was printed and
+    then discarded, and a run rediscovered no SQL injection that earlier
+    sections had already proved on the same target. The probes now lead the
+    queue, deduplicated against what the graph already carries.
+    """
+    from types import SimpleNamespace
+
+    from core.attack_graph import AttackPath
+    from orchestrator import probe_chains_first
+
+    n1 = AttackNode(id="n1", label="http://t/", node_type="url",
+                    confidence="CONFIRMED")
+    goal = AttackNode(id="goal", label="goal: probe", node_type="goal")
+    graph = SimpleNamespace(nodes={"n1": n1, "goal": goal})
+
+    graph_edge = AttackEdge(source_id="n1", target_id="goal",
+                            edge_type="pivot", likelihood=0.5, impact=0.7)
+    existing = [AttackPath(nodes=[n1, goal], edges=[graph_edge], score=0.35,
+                           summary="graph chain")]
+    probe = AttackEdge(source_id="n1", target_id="goal", edge_type="exploit",
+                       action_id="web.sqli.detect", likelihood=0.3, impact=0.9)
+
+    chains, probe_chains = probe_chains_first(graph, existing, [probe])
+    assert len(probe_chains) == 1, "the plan must survive into the queue"
+    assert chains[0] is probe_chains[0], "the plan runs before graph chains"
+    assert chains[-1] is existing[0], "graph chains are kept, not replaced"
+    assert chains[0].score == 0.27, "a probe scores under the 0.3 floor"
+    assert chains[0].edges[0].action_id == "web.sqli.detect"
+
+    # An edge the graph already carries as a chain is not run twice.
+    same, probes = probe_chains_first(graph, existing, [graph_edge])
+    assert probes == []
+    assert [c.summary for c in same] == [c.summary for c in existing]
+
+    # Nothing proposed: unchanged, and no crash on an empty plan.
+    same, probes = probe_chains_first(graph, existing, [])
+    assert probes == []
+    assert same == existing
+
+
+def test_execution_window_covers_every_planned_probe(tmp_path):
+    """`--max-chains 10` must not drop the plan it was handed.
+
+    The executor takes the first N chains it is given, so a plan of 25 probes
+    handed to a window of 10 lost 15 of them to whatever the graph scored
+    highest — on the benchmark target, archived JavaScript and an S3 bucket.
+    The action budget is what bounds cost; this window only decides whose
+    request is spent first.
+    """
+    from core.chain_executor import ExecutionReport
+    from orchestrator import Orchestrator
+
+    o = Orchestrator(target="example.test", output_dir=str(tmp_path),
+                     config_path="config.example.yaml", mode="auto")
+    o.execute_chains = True
+    # `run_pentest` builds the budget; this test calls the executor directly.
+    o.budget = None
+    with patch("core.chain_executor.ChainExecutor.execute",
+               return_value=ExecutionReport()) as mock_exec:
+        asyncio_run(o._execute_chains([], probe_count=25))
+    assert mock_exec.call_args.kwargs["max_chains"] == o.max_chains + 25
+
+    # No plan: the operator's ceiling alone still applies.
+    with patch("core.chain_executor.ChainExecutor.execute",
+               return_value=ExecutionReport()) as mock_exec:
+        asyncio_run(o._execute_chains([]))
+    assert mock_exec.call_args.kwargs["max_chains"] == o.max_chains
+
+
 def asyncio_run(coro):
     import asyncio
     return asyncio.run(coro)

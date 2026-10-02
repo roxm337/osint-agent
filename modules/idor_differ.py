@@ -447,8 +447,15 @@ def _collection_candidates(url: str) -> list:
     implies `/api/v1/orders` lists them. Note that the resource name itself is
     not an object reference, so it must not be trimmed as well — that would
     walk the path all the way back to the root and find nothing.
+
+    Only absolute http(s) URLs qualify. Reconnaissance also stores
+    protocol-relative and bare-path values (`//api.ipinfodb.com/v3/...`,
+    `/api/Users`); trimming those yields something that cannot be fetched, and
+    it would be fetched anyway because the candidate list is walked verbatim.
     """
     parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return []
     segments = [s for s in parsed.path.split("/") if s]
     if len(segments) < 2:
         return []
@@ -573,6 +580,12 @@ class IdorDiffer(BaseModule):
         templates: dict[str, ObjectTemplate] = {}
 
         def add(url: str, source: str = "discovered"):
+            if not url.startswith(("http://", "https://")):
+                # Reconnaissance stores protocol-relative and bare-path values
+                # (`//js.maxmind.com/...`, `/api/Users`). A template built from
+                # one of those has no host of its own, every probe against it
+                # fails, and it still costs a slot in the endpoint budget.
+                return
             for value in _extract_refs(url):
                 key = _template_key(url)
                 entry = templates.get(key)

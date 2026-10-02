@@ -543,22 +543,11 @@ class JSAnalysis(BaseModule):
                 attrs=sink,
             )
 
-        if unique_dom_sinks:
-            self.state.add_finding(
-                title=f"DOM XSS Sink Candidates in JavaScript: {len(unique_dom_sinks)}",
-                severity="MEDIUM",
-                confidence="TENTATIVE",
-                category="Client-Side Attack Surface",
-                description=(
-                    "JavaScript contains DOM sinks or postMessage handlers that may "
-                    "be exploitable if attacker-controlled sources reach them."
-                ),
-                evidence=[
-                    f"{sink['sink']} in {sink['source'].split('/')[-1]} near: {sink['snippet'][:120]}"
-                    for sink in unique_dom_sinks[:12]
-                ],
-                remediation="Trace controllable sources to sinks, sanitize untrusted input, and enforce CSP.",
-            )
+        # Sinks are inventory, not a finding. `innerHTML` is everywhere a
+        # library renders its own markup, and the count carried no signal: the
+        # audit measured 13 of them and all 13 were Mermaid writing its own
+        # generated SVG. They stay as `dom_sink` assets for anyone who wants
+        # the list; only a traced source-to-sink flow is reported below.
 
         seen_flows = set()
         unique_dom_flows = []
@@ -578,6 +567,10 @@ class JSAnalysis(BaseModule):
                 attrs=flow,
             )
 
+        if unique_dom_sinks and not unique_dom_flows:
+            self.log(f"  {len(unique_dom_sinks)} DOM sink(s), 0 traced flow(s) "
+                     f"— inventory only, not reported")
+
         if unique_dom_flows:
             # Reported separately from the sink inventory. The inventory says
             # "this bundle writes to innerHTML"; this says "this particular
@@ -586,6 +579,12 @@ class JSAnalysis(BaseModule):
             # a reviewer opening a few hundred.
             pairs = sorted({f"{f['src']} -> {f['sink']}"
                             for f in unique_dom_flows})
+            self.log(f"  {len(unique_dom_flows)} traced flow(s): "
+                     f"{', '.join(pairs[:5])}")
+            # `add_finding` takes no `attrs`: passing one raised TypeError on
+            # the only path that reports a real flow, so the module died
+            # precisely when it had something worth saying. The pairs are
+            # logged and the per-flow evidence carries them instead.
             self.state.add_finding(
                 title=f"Attacker-Controlled Source Reaches a DOM Sink: "
                       f"{len(unique_dom_flows)} flow(s)",
@@ -611,7 +610,6 @@ class JSAnalysis(BaseModule):
                     "HTML context, prefer textContent over innerHTML, and "
                     "enforce CSP."
                 ),
-                attrs={"flows": pairs[:40]},
             )
 
         self.state.add_asset(

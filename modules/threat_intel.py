@@ -134,8 +134,17 @@ class ThreatIntel(BaseModule):
 def _host_from_value(value: str) -> str:
     if not value:
         return ""
-    parsed = urlparse(value if "://" in value else f"//{value}")
-    host = parsed.hostname or value
+    # Values are written by every module that records an asset, so one
+    # malformed string must not take the whole run down: CPython 3.14's
+    # `urlparse` raises "Invalid IPv6 URL" for a netloc whose brackets do not
+    # pair, and `http://host:3000 [exchange_owa]` was stored verbatim.
+    candidate = value.split()[0]
+    try:
+        parsed = urlparse(candidate if "://" in candidate else f"//{candidate}")
+        host = parsed.hostname or ""
+    except ValueError:
+        host = candidate.split("://", 1)[-1].split("/", 1)[0]
+    host = host or value
     return host.strip().lower().strip(".")
 
 

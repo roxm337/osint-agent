@@ -35,6 +35,30 @@ def _refused(base_raw: dict, test_raw: dict) -> bool:
     return not _DB_ERROR.search(str(test_raw.get("body") or ""))
 
 
+def _path_probe(url: str, param: str) -> bool:
+    """Does this probe put the payload in the path rather than in a query?
+
+    `inject_param` fills a `{id}` placeholder in place, so the payload decides
+    which resource the router resolves: `/rest/products/1'/reviews` is simply
+    a product that does not exist, and the server answers `200
+    {"data":[]}` for it. The differential then sees a 92% body change against
+    `/rest/products/1/reviews` and calls it injection. A query parameter
+    cannot change which row the route looks up, so the same divergence there
+    stays evidence — only path segments get this extra gate.
+    """
+    return "{" + param + "}" in str(url)
+
+
+def _db_signature(base_raw: dict, test_raw: dict) -> bool:
+    """Did either side of the differential come back with a database error?"""
+    for raw in (base_raw, test_raw):
+        if _DB_ERROR.search(str(raw.get("body") or "")):
+            return True
+        if int(raw.get("status") or 0) >= 500:
+            return True
+    return False
+
+
 @action(
     id="web.sqli.detect",
     risk="MEDIUM",
@@ -59,6 +83,7 @@ async def detect_sqli(ctx: ActionContext) -> ActionResult:
     ]
 
     rejected: list[dict] = []
+    path_divergence: list[dict] = []
 
     for payload in payloads:
         test_url = inject_param(url, param, payload)
@@ -80,6 +105,21 @@ async def detect_sqli(ctx: ActionContext) -> ActionResult:
                              "test_body": str(test_raw.get("body") or "")[:200]})
             continue
 
+        if (verdict.confidence.value in ("FIRM", "CONFIRMED")
+                and _path_probe(url, param)
+                and not _db_signature(base_raw, test_raw)):
+            # Same trap, one notch looser: both sides answer 200, so the
+            # refusal check never fires, and what actually changed is which
+            # resource the path resolved to. A finding here would be a
+            # missing row wearing an injection's confidence label.
+            path_divergence.append(
+                {"payload": payload,
+                 "baseline_status": base_raw.get("status"),
+                 "test_status": test_raw.get("status"),
+                 "test_body": str(test_raw.get("body") or "")[:200],
+                 "reason": "path segment changed resource, no database error"})
+            continue
+
         if verdict.confidence.value in ("FIRM", "CONFIRMED"):
             repro = await oracle.reproducibility.check(
                 lambda: oracle.differential.test(test_url, method=method)
@@ -98,6 +138,7 @@ async def detect_sqli(ctx: ActionContext) -> ActionResult:
                     "differential": verdict.evidence,
                     "reproducibility": repro.evidence,
                     "refused_as_input_error": rejected,
+                    "path_divergences": path_divergence,
                 },
             )
 
@@ -112,6 +153,17 @@ async def detect_sqli(ctx: ActionContext) -> ActionResult:
                   f"invalid input (HTTP {', '.join(statuses)})",
             confidence="TENTATIVE",
             data={"refused_as_input_error": rejected},
+        )
+
+    if path_divergence:
+        statuses = sorted({str(r["test_status"]) for r in path_divergence})
+        return ActionResult(
+            False,
+            error=f"no SQLi detected; {len(path_divergence)} payload(s) "
+                  f"changed the path segment's resource with no database "
+                  f"signature (HTTP {', '.join(statuses)})",
+            confidence="TENTATIVE",
+            data={"path_divergences": path_divergence},
         )
 
     return ActionResult(False, error="no SQLi detected with test payloads",

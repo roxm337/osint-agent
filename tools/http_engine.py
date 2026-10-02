@@ -27,6 +27,7 @@ import ssl
 import sys
 import time
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 try:
     import aiohttp
@@ -316,6 +317,20 @@ class HttpEngine:
         the old curl wrapper's modes so existing call sites need no changes:
         "status" (code only), "headers", "body", "full" (body + raw headers).
         """
+        started = time.monotonic()
+
+        # Only http(s) URLs with a host can be materialised by aiohttp. For
+        # anything else — a protocol-relative `//host/path`, a scheme from an
+        # asset key such as `s3://` or `api://`, a bare path — yarl reports
+        # `URL.port is None`, the connector trips its internal
+        # `assert port is not None`, and the AssertionError escapes every
+        # handler below (it is not a ValueError and not an aiohttp.ClientError).
+        # One such URL in a candidate list is enough to take down the entire
+        # calling module and all the findings it would have produced.
+        parts = urlsplit(str(url))
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            return _fail(f"unsupported_url: {url}", started)
+
         session = self.session(identity)
         want_body = output in ("body", "full")
         cap = self.max_body if max_body is None else max_body
@@ -325,7 +340,6 @@ class HttpEngine:
             request_headers.update({str(k): str(v) for k, v in headers.items() if v is not None})
 
         client_timeout = aiohttp.ClientTimeout(total=timeout, sock_connect=min(timeout, 5.0))
-        started = time.monotonic()
 
         try:
             async with session.request(

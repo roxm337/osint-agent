@@ -6,6 +6,24 @@ from tools.wrappers import curl, curl_with_status, cert_info
 from tools.external import whatweb_scan, httpx_probe, tool_available
 
 
+def pattern_in(pattern: str, text: str) -> bool:
+    """Does this fingerprint appear in the text *as that string*?
+
+    A short alphanumeric pattern names a token, not a substring: `'OWA'`
+    matched somewhere inside a minified bundle is just two letters with
+    whatever sits either side of them, and matching it there identified a
+    single-page app as "Exchange Owa" (MEDIUM, FIRM). Token patterns — short
+    and alphanumeric — therefore need word boundaries. Everything else keeps
+    substring matching, because separators like `kbn-` or `/tmui/` are already
+    doing that job and a boundary test would fail on a trailing dash.
+    """
+    low_pattern = pattern.lower()
+    if len(pattern) <= 6 and pattern.isalnum():
+        return re.search(rf"(?<![a-z0-9]){re.escape(low_pattern)}(?![a-z0-9])",
+                         text.lower()) is not None
+    return low_pattern in text.lower()
+
+
 VENDOR_FINGERPRINTS = {
     "citrix_netscaler": {
         "paths": ["/vpn/index.html", "/logon/LogonPoint/index.html"],
@@ -304,7 +322,7 @@ class TechDetection(BaseModule):
 
             # Check body patterns on main page first (cheap)
             for pattern in fp["body_patterns"]:
-                if pattern.lower() in main_body.lower():
+                if pattern_in(pattern, main_body):
                     detected = True
                     evidence.append(f"Body pattern: '{pattern}' on {base_url}")
                     break
@@ -317,7 +335,7 @@ class TechDetection(BaseModule):
                     body = r.get("body", "")
                     if status in (200, 302, 301):
                         for pattern in fp["body_patterns"]:
-                            if pattern.lower() in body.lower():
+                            if pattern_in(pattern, body):
                                 detected = True
                                 evidence.append(f"Path: {base_url}{path} ({status})")
                                 break
@@ -326,10 +344,16 @@ class TechDetection(BaseModule):
 
             if detected:
                 tech["vendor_products"].append(product_name)
+                # The value stays a bare URL. Annotating it as
+                # `http://host:3000 [exchange_owa]` made every consumer that
+                # treats `webapp.value` as a URL parse a netloc containing
+                # brackets, which CPython 3.14 rejects outright — two modules
+                # died with "Invalid IPv6 URL" on that one string. The product
+                # already rides in the key and in attrs.
                 self.state.add_asset(
                     "webapp",
                     f"vendor:{base_url}:{product_name}",
-                    f"{base_url} [{product_name}]",
+                    base_url,
                     confidence="FIRM",
                     sources=["vendor fingerprint"],
                     attrs={"product": product_name},

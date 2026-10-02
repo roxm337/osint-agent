@@ -226,9 +226,19 @@ def _auth_headers(config: dict) -> dict:
     return headers
 
 
+def _hostname(url: str) -> str:
+    try:
+        return urlparse(url).hostname or ""
+    except ValueError:
+        # CPython 3.14 raises "Invalid IPv6 URL" for a netloc whose brackets
+        # do not pair. Asset values are written by other modules, so a
+        # malformed one costs a cookie scope, not the whole crawl.
+        return ""
+
+
 def _auth_cookies(config: dict, url: str) -> list[dict]:
     auth = config.get("auth", {}) or {}
-    domain = urlparse(url).hostname or ""
+    domain = _hostname(url)
     cookie_items = []
     if isinstance(auth.get("cookies"), dict):
         cookie_items.extend(auth["cookies"].items())

@@ -472,7 +472,19 @@ def parse_sqlmap_text(text: str) -> List[dict]:
     Each finding keeps the target URL so a caller can attribute an out-of-band
     confirmation to the one request that produced it. sqlmap prints the URL on
     the connection line, so that is where it is recovered from.
+
+    Only lines that *assert* an injection count. The old rule was "the line
+    mentions a GET or POST parameter", which is every other line sqlmap
+    prints: `testing if GET parameter 'to' is dynamic`,
+    `GET parameter 'to' does not appear to be dynamic`, `skipping GET
+    parameter 'to'` each became a CRITICAL finding. Four of them came out of
+    one run against a parameter sqlmap had rejected outright, reported as
+    FIRM evidence of SQL injection. The verdict words are the test.
     """
+    positives = ("is vulnerable", "is injectable", "appears to be injectable",
+                 "injection point", "injection was found")
+    negations = ("not injectable", "might not", "does not appear",
+                 "is not dynamic", "does not seem", "skipping")
     findings = []
     current_url = ""
     marker = "testing connection to the target URL:"
@@ -483,10 +495,12 @@ def parse_sqlmap_text(text: str) -> List[dict]:
             # a "[HH:MM:SS]" timestamp that would otherwise become the URL.
             _, _, tail = stripped.partition(marker)
             current_url = tail.strip() or current_url
-        if "GET parameter" in stripped or "POST parameter" in stripped:
-            findings.append({"url": current_url, "evidence": stripped})
-        elif "is vulnerable" in stripped.lower():
-            findings.append({"url": current_url, "evidence": stripped})
+        low = stripped.lower()
+        if not any(what in low for what in positives):
+            continue
+        if any(what in low for what in negations):
+            continue
+        findings.append({"url": current_url, "evidence": stripped})
     return findings
 
 

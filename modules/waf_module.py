@@ -1,5 +1,7 @@
 """Stage 4: WAF Mapping — detect, classify, and find gaps."""
 
+from core.response_fingerprint import fingerprint
+from core.site_profile import get_profile
 from modules.base import BaseModule
 from tools.wrappers import curl
 
@@ -49,11 +51,29 @@ class WAFMapping(BaseModule):
         waf_vendor = None
         rate_limit = None
 
+        # What this origin serves when nothing matches. Phase 1 classifies a
+        # 200 as "the WAF allowed it", and on a server that answers 200 to
+        # every unknown path that labelled `/.env`, `/wp-config.php` and
+        # `/.git/config` as allowed — three findings asserting a WAF gap on a
+        # target running no WAF, all three the same single-page shell as `/`.
+        async def _fetch(path: str):
+            r = await self.http_get(f"{base_url}{path}", output="full")
+            return (r.get("status", 0), r.get("body", "") or "",
+                    r.get("content_type", "") or "")
+
+        try:
+            profile = await get_profile(base_url, _fetch)
+        except Exception as exc:  # noqa: BLE001 - a baseline is best-effort
+            profile = None
+            self.log(f"  [!] Baseline unavailable ({exc}); "
+                     "classifying on status alone.")
+
         # Phase 1: Probe all paths to understand WAF
         self.log("Phase 1: Path classification...")
         for category, paths in self.PROBE_PATHS.items():
             for path in paths:
-                result = await self.http_get(f"{base_url}{path}")
+                result = await self.http_get(f"{base_url}{path}",
+                                             output="full")
                 status = result.get("status", 0)
 
                 # Check for WAF headers
@@ -64,6 +84,15 @@ class WAFMapping(BaseModule):
                     waf_blocks.append({"path": path, "code": 500, "category": category})
                     self.state.record_waf_block(path, 500)
                 elif status == 200:
+                    sig = fingerprint(status, result.get("body", "") or "",
+                                      result.get("content_type", "") or "")
+                    if path != "/" and profile is not None and \
+                            profile.baseline.catch_all(sig):
+                        # The site answers 200 to anything, so this response
+                        # says nothing about the path. Not "allowed", not
+                        # blocked: unjudgeable. `/` is the baseline itself and
+                        # is genuinely allowed, so it is exempt.
+                        continue
                     waf_allows.append({"path": path, "code": 200, "category": category})
                     self.state.record_waf_allow(path, 200)
                 elif status == 403:
@@ -153,9 +182,12 @@ class WAFMapping(BaseModule):
                 remediation="Map allowed paths to find WAF gaps.",
             )
 
-        # WAF gap finding (what's allowed that shouldn't be)
+        # WAF gap finding (what's allowed that shouldn't be). There has to be a
+        # WAF to have a gap in: filing this against an origin that runs none
+        # is a claim about a rule set that does not exist.
         sensitive_allowed = [a for a in waf_allows if a["category"] == "sensitive"]
-        if sensitive_allowed:
+        waf_present = bool(waf_vendor) or bool(waf_blocks)
+        if sensitive_allowed and waf_present:
             self.state.add_finding(
                 title="WAF Gap: Sensitive Paths Allowed",
                 severity="MEDIUM",
@@ -166,6 +198,10 @@ class WAFMapping(BaseModule):
                 evidence=[f"Allowed sensitive paths: {sensitive_allowed}"],
                 remediation="Add WAF rules to protect sensitive paths.",
             )
+        elif sensitive_allowed:
+            self.log(f"  {len(sensitive_allowed)} sensitive path(s) served 200 with "
+                     "content of their own, but no WAF fronts this origin — "
+                     "no gap claimed.")
 
         self.state.complete_module(self.id)
         self.log(f"WAF: {waf_vendor or 'unknown'} | {len(waf_blocks)} blocked, "

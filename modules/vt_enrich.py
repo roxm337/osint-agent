@@ -1,11 +1,29 @@
 """Stage 3: VirusTotal keyed enrichment."""
 
+import ipaddress
+
 from modules.base import BaseModule
 from tools.wrappers import (
     virustotal_domain,
     virustotal_domain_subdomains,
     virustotal_ip,
 )
+
+
+def _reputable(ip: str) -> bool:
+    """Is this an address whose reputation means anything about the target?
+
+    A reputation vote on 127.0.0.1 is a fact about loopback and nothing else,
+    and it was filed as HIGH: `VirusTotal IP Reputation Signals: 127.0.0.1:
+    malicious=1` on a target whose entire addressable surface is one Docker
+    container. Private, loopback and link-local addresses are not reachable
+    from the internet, so nothing about them says how the target looks from
+    outside.
+    """
+    try:
+        return ipaddress.ip_address(ip).is_global
+    except ValueError:
+        return False
 
 
 class VirusTotalEnrich(BaseModule):
@@ -58,6 +76,9 @@ class VirusTotalEnrich(BaseModule):
         for asset in self.state.get_assets_by_type("ip")[:25]:
             ip = str(asset.get("value", "")).strip()
             if not ip:
+                continue
+            if not _reputable(ip):
+                self.log(f"  {ip}: not globally routable, no reputation to ask about")
                 continue
             result = await virustotal_ip(ip, api_key)
             ip_results[ip] = _vt_stats(result)

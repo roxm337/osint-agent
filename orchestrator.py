@@ -28,6 +28,50 @@ logger = logging.getLogger("osint-agent")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
+def probe_chains_first(graph, chains, proposed):
+    """Put the planner's own probes ahead of every chain the graph offers.
+
+    `find_chains` scores a path by multiplying likelihood by impact, so a
+    proposed probe edge — 0.3 likelihood, 0.9 impact — scores 0.27 and falls
+    under the 0.3 floor the chain search is called with. Arming these edges
+    used to happen only when `chains` came back empty, which is exactly what
+    happened while the graph held nothing else: the plan ran because there
+    was nothing to crowd it out. Once the seeder started finding an S3 bucket
+    and archived JavaScript, the graph returned 38 chains, the arming branch
+    was skipped, the 25 proposed probes were printed and then never executed,
+    and the run rediscovered no SQL injection that earlier sections had
+    already proved on the same target. A plan that is printed and not run is
+    the same failure as one that was never made, so the probes are now
+    spliced in unconditionally, deduplicated against the chains, and lead the
+    queue the executor takes its window from.
+
+    Returns `(chains, probe_chains)` — the new list and the part of it that
+    came from the plan, so the caller can report both counts honestly.
+    """
+    if not proposed:
+        return list(chains), []
+    already = {(edge.source_id, edge.target_id, edge.action_id)
+               for path in chains for edge in path.edges}
+    probe_chains = []
+    for edge in proposed:
+        if edge.source_id not in graph.nodes or edge.target_id not in graph.nodes:
+            continue
+        if (edge.source_id, edge.target_id, edge.action_id) in already:
+            continue
+        already.add((edge.source_id, edge.target_id, edge.action_id))
+        probe_chains.append(AttackPath(
+            nodes=[graph.nodes[edge.source_id], graph.nodes[edge.target_id]],
+            edges=[edge],
+            score=round(edge.likelihood * edge.impact, 3),
+            summary=f"{graph.nodes[edge.source_id].label} "
+                    f"--[{edge.edge_type}]--> "
+                    f"{graph.nodes[edge.target_id].label}",
+        ))
+    if not probe_chains:
+        return list(chains), []
+    return probe_chains + list(chains), probe_chains
+
+
 def _explicit_port(host: str) -> bool:
     """Does this bare `host[:port]` name a port the user typed?
 
@@ -40,8 +84,37 @@ def _explicit_port(host: str) -> bool:
     return ":" in host
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively layer `override` over `base`.
+
+    Nested mappings merge key by key; anything else — a list of identities, a
+    scalar, an explicitly empty value — is taken whole from the override, so a
+    config file can still *replace* a list rather than have it unioned.
+    """
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 class Orchestrator:
     """Main orchestrator. Runs all modules in stage order."""
+
+    @staticmethod
+    def _read_config_file(path: str) -> dict:
+        """Read one YAML file as a dict, or {} if it is absent or unreadable."""
+        p = Path(path)
+        if not p.exists():
+            return {}
+        try:
+            loaded = yaml.safe_load(p.read_text())
+        except Exception as e:
+            print(f"Warning: Could not load config: {e}")
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
 
     def __init__(self, target: str, output_dir: str,
                  config_path: str = "config.yaml",
@@ -84,13 +157,32 @@ class Orchestrator:
         self.max_chains = 10
 
     def _load_config(self, path: str) -> dict:
-        """Load YAML config."""
-        p = Path(path)
-        if p.exists():
-            try:
-                return yaml.safe_load(p.read_text())
-            except Exception as e:
-                print(f"Warning: Could not load config: {e}")
+        """Load YAML config, laying the given file over `config.yaml`.
+
+        `-c` used to *replace* the whole configuration. The file an operator
+        actually writes for a scoped run carries only what differs — identities
+        for two test accounts — and passing it deleted every wordlist,
+        threshold and module switch in the product along with everything it
+        meant to set. `misconfig_probes` then reported "Checking 0 of 0 paths"
+        and `content_discovery` skipped its wordlist, both as green
+        completions, because the config no longer contained the lists they
+        read. Merge instead: the file wins where it speaks and the rest stays.
+        """
+        override = self._read_config_file(path)
+        # The default config is this file; merging it onto itself is a no-op,
+        # so skip it rather than depend on that arithmetic.
+        try:
+            is_default = Path(path).resolve() == Path("config.yaml").resolve()
+        except OSError:
+            is_default = False
+        base = {} if is_default else self._read_config_file("config.yaml")
+        if not override:
+            if base:
+                return base
+        elif base:
+            override = _deep_merge(base, override)
+        if override:
+            return override
         # Default config
         return {
             "target": {"domain": "", "mode": "active"},
@@ -375,31 +467,12 @@ class Orchestrator:
 
         # Find exploit chains
         chains = graph.find_chains(max_depth=4, min_score=0.3)
-
-        if not chains and proposed:
-            # `find_chains` BFS's from assets to goal nodes and multiplies
-            # likelihood by impact per edge. A proposed probe edge is scored
-            # 0.3 * 0.9 = 0.27, which is under the 0.3 floor, so every
-            # planner-created edge was discarded here and the run reported
-            # "1 probe proposed / 0 chains / 0 actions run". The edges exist
-            # precisely to be executed, so build a one-hop path for each.
-            # The hypothesis is still marked as such on the edge; this only
-            # decides that it is worth spending a request on.
-            chains = [
-                AttackPath(
-                    nodes=[graph.nodes[e.source_id],
-                           graph.nodes[e.target_id]],
-                    edges=[e],
-                    score=round(e.likelihood * e.impact, 3),
-                    summary=f"{graph.nodes[e.source_id].label} --[{e.edge_type}]--> "
-                            f"{graph.nodes[e.target_id].label}",
-                )
-                for e in proposed
-                if e.source_id in graph.nodes and e.target_id in graph.nodes
-            ]
-            if chains:
-                print(f"  Built {len(chains)} probe chain(s) from the "
-                      f"{len(proposed)} proposed edge(s).")
+        graph_chains = len(chains)
+        chains, probe_chains = probe_chains_first(graph, chains, proposed)
+        if probe_chains:
+            print(f"  Built {len(probe_chains)} probe chain(s) from the "
+                  f"{len(proposed)} proposed edge(s), ahead of "
+                  f"{graph_chains} graph chain(s).")
 
         if not chains:
             print("  No exploit chains found.")
@@ -411,7 +484,9 @@ class Orchestrator:
             chains_found = 0
         else:
             chains_found = len(chains)
-            print(f"  Found {chains_found} exploit chains (score >= 0.3):")
+            print(f"  Chains to execute: {chains_found} "
+                  f"({len(probe_chains)} planned probe(s), "
+                  f"{graph_chains} at score >= 0.3):")
             print()
             for i, path in enumerate(chains[:10], 1):
                 print(f"  Chain #{i} (score: {path.score:.3f})")
@@ -421,7 +496,7 @@ class Orchestrator:
         # Actually prove them. This is the step that used to be missing: the
         # chains above were printed and nothing was ever run against the
         # target, so every finding stayed a claim.
-        report = await self._execute_chains(chains)
+        report = await self._execute_chains(chains, probe_count=len(probe_chains))
 
         # Summary
         budget_summary = self.budget.summary() if hasattr(self, 'budget') else {}
@@ -434,7 +509,7 @@ class Orchestrator:
         print(f"  Attack graph: {self.output_dir / self.target / 'attack_graph.json'}")
         print(f"{'='*60}\n")
 
-    async def _execute_chains(self, chains):
+    async def _execute_chains(self, chains, probe_count: int = 0):
         """Run the proving action for each chain edge, under risk and budget."""
         from core.chain_executor import ChainExecutor
 
@@ -449,7 +524,14 @@ class Orchestrator:
         )
         print(f"  Executing chains (risk ceiling: {ceiling.value}, "
               f"max {self.max_actions} actions)")
-        report = await executor.execute(chains, max_chains=self.max_chains)
+        # The window covers the planner's probes in full plus `--max-chains`
+        # graph chains. The executor takes the first N chains it is handed, so
+        # with `--max-chains 10` a plan of 25 probes would lose 15 of them to
+        # whatever the graph happened to score highest — on the benchmark
+        # target, archived JavaScript and an S3 bucket. The action budget is
+        # what limits cost; this only decides whose request gets spent first.
+        report = await executor.execute(
+            chains, max_chains=self.max_chains + probe_count)
 
         # Persist what the executor just proved. `ChainExecutor` writes into
         # `state.findings` in memory, but the only `save()` on this path ran

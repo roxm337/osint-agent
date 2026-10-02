@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import html
 import secrets
 from urllib.parse import parse_qsl, urlparse
 
@@ -200,12 +199,20 @@ class XSSScan(BaseModule):
 
 
 def _looks_unsanitized(body: str, payload: str, marker: str) -> bool:
+    """Is the payload present in the response *as sent*?
+
+    Unescaping the body before looking (the previous behaviour) made the
+    encoding that defends against the payload look like proof of it: on an
+    error page that entity-encodes its input, `&lt;sVg/onLOad=...&gt;`
+    unescaped straight back into the payload and was reported as an
+    unsanitized reflection with HTML/JS metacharacters intact. Four HIGH
+    findings came out of one run that way, none of them executable.
+
+    So the dangerous pieces have to appear verbatim, or not at all.
+    """
     if not body:
         return False
     if payload in body:
-        return True
-    decoded = html.unescape(body)
-    if payload in decoded:
         return True
     dangerous_fragments = [
         "<svg",
@@ -213,7 +220,8 @@ def _looks_unsanitized(body: str, payload: str, marker: str) -> bool:
         "document.body.append",
         f"`{marker}`.repeat(2)",
     ]
-    return all(fragment.lower() in decoded.lower() for fragment in dangerous_fragments)
+    raw = body.lower()
+    return all(fragment.lower() in raw for fragment in dangerous_fragments)
 
 
 async def _playwright_available() -> bool:
