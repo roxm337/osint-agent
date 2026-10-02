@@ -257,6 +257,19 @@ class ChainExecutor:
                 first = parse_qsl(query)
                 param = first[0][0] if first else ""
 
+        # Mirror `AttackGraph._surface`: an object reference names its id in
+        # the path segment, not the query string. The two must agree — if the
+        # graph proposes a probe the executor cannot arm, the report says
+        # "planned" and means "unarmable", which is worse than saying neither.
+        if url and not param:
+            template = ""
+            for node in nodes:
+                template = str((node.attrs or {}).get("template") or "")
+                if template:
+                    break
+            if "{id}" in template:
+                param = "id"
+
         if url:
             params["url"] = url
         if param:

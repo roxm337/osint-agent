@@ -271,6 +271,19 @@ class Orchestrator:
                 attrs={"url": url},
             )
 
+        # Object references, kept TENTATIVE because the template is
+        # reassembled from two halves of a class body rather than written down
+        # whole. A collection endpoint with no way to address an individual
+        # record gives an authorisation tester nothing to test, so recording
+        # that one exists matters more than being certain of its exact shape.
+        for url, template in seed.object_refs(base):
+            self.state.add_asset(
+                asset_type="endpoint", key=url, value=url,
+                confidence="TENTATIVE",
+                sources=["surface-seed: derived from service base path"],
+                attrs={"url": url, "template": template, "object_ref": True},
+            )
+
         s = seed.summary()
         self.state.save()
         param_pairs = len(seed.seeded_params(base))
@@ -278,6 +291,13 @@ class Orchestrator:
               f"{s['api_paths']} path(s) from {s['scripts_fetched']} script(s)")
         if s["injectable_params"]:
             print(f"  Declared parameter(s): {', '.join(s['injectable_params'])}")
+        if s["object_templates"]:
+            print(f"  Derived object reference(s) (access-control surface): "
+                  f"{', '.join(s['object_templates'][:6])}"
+                  f"{' …' if len(s['object_templates']) > 6 else ''}")
+        if s["parameterised_names_unknown"]:
+            print(f"  Parameterised, names not in bundle: "
+                  f"{len(s['parameterised_names_unknown'])} path(s)")
         if s["truncated"]:
             print("  Surface truncated at the seeder's limits.")
         if not seed.paths:

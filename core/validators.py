@@ -2,17 +2,35 @@
 
 import base64
 import re
-from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, parse_qs, quote, urlencode
 
 
 def inject_param(url: str, param: str, value: str) -> str:
-    """Replace a query parameter's value regardless of its current value.
+    """Replace a parameter's value regardless of its current value.
 
     Correctly handles URLs where the parameter doesn't yet appear, has a
     different value, or appears multiple times.  Use this everywhere a payload
     needs to be injected into a URL parameter — never str.replace().
+
+    A placeholder in the **path** is filled in place rather than turned into a
+    query parameter. Bundle-derived object references arrive as
+    `/api/Users/{id}`, and appending gives `/api/Users/{id}?id=1'` — the hole
+    stays open, the server serves its catch-all page, and every probe reports
+    "no SQLi detected". That is a false negative manufactured by the injector,
+    which is worse than the missing coverage it was meant to add: nine object
+    references cleared on a URL that was never a real endpoint.
     """
     parsed = urlparse(url)
+    placeholder = "{" + param + "}"
+
+    if placeholder in parsed.path:
+        # `quote` because a payload in a path segment must not be re-parsed as
+        # structure: a bare `'` or `/` would change the path rather than the
+        # value being tested.
+        filled = parsed._replace(path=parsed.path.replace(
+            placeholder, quote(value, safe="")))
+        return filled.geturl()
+
     params = parse_qs(parsed.query, keep_blank_values=True)
     params[param] = [value]
     new_qs = urlencode(params, doseq=True)

@@ -64,6 +64,22 @@ class DifferentialAnalyzer:
                             output="full")
         return self._fingerprint(result)
 
+    async def compare_urls(self, base_url: str, test_url: str,
+                           method: str = "GET",
+                           headers: Optional[dict] = None):
+        """Verdict plus both raw bodies, fetching each URL exactly once.
+
+        The bodies are needed because a fingerprint cannot tell a query that
+        *ran* from a query the server *refused*. Both look like divergence.
+        """
+        base_raw = await curl(base_url, method=method,
+                              headers=headers or {}, output="full")
+        test_raw = await curl(test_url, method=method,
+                              headers=headers or {}, output="full")
+        verdict = self.compare(self._fingerprint(base_raw),
+                               self._fingerprint(test_raw))
+        return verdict, base_raw, test_raw
+
     async def test(self, url: str, method: str = "GET",
                    headers: Optional[dict] = None,
                    data: str = "") -> dict:

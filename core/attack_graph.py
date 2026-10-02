@@ -353,6 +353,22 @@ class AttackGraph:
             query = urlparse(url).query
             parsed = parse_qsl(query)
             param = parsed[0][0] if parsed else ""
+
+        # An object reference has exactly one differentiated component, and it
+        # is not in the query string. `/api/Users/{id}` read literally has no
+        # parameter at all, which is why 12 real access-control surfaces were
+        # considered and none of them could be probed: every injection action
+        # requires a parameter, and the id segment is not named anywhere in
+        # the URL.
+        #
+        # Naming it lets a path-segment probe land on it. That is a real test
+        # — `/api/Users/1 OR 1=1` and `/api/Users/-1 UNION SELECT …` are
+        # genuine vulnerability classes, not a way of manufacturing activity,
+        # and the id is the one thing this URL differentiates.
+        if url and not param and attrs.get("object_ref"):
+            template = str(attrs.get("template") or "")
+            if "{id}" in template:
+                param = "id"
         return url, param
 
 

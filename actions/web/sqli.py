@@ -1,10 +1,38 @@
 """SQL Injection actions."""
 
+import re
+
 from actions.registry import action, ActionContext, ActionResult
 from core.validators import inject_param
 from core.verification_oracle import VerificationOracle
 from tools.external import tool_available
 from tools.wrappers import curl
+
+# Statuses that mean the server declined the request.
+_CLIENT_ERROR = (400, 401, 403, 404, 405, 409, 422)
+
+# Some backends report the database error *as* the rejection, so a 400 carrying
+# one of these is still an injection. Rejecting the status code alone would
+# hide a real finding behind a tidy rule.
+_DB_ERROR = re.compile(
+    r"sql|syntax error|mysql|sqlite|postgres|oracle|ora-\d+|sequelize|"
+    r"pg_|database|jdbc|odbc",
+    re.IGNORECASE,
+)
+
+
+def _refused(base_raw: dict, test_raw: dict) -> bool:
+    """True when a 2xx baseline turns into a client error on injection.
+
+    Input rejection and query execution are indistinguishable in a response
+    fingerprint. They are not the same thing, and the difference decides
+    whether a finding exists.
+    """
+    base_status = int(base_raw.get("status") or 0)
+    test_status = int(test_raw.get("status") or 0)
+    if not (200 <= base_status < 300) or test_status not in _CLIENT_ERROR:
+        return False
+    return not _DB_ERROR.search(str(test_raw.get("body") or ""))
 
 
 @action(
@@ -30,13 +58,27 @@ async def detect_sqli(ctx: ActionContext) -> ActionResult:
         "' UNION SELECT NULL--", "' AND 1=1--", "' AND 1=2--",
     ]
 
+    rejected: list[dict] = []
+
     for payload in payloads:
         test_url = inject_param(url, param, payload)
         base_url = inject_param(url, param, "1")
 
-        base = await oracle.differential.baseline(base_url, method=method)
-        test = await oracle.differential.test(test_url, method=method)
-        verdict = oracle.differential.compare(base, test)
+        verdict, base_raw, test_raw = await oracle.differential.compare_urls(
+            base_url, test_url, method=method)
+
+        if verdict.confidence.value in ("FIRM", "CONFIRMED") and _refused(
+                base_raw, test_raw):
+            # Divergence here means the server declined the value, not that it
+            # executed it. `/api/Products/1'` is not an id, so a server that
+            # answers 404 has behaved correctly — and a differential oracle
+            # that cannot see that difference will report twelve endpoints as
+            # injectable the first time anyone probes a typed path segment.
+            rejected.append({"payload": payload,
+                             "baseline_status": base_raw.get("status"),
+                             "test_status": test_raw.get("status"),
+                             "test_body": str(test_raw.get("body") or "")[:200]})
+            continue
 
         if verdict.confidence.value in ("FIRM", "CONFIRMED"):
             repro = await oracle.reproducibility.check(
@@ -55,8 +97,22 @@ async def detect_sqli(ctx: ActionContext) -> ActionResult:
                 evidence={
                     "differential": verdict.evidence,
                     "reproducibility": repro.evidence,
+                    "refused_as_input_error": rejected,
                 },
             )
+
+    if rejected:
+        # Say *why* it cleared. "no SQLi detected" alone cannot be told apart
+        # from never having reached an endpoint, and that is the difference
+        # between a tested surface and a skipped one.
+        statuses = sorted({str(r["test_status"]) for r in rejected})
+        return ActionResult(
+            False,
+            error=f"no SQLi detected; {len(rejected)} payload(s) rejected as "
+                  f"invalid input (HTTP {', '.join(statuses)})",
+            confidence="TENTATIVE",
+            data={"refused_as_input_error": rejected},
+        )
 
     return ActionResult(False, error="no SQLi detected with test payloads",
                         confidence="TENTATIVE")

@@ -500,3 +500,120 @@ def test_git_severity_reflects_what_is_readable():
     # that only says repositoryformatversion.
     assert grade([{"path": "/.git/HEAD", "status": 200,
                    "preview": "ref: refs/heads/main\n"}]) == "HIGH"
+
+
+# --- object references, and the injector that has to honour them --------
+
+def test_object_templates_are_reassembled_across_a_service_class_body():
+    """A minified Angular service writes the object URL in two pieces.
+
+        class o{host=this.hostServer+`/api/Users`;
+                get(e){return this.http.get(`${this.host}/${e}`)}}
+
+    Read literally that is a collection path and an orphan id, so the whole
+    access-control surface — `/api/Users/{id}`, `/api/Cards/{id}`,
+    `/rest/track-order/{id}` — is invisible and every endpoint looks like a
+    collection with nothing to differentiate.
+
+    The identifier is not unique: every one of those classes names its own
+    field `host`. Keying a dict on the identifier collapses them all into
+    whichever was assigned last, which is how this returned exactly one
+    template (`/rest/chat/{id}`) and hid the other eleven.
+    """
+    from core.surface import derive_from_service_bases
+
+    src = (
+        "class a{host=this.hostServer+`/api/Users`;"
+        "get(e){return this.http.get(`${this.host}/${e}`)}}"
+        "class b{host=this.hostServer+`/api/Cards`;"
+        "get(e){return this.http.get(`${this.host}/${e}`)}}"
+        "class c{host=this.hostServer+`/rest/chat`;"
+        "send(e,i){return this.http.post(`${this.host}/${e}/x/${i}`,i)}}"
+    )
+    derived, _ = derive_from_service_bases(src)
+    assert derived == {"/api/Users/{id}", "/api/Cards/{id}",
+                       "/rest/chat/{id}/x/{id}"}, derived
+
+
+def test_the_injector_fills_a_path_placeholder_in_place():
+    """Appending `?id=` leaves the hole open and tests nothing.
+
+    `/api/Users/{id}` with the query branch taken becomes
+    `/api/Users/{id}?id=1'`. The server answers with its catch-all page, and
+    every probe reports "no SQLi detected" — a false negative invented by the
+    injector, on a URL that was never an endpoint. That is worse than the
+    missing coverage, because it is recorded as tested and clear.
+    """
+    from core.validators import inject_param
+
+    assert inject_param("http://h/api/Users/{id}", "id", "1") == \
+        "http://h/api/Users/1"
+
+    # The payload must be encoded into the segment: a bare quote or slash
+    # would change the path instead of the value under test.
+    got = inject_param("http://h/api/Users/{id}", "id", "1' OR '1'='1")
+    assert got.startswith("http://h/api/Users/1%27"), got
+    assert "/" not in got.split("/api/Users/")[1], "payload leaked a path separator"
+
+    # Query parameters keep working exactly as before.
+    assert inject_param("http://h/s?q=a", "q", "b") == "http://h/s?q=b"
+    assert inject_param("http://h/s", "q", "b") == "http://h/s?q=b"
+
+
+def test_the_graph_and_the_executor_agree_on_where_the_id_lives():
+    """A probe the executor cannot arm is reported as planned, not run.
+
+    `propose_test_edges` and `ChainExecutor._build_params` each resolve a
+    surface independently. When they disagree the run says a chain was
+    executed when nothing was sent, which is the one report an operator has no
+    way to notice.
+    """
+    from core.attack_graph import AttackGraph, AttackNode
+    from core.chain_executor import ChainExecutor
+    import inspect
+
+    node = AttackNode(id="u", label="http://h/api/Users/{id}", node_type="endpoint",
+                      attrs={"url": "http://h/api/Users/{id}",
+                             "template": "/api/Users/{id}", "object_ref": True})
+    g = AttackGraph.__new__(AttackGraph)
+    g.nodes = {"u": node}
+    assert AttackGraph._surface(g, node) == ("http://h/api/Users/{id}", "id")
+
+    src = inspect.getsource(ChainExecutor._build_params)
+    assert '"{id}" in template' in src, \
+        "the executor must resolve the path placeholder the graph resolved"
+
+
+def test_a_refused_id_is_not_reported_as_injection():
+    """Quoting a typed path segment makes it invalid; 404 is correct behaviour.
+
+    Twelve derived object references turned the SQLi action loose on path
+    segments, and it promptly proved SQL injection on two of them:
+    `/api/Products/{id}` 200 -> 404 `{"message":"Not Found"}` and
+    `/api/Deliverys/{id}` 200 -> 400 `{"status":"error"}`. Neither touched a
+    query. A server that rejects a malformed id is doing what it should, and a
+    fingerprint cannot tell that apart from a query that ran.
+
+    The check stays two-sided on purpose: a 4xx that carries a database
+    signature is still an injection, because the payload reached the query
+    before the error was rendered.
+    """
+    from actions.web.sqli import _refused
+
+    refused = {"status": 400, "body": '{"status":"error"}'}
+    not_found = {"status": 404, "body": '{"message":"Not Found"}'}
+    db_error = {"status": 400, "body": "SQLITE_ERROR: near \"'\": syntax error"}
+    ok200 = {"status": 200, "body": "[]"}
+
+    assert _refused(ok200, refused) is True
+    assert _refused(ok200, not_found) is True
+
+    # The payload reached the database before the error was rendered.
+    assert _refused(ok200, db_error) is False
+
+    # A 5xx is a broken query, not a refusal.
+    assert _refused(ok200, {"status": 500, "body": "boom"}) is False
+
+    # Same status, different body: the query ran and returned something else.
+    # This is the real Juice Shop signature and must survive.
+    assert _refused(ok200, {"status": 200, "body": '{"status":"error"}'}) is False
