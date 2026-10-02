@@ -17,6 +17,7 @@ The same local aiohttp server convention as test_http_engine is used, and
 """
 
 import asyncio
+import base64
 import contextlib
 import json
 import sys
@@ -32,6 +33,7 @@ from aiohttp import web
 
 from modules.idor_differ import (
     IdorDiffer,
+    ObjectTemplate,
     _absent_ref,
     _extract_object_ids,
     _extract_refs,
@@ -42,6 +44,19 @@ from modules.idor_differ import (
 )
 from state.manager import StateManager
 from tools.http_engine import HttpEngine
+
+
+def _jwt(claims: dict) -> str:
+    """A structurally valid JWT carrying `claims`.
+
+    Nothing here verifies a signature — the harness reads an identity's own
+    token only to ask it who it says it is — so an unsigned body is enough.
+    """
+    def seg(payload: dict) -> str:
+        raw = json.dumps(payload).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    return f"{seg({'alg': 'none', 'typ': 'JWT'})}.{seg(claims)}.forged"
 
 
 # ── Local servers ────────────────────────────────────────────────
@@ -137,6 +152,21 @@ def _build_app(vulnerable: bool, *, write_vulnerable: bool = False,
             raise web.HTTPUnauthorized()
         return web.json_response({"email": user["email"], "user": user["user"]})
 
+    # A bearer-protected route. A cookie identity keeps its session in the
+    # engine's per-identity jar, but a bearer identity has no jar: its
+    # Authorization header *is* the credential, so anything that discards
+    # that header authenticates nothing.
+    BEARERS = {"tok-alice": "alice@example.com", "tok-bob": "bob@example.com"}
+
+    async def vault(request):
+        token = request.headers.get("Authorization", "")
+        if token.startswith("Bearer "):
+            token = token[len("Bearer "):]
+        email = BEARERS.get(token)
+        if not email:
+            raise web.HTTPUnauthorized(text="No Authorization header was found")
+        return web.json_response({"email": email, "role": "member"})
+
     async def collection(request):
         user = current(request)
         if not user:
@@ -188,15 +218,37 @@ def _build_app(vulnerable: bool, *, write_vulnerable: bool = False,
     async def not_a_collection(request):
         raise web.HTTPNotFound(text="not found")
 
+    # An object shape with no listing counterpart, like a shopping basket.
+    # Neither account's view of it can be compared with the other's, so the
+    # flat map puts every reference in both pockets at once and the
+    # difference that proves privacy is empty.
+    BASKETS = {
+        "100": {"id": "100", "owner_email": "alice@example.com", "items": 3},
+        "200": {"id": "200", "owner_email": "bob@example.com", "items": 1},
+    }
+
+    async def basket(request):
+        user = current(request)
+        record = BASKETS.get(request.match_info["id"])
+        if not record:
+            raise web.HTTPNotFound(text="not found")
+        if not user:
+            raise web.HTTPUnauthorized()
+        if not vulnerable and not owns(user, record):
+            raise web.HTTPForbidden(text="forbidden")
+        return web.json_response(record)
+
     app = web.Application()
     app.router.add_get("/", dashboard)
     app.router.add_get("/dashboard", dashboard)
     app.router.add_get("/login", login_page)
     app.router.add_post("/login", login)
     app.router.add_get("/api/me", api_me)
+    app.router.add_get("/api/vault", vault)
     app.router.add_get("/api/invoices", collection)
     app.router.add_get("/api/invoices/{id}", invoice)
     app.router.add_get("/api/v1/invoices/{id}", invoice)
+    app.router.add_get("/api/baskets/{id}", basket)
     for method in ("PATCH", "PUT", "DELETE"):
         app.router.add_route(method, "/api/invoices/{id}", write_invoice)
     # A decoy so wordlist probing is not trivially all-404.
@@ -514,6 +566,23 @@ class TestAuthHarness:
         assert AuthHarness({}).identities == {}
         assert AuthHarness({"auth": {}}).identities == {}
 
+    def test_privilege_comes_from_config_or_the_tokens_own_claims(self):
+        """Only the report's ordering depends on this, and only if it is known.
+
+        An unknown role must count as ordinary: guessing that an account is
+        privileged would bury the peer-to-peer direction of a real leak.
+        """
+        assert Identity(name="a", role="admin").privileged
+        assert not Identity(name="b", role="customer").privileged
+        assert not Identity(name="c").privileged
+        assert Identity(name="d",
+                        bearer_token=_jwt({"role": "root"})).privileged
+        # Juice Shop nests its claims under `data`; the walk flattens them.
+        assert Identity(name="e", bearer_token=_jwt(
+            {"data": {"role": "admin"}})).privileged
+        assert not Identity(name="f",
+                            bearer_token=_jwt({"role": "customer"})).privileged
+
 
 # ── The differ: positive ─────────────────────────────────────────
 
@@ -558,6 +627,29 @@ class TestIdorDetected:
             assert data["data"]["victim_markers_leaked"], "evidence must show what leaked"
             assert any("@" in marker
                        for marker in data["data"]["victim_markers_leaked"])
+
+    @served
+    async def test_the_headline_direction_is_between_peers(self, env):
+        """The first entry in the report is what a triager reads."""
+        await env.run_module()
+        subjects = [e["subject"] for e in env.evidence()
+                    if e["type"] == "idor_read"]
+        assert subjects[0].startswith("alice->bob"), subjects
+
+    @served
+    async def test_a_privileged_account_is_not_the_headline_direction(self, env):
+        """An administrator may be entitled to read any record; peers are not.
+
+        Leading with an administrator's read would hand a triager the reason
+        to close the ticket. Demoting the privileged account moves the peer
+        pair to the front without dropping anything.
+        """
+        env.config["auth"]["identities"]["alice"]["role"] = "admin"
+        await env.run_module()
+        subjects = [e["subject"] for e in env.evidence()
+                    if e["type"] == "idor_read"]
+        assert subjects[0].startswith("bob->alice"), subjects
+        assert len(subjects) == 2, subjects
 
 
 # ── The differ: negative ─────────────────────────────────────────
@@ -623,6 +715,55 @@ class TestNoFalsePositives:
         ]
         assert await env.run_module() in ("done", "skipped")
         assert env.findings() == []
+
+
+# ── Bearer identities ─────────────────────────────────────────────
+
+
+class TestBearerIdentities:
+    """A bearer identity has no cookie jar, so its header is the session.
+
+    The strip that protects isolated jars from the legacy global credential
+    used to run over the identity's own headers as well, so every bearer
+    request went out unauthenticated: objects came back 401, no ownership
+    could be attributed, and the differ reported zero probes against a
+    target whose baskets were readable by anyone — while the run still
+    claimed verified sessions, because the fallback verify URL was public.
+    """
+
+    @staticmethod
+    def _with_vault_identities(env, tokens):
+        env.config["auth"]["identities"] = {
+            name: {"bearer_token": token,
+                   "verify_url": f"{env.base}/api/vault",
+                   "success_marker": f"{name}@example.com"}
+            for name, token in tokens.items()
+        }
+
+    @served
+    async def test_verification_proves_the_header_was_sent(self, env):
+        """The vault 401s without a token, so 200 means the header arrived."""
+        self._with_vault_identities(env, {"alice": "tok-alice",
+                                          "bob": "tok-bob"})
+        assert await env.run_module() == "done"
+
+    @served
+    async def test_a_rejected_token_is_not_a_session(self, env):
+        """The counterpart, or the test above would pass on a fluke."""
+        self._with_vault_identities(env, {"ghost": "tok-nope"})
+        assert await env.run_module() == "skipped"
+        assert env.findings() == []
+
+    def test_identity_headers_survive_the_legacy_session_strip(self):
+        merged = wrappers._merge_session_headers(
+            {"Authorization": "Bearer identity-token"}, drop_auth=True)
+        assert merged["Authorization"] == "Bearer identity-token"
+
+    def test_anonymous_strips_even_a_caller_supplied_credential(self):
+        merged = wrappers._drop_auth_headers(
+            {"Authorization": "Bearer identity-token", "Cookie": "session=1",
+             "User-Agent": "scanner"})
+        assert merged == {"User-Agent": "scanner"}
 
 
 # ── Bug regressions: false-positive sources found in review ───────
@@ -888,6 +1029,124 @@ class TestCollectionDiscovery:
         env.config["modules"]["idor"]["max_collections"] = 5
         assert await env.run_module() in ("done", "skipped")
         assert env.findings() == [], "a 404 is not an endpoint"
+
+
+# ── Object shapes with no listing endpoint ───────────────────────
+
+
+class TestOwnershipWithoutCollection:
+    """Ownership for an object nobody ever listed, such as a basket.
+
+    A collection response is where ownership normally comes from: alice's
+    view of `/api/invoices` shows 100, bob's shows 200, and the difference is
+    the proof. A basket has no listing endpoint, both accounts read it
+    identically, and the flat map then hands every reference to both accounts
+    at once — 1191 references were attributed that way on the live target
+    without one of them ever being tested. These cases cover the fix: the
+    payload's own owner field is what has to say whose record it is.
+    """
+
+    @staticmethod
+    def _point_at_baskets(env):
+        env.config["modules"]["idor"]["endpoints"] = [
+            f"{env.base}/api/invoices/100",
+            f"{env.base}/api/baskets/100",
+        ]
+        for name, email in (("alice", "alice@example.com"),
+                            ("bob", "bob@example.com")):
+            env.config["auth"]["identities"][name]["email"] = email
+
+    @staticmethod
+    def _evidence(env):
+        """Every idor evidence record, payload included."""
+        records = []
+        for item in env.evidence():
+            if not item["type"].startswith("idor_"):
+                continue
+            path = Path(env.state.output_dir) / item["path"]
+            records.append(json.loads(path.read_text())["data"])
+        return records
+
+    @staticmethod
+    def _for_endpoint(env, needle):
+        return [e for e in TestOwnershipWithoutCollection._evidence(env)
+                if needle in e.get("url", "")]
+
+    @served
+    async def test_unlisted_object_is_attributed_and_reported(self, env):
+        """The endpoint that had no collection behind it must still land."""
+        self._point_at_baskets(env)
+        assert await env.run_module() == "done"
+
+        basket = self._for_endpoint(env, "/api/baskets/")
+        assert basket, f"no evidence for the unlisted object: " \
+                       f"{[f['title'] for f in env.findings()]}"
+        assert len(basket) == 2, f"expected one per direction: {basket}"
+        # Invoices produce a pair as well, so four findings total: the pair
+        # that had a collection behind it and the pair that had none.
+        assert len(env.findings()) == 4, [f["title"] for f in env.findings()]
+
+        for record in basket:
+            assert record["victim_markers_leaked"], record
+            assert record["victim"] in json.dumps(record["victim_markers_leaked"])
+
+    @served_hardened
+    async def test_authorised_unlisted_object_stays_silent(self, env):
+        """Knowing who owns the record is not the same as a leak."""
+        self._point_at_baskets(env)
+        assert await env.run_module() == "done"
+        assert self._for_endpoint(env, "/api/baskets/") == [], \
+            "authorised reads were reported as IDOR"
+
+    @served
+    async def test_a_reference_seen_by_both_accounts_is_not_common_property(self,
+                                                                          env):
+        """One shared collection must not put a record in both pockets.
+
+        Scoped per endpoint, `/api/invoices/100` belongs to alice alone even
+        though the same value shows up in another account's view elsewhere.
+        """
+        self._point_at_baskets(env)
+        assert await env.run_module() == "done"
+
+        basket = self._for_endpoint(env, "/api/baskets/")
+        assert basket, "the unlisted endpoint produced no evidence"
+        pairs = {(e["attacker"], e["victim"]) for e in basket}
+        # Each direction names the account whose marker came back, so a
+        # shared flat map could never have produced this: it would have
+        # called the record common property and probed nothing.
+        assert pairs == {("alice", "bob"), ("bob", "alice")}, pairs
+        for record in basket:
+            assert record["victim"] in json.dumps(record["victim_markers_leaked"])
+
+
+def test_ownership_is_scoped_to_the_endpoint_that_disclosed_it():
+    """A shared collection must not make every reference common property."""
+    module = IdorDiffer(StateManager(tempfile.mkdtemp()),
+                        {"target": {}, "auth": {}, "modules": {}})
+    module._owned_by_coll_identity = {
+        "https://x.test/api/products": {"alice": {"100"}, "bob": {"100"}},
+        "https://x.test/rest/basket": {"alice": {"6"}},
+    }
+    ownership = module._build_ownership([
+        ObjectTemplate(url="https://x.test/api/products/100"),
+        ObjectTemplate(url="https://x.test/rest/basket/6"),
+    ])
+
+    products = ownership["https://x.test/api/products/{id}"]
+    assert products["alice"] == products["bob"] == {"100"}
+    # Same reference value, different endpoint: only one account holds it.
+    basket = ownership["https://x.test/rest/basket/{id}"]
+    assert basket == {"alice": {"6"}}
+
+
+def test_only_object_shapes_are_probed_for_ownership():
+    """A command path such as /things/{id}/checkout has no id space to walk."""
+    module = IdorDiffer(StateManager(tempfile.mkdtemp()),
+                        {"target": {}, "auth": {}, "modules": {}})
+    assert module._is_pure_object(ObjectTemplate(url="https://x.test/a/{id}"))
+    assert not module._is_pure_object(
+        ObjectTemplate(url="https://x.test/a/{id}/checkout"))
 
 
 # ── CSRF-aware and Basic-auth identities ─────────────────────────

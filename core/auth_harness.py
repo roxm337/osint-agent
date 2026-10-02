@@ -17,6 +17,7 @@ for horizontal privilege testing, and you supply them.
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 from dataclasses import dataclass, field
@@ -62,6 +63,33 @@ class Identity:
     success_marker: str = ""
     verified: bool = False
     verification_note: str = ""
+    # Who this account is, so a response can be attributed to it. Usually
+    # read from the bearer token's own claims; overridden by config.
+    email: str = ""
+    owner_id: str = ""
+    owner_markers: tuple = ()
+    role: str = ""
+
+    _PRIVILEGED_ROLES = frozenset({
+        "admin", "administrator", "root", "superadmin", "superuser",
+        "owner", "manager", "staff", "moderator", "internal",
+    })
+
+    @property
+    def privileged(self) -> bool:
+        """Whether this account sits above an ordinary peer.
+
+        Used only to choose which direction of a leak gets reported first.
+        An administrator reading a customer's record may be entitled to it,
+        so naming that pair as the finding would understate the bug, while a
+        customer reading another customer's record is the case nobody can
+        argue with. The role comes from config or from the account's own
+        token claims; an unknown role counts as ordinary.
+        """
+        role = str(self.role or "").strip()
+        if not role:
+            role = str(self._token_claims().get("role") or "").strip()
+        return role.lower() in self._PRIVILEGED_ROLES
 
     def describe(self) -> str:
         bits = []
@@ -119,6 +147,76 @@ class Identity:
         """
         return bool(self.cookies or self.bearer_token or self.basic_auth
                     or self.headers.get("Authorization"))
+
+    # Claims that name a specific account rather than a role or a scope.
+    # `role: admin` and `iss:` are deliberately absent: they are shared by
+    # every admin and would attribute one account's record to another.
+    _TOKEN_OWNER_CLAIMS = frozenset({
+        "id", "sub", "email", "username", "user_id", "userid",
+        "preferred_username", "name",
+    })
+
+    def own_markers(self) -> set[str]:
+        """Values that mark a response as belonging to *this* account.
+
+        Attribution needs the other side: without your own id you cannot say
+        whether `UserId: 27` in a basket you just read is yours or somebody
+        else's, and every leak collapses to "unattributed" no matter how
+        complete the payload is.
+
+        Sourced from the account's own bearer token, whose claims it is
+        entitled to read, so no extra endpoint or configuration is needed.
+        Only account-naming claims are taken — `role` and `iss` identify a
+        class, not a person.
+        """
+        markers: set[str] = set()
+
+        for configured in (self.email, self.owner_id, *self.owner_markers):
+            value = str(configured).strip().lower()
+            if value:
+                markers.add(value)
+
+        claims = self._token_claims()
+        for key, value in claims.items():
+            flat = str(key).lower().replace("-", "_").replace("_", "")
+            if flat in {c.replace("_", "") for c in self._TOKEN_OWNER_CLAIMS}:
+                raw = str(value).strip().lower()
+                if raw:
+                    markers.add(raw)
+        return markers
+
+    def _token_claims(self) -> dict[str, Any]:
+        """Flattened claims of a JWT, without verifying it.
+
+        No signature check: the token belongs to this identity and we are
+        only asking it who it says it is.
+        """
+        token = str(self.bearer_token or "")
+        if token.count(".") != 2:
+            return {}
+        try:
+            segment = token.split(".")[1]
+            segment += "=" * (-len(segment) % 4)
+            decoded = json.loads(base64.urlsafe_b64decode(segment.encode()))
+        except Exception:
+            return {}
+
+        flat: dict[str, Any] = {}
+
+        def walk(node: Any) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if isinstance(value, (dict, list)):
+                        walk(value)
+                    elif not isinstance(value, bool):
+                        flat[str(key)] = value
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        if isinstance(decoded, dict):
+            walk(decoded)
+        return flat
 
     async def _perform_login(self, base_url: str) -> bool:
         """Submit the configured login and adopt any session cookie set."""
@@ -364,6 +462,12 @@ class AuthHarness:
                 basic_auth=_basic_pair(entry.get("basic_auth") or entry.get("basic")),
                 login=entry.get("login") or {},
                 verify_url=str(entry.get("verify_url") or ""),
+                email=str(entry.get("email") or ""),
+                owner_id=str(entry.get("owner_id") or ""),
+                owner_markers=tuple(
+                    str(v) for v in (entry.get("owner_markers") or [])
+                ),
+                role=str(entry.get("role") or ""),
                 # Earlier documentation put this inside `login`, so both are
                 # honoured. A top-level value wins.
                 success_marker=str(

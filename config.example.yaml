@@ -142,6 +142,23 @@ modules:
     # Ceiling on cross-account probes per endpoint template.
     max_probes_per_template: 15
 
+    # Ownership for object shapes that have no listing endpoint — a basket,
+    # a cart, an order fetched by id. Ownership normally comes from comparing
+    # two accounts' views of a collection, so an endpoint nobody lists never
+    # enters the map: both accounts appear to hold every reference, the
+    # difference that proves privacy is empty, and the module reports zero
+    # probes against an endpoint anyone can read. When enabled, references
+    # the target has already disclosed are fetched once against those shapes
+    # and kept only when the response's own owner field names one of your
+    # accounts, so a record belonging to nobody you hold credentials for is
+    # read and discarded rather than claimed.
+    object_probe:
+      enabled: true
+      max_refs: 12             # references tried per endpoint
+      max_fetches: 24          # per endpoint, every identity included
+      max_total_fetches: 240   # across the whole run
+      stop_after_misses: 6     # consecutive ids nobody has, then move on
+
     # Ceiling on collection endpoints fetched while mapping who owns what.
     max_collections: 60
 

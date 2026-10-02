@@ -27,6 +27,13 @@ _HTTP_SESSION_HEADERS: dict[str, str] = {}
 # session in `auth.cookies` can never authenticate every other request.
 _AUTH_HEADERS = frozenset({"authorization", "cookie", "cookie_header", "x-api-key"})
 
+
+def _drop_auth_headers(headers: dict) -> dict:
+    """Remove every credential header, in place. Used for anonymous probes."""
+    for name in [h for h in headers if h.lower() in _AUTH_HEADERS]:
+        headers.pop(name, None)
+    return headers
+
 def _get_cookie_jar() -> str:
     global _COOKIE_JAR
     if _COOKIE_JAR is None or not os.path.exists(_COOKIE_JAR):
@@ -79,18 +86,25 @@ def _merge_session_headers(headers: Optional[dict] = None,
                            drop_auth: bool = False) -> dict:
     """Combine the globally configured headers with the caller's.
 
-    `drop_auth` removes the credentials. The global `Cookie` and
+    `drop_auth` removes the *global* credentials. The global `Cookie` and
     `Authorization` headers come from a single legacy session, and applying
     them to a request made under a different identity would defeat the whole
     point of isolated jars — and applying them to an anonymous probe would
     turn "this record is public" into a false claim.
+
+    The caller's own headers survive. A cookie identity keeps its session in
+    a per-identity jar the engine attaches itself, but a bearer identity has
+    no jar to lean on: its `Authorization` header *is* the credential.
+    Stripping it along with the legacy one sent every bearer request out
+    unauthenticated, so every object came back 401, no ownership could be
+    attributed, and the module reported zero probes against a target whose
+    baskets were readable by anyone.
     """
     merged = dict(_HTTP_SESSION_HEADERS)
+    if drop_auth:
+        _drop_auth_headers(merged)
     if headers:
         merged.update({str(k): v for k, v in headers.items() if v is not None})
-    if drop_auth:
-        for name in [h for h in merged if h.lower() in _AUTH_HEADERS]:
-            merged.pop(name, None)
     return merged
 
 
@@ -294,6 +308,11 @@ async def curl(url: str, method: str = "GET",
     own. Non-authentication headers such as User-Agent still apply.
     """
     merged_headers = _merge_session_headers(headers, drop_auth=no_session or bool(identity))
+    if no_session:
+        # Anonymous means anonymous, including a credential the caller passed
+        # in explicitly: the caller's headers now survive `drop_auth`, so
+        # without this an "is it public?" probe would authenticate itself.
+        _drop_auth_headers(merged_headers)
 
     # HTTP/1.0 has no aiohttp equivalent, and a missing aiohttp disables the
     # engine entirely — both fall back to the original subprocess.

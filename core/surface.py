@@ -232,9 +232,6 @@ def derive_from_service_bases(source: str) -> tuple[set[str], set[str]]:
         by_ident.setdefault(ident, []).append((pos, path))
 
     derived: set[str] = set()
-    if not bases:
-        return derived, set()
-
     def base_for(pos: int, ident: str) -> str | None:
         candidates = by_ident.get(ident, [])
         chosen = None
@@ -248,13 +245,26 @@ def derive_from_service_bases(source: str) -> tuple[set[str], set[str]]:
     # Every occurrence of `${this.<ident>}` spliced with at least one further
     # segment is an object reference against that service's collection.
     for match in TEMPLATE_OVER_BASE.finditer(source):
+        suffix = _tail_to_path(match.group("tail"))
+        if suffix is None or suffix == "/" or "{id}" not in suffix:
+            # Either `${this.host}` on its own, which is just the collection,
+            # or a path with no interpolation at all — `${this.hostServer}/
+            # rest/languages` repeats the base and addresses no record. Only
+            # something that varies per record is an object reference.
+            continue
+
         base = base_for(match.start(), match.group("ident"))
         if base is None:
-            continue
-        suffix = _tail_to_path(match.group("tail"))
-        if suffix is None or suffix == "/":
-            # `${this.host}` alone is just the collection, not a reference.
-            continue
+            # `${this.hostServer}/rest/basket/${e}` — the identifier holds a
+            # host read from configuration, so no literal base exists for it.
+            # The path written after it is origin-relative all the same, and
+            # it is written in full: `/rest/basket/{id}` is the endpoint that
+            # exposes another account's basket, and with no origin fallback it
+            # was dropped entirely because the host came from a config value.
+            if suffix.startswith(("/rest/", "/api/", "/graphql")):
+                base = ""
+            else:
+                continue
         derived.add(base + suffix)
 
     # `{params:e}` next to a base path: parameterised, names not recoverable.

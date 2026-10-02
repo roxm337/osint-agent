@@ -85,6 +85,9 @@ _OWNER_KEY_HINTS = (
     "customer_email", "billing_email", "contact_email",
 )
 
+# The same vocabulary with separators removed, for `UserId`-style keys.
+_OWNER_HINTS_FLAT = {h.replace("_", "") for h in _OWNER_KEY_HINTS}
+
 DEFAULT_PATHS = [
     "/api/v1/users/me", "/api/v1/orders", "/api/v1/invoices",
     "/api/v1/projects", "/api/v1/tickets", "/api/v1/documents",
@@ -357,19 +360,60 @@ def _identity_markers(body: str) -> set:
     string or a currency code would match every response and turn the
     attribution gate into noise.
     """
-    markers: set = set()
-
+    # Emails found by pattern rather than by key: an address in a payload is
+    # specific regardless of which field printed it, so it joins the loose set
+    # and is graded like any other guessed value.
+    loose: set = set()
     for email in set(re.findall(r"[\w.+-]+@[\w-]+\.[\w.]{2,}", body or "")):
-        markers.add(email.lower())
+        loose.add(email.lower())
 
+    # Two grades. A value under an explicit ownership field (`UserId`,
+    # `owner_id`) is specific because of the key, so its length says nothing
+    # about how much it identifies — the `len > 3` rule that keeps short
+    # noise out was discarding `UserId: 26` and `UserId: 27`, and with them
+    # any chance of saying whose basket was read. A value we only guessed at
+    # from a substring match still has to earn it by being distinctive.
+    strict: set = set()
     payload = _maybe_json(body)
     for key, value in _walk_identifiers(payload):
-        markers.add(str(value).strip().lower())
+        raw = str(value).strip().lower()
+        if not raw:
+            continue
+        flat = str(key).lower().replace("-", "_").replace("_", "")
+        if flat in _OWNER_HINTS_FLAT:
+            strict.add(raw)
+        else:
+            loose.add(raw)
 
     # Drop values too generic to be evidence of ownership.
     generic = {"", "null", "none", "true", "false", "0", "1", "admin", "user",
                "active", "pending", "usd", "eur", "gbp", "test", "demo"}
-    return {m for m in markers if m and len(m) > 3 and m not in generic}
+    result = {m for m in loose if len(m) > 3 and m not in generic}
+    # Under an explicit ownership key an id is an id: `UserId: 1` is admin's
+    # record and the generic-word filter would have hidden it, while
+    # `username: "user"` still has to be distinctive to mean anything.
+    for m in strict:
+        if m.isdigit():
+            result.add(m)
+        elif m not in generic and len(m) > 3:
+            result.add(m)
+    return result
+
+
+def _looks_like_owner_key(low: str) -> bool:
+    """Does this response key plausibly name whose record this is?
+
+    Underscores are dropped on both sides before matching. The hints list
+    spells it `user_id`; an ORM writes `UserId`, which lowercases to `userid`
+    and matched neither the list nor any of the substring rules. The result
+    was that every basket payload came back with **zero** ownership markers,
+    so attribution could never succeed — a leak read in full and recorded as
+    "unattributed" forever. The hints are a fixed, small vocabulary, so
+    flattening is safe and cheaper than spelling every casing variant.
+    """
+    if low.replace("_", "") in _OWNER_HINTS_FLAT:
+        return True
+    return any(hint in low for hint in ("email", "name", "owner", "account"))
 
 
 def _walk_identifiers(node: Any, key_hint: str = ""):
@@ -377,11 +421,7 @@ def _walk_identifiers(node: Any, key_hint: str = ""):
     if isinstance(node, dict):
         for key, value in node.items():
             low = str(key).lower().replace("-", "_")
-            interesting = (
-                low in _OWNER_KEY_HINTS
-                or any(hint in low for hint in ("email", "name", "owner", "account"))
-            )
-            if interesting and isinstance(value, (str, int, float)):
+            if _looks_like_owner_key(low) and isinstance(value, (str, int, float)):
                 if str(value).strip():
                     yield key, value
             yield from _walk_identifiers(value, low)
@@ -497,6 +537,20 @@ class IdorDiffer(BaseModule):
 
         # Kept for _self_markers(), which needs a page describing the caller.
         self._templates = list(templates)
+
+        # Ownership, scoped per endpoint, then filled in for shapes that have
+        # no listing endpoint. Without this step both accounts own the same
+        # shared-collection ids, the difference is empty, and the module
+        # reports "0 finding(s) from 0 probe(s)" on a target whose baskets
+        # are readable by anyone.
+        ownership = self._build_ownership(templates)
+        ownership = await self._attribute_objects(
+            harness, templates, ownership, owned)
+        self._owned_by_tpl = ownership
+        scoped = sum(len(v) for by_id in ownership.values() for v in by_id.values())
+        if scoped:
+            self.log(f"  ownership scoped to {len(ownership)} object endpoint(s), "
+                     f"{scoped} reference(s)")
 
         results: list[CrossResult] = []
         for template in templates:
@@ -631,8 +685,16 @@ class IdorDiffer(BaseModule):
         A reference is only useful as a cross-account target if it is known to
         belong to someone. Enumerating each account's own view is what
         produces that mapping, and it is why the harness needs two sessions.
+
+        Both views are kept. The flat map answers "whose is this id"; the
+        per-collection map answers "whose is this id *on this endpoint*", and
+        only the second is safe to reason with. One shared collection hands
+        both accounts the same thousand ids, which is why every cross-account
+        difference came out empty and every reference looked owned by
+        everybody at once.
         """
         self._owned_by_collection: dict[str, set] = {}
+        self._owned_by_coll_identity: dict[str, dict[str, set]] = {}
         owned: dict = {i.name: set() for i in harness.usable}
 
         # One account's view is enough to start; the second confirms the
@@ -652,6 +714,8 @@ class IdorDiffer(BaseModule):
             if refs:
                 owned[primary.name].update(refs)
                 self._owned_by_collection[url] = refs
+                self._owned_by_coll_identity.setdefault(url, {})[
+                    primary.name] = set(refs)
                 self.state.add_asset("idor_collection", f"idor_coll:{url}", url,
                                      confidence="TENTATIVE",
                                      sources=[self.id])
@@ -667,9 +731,188 @@ class IdorDiffer(BaseModule):
                 body = result.get("body", "") or ""
                 if fingerprint_body(body)["has_login_form"]:
                     continue
-                owned[identity.name].update(_extract_object_ids(body))
+                refs = _extract_object_ids(body)
+                if refs:
+                    owned[identity.name].update(refs)
+                    self._owned_by_coll_identity.setdefault(url, {})[
+                        identity.name] = set(refs)
 
         return owned
+
+    # ── Phase 2b: ownership, scoped to an endpoint ─────────────────────
+
+    def _build_ownership(self, templates: list) -> dict:
+        """Which account owns which reference *on which endpoint*.
+
+        The scope is the whole point. One shared collection hands both
+        accounts the same thousand ids, so the flat map differs by nothing,
+        every cross-account comparison comes out empty, and 1191 references
+        were attributed to known accounts that way without a single one ever
+        being tested. Scoped to the endpoint they were observed on, the same
+        ids say "both accounts see this product" while `/rest/basket/6` says
+        "only alice".
+        """
+        coll_to_keys: dict[str, set] = {}
+        for template in templates:
+            for coll_url in _collection_candidates(template.url):
+                coll_to_keys.setdefault(coll_url.rstrip("/"), set()).add(
+                    template.key)
+
+        ownership: dict[str, dict[str, set]] = {}
+        for coll_url, by_identity in self._owned_by_coll_identity.items():
+            keys = coll_to_keys.get(coll_url.rstrip("/"), set())
+            if not keys:
+                continue
+            for name, refs in by_identity.items():
+                for key in keys:
+                    ownership.setdefault(key, {}).setdefault(
+                        name, set()).update(refs)
+        return ownership
+
+    def _is_pure_object(self, template) -> bool:
+        """`/things/{id}` and nothing after it.
+
+        A nested shape such as `/rest/basket/{id}/checkout` addresses a
+        command rather than a record, so sequential ids mean nothing there
+        and probing it only spends the budget.
+        """
+        shape = template.url_template or template.url or ""
+        return shape.endswith("{id}")
+
+    def _ref_pool(self, owned: dict) -> list[str]:
+        """Reference values the target has already disclosed, numeric first.
+
+        Ids that appeared in a collection body are ids the application told
+        us about, so walking them is bounded and starts from something real
+        rather than guessing at an id space.
+        """
+        pool = {str(ref) for refs in owned.values() for ref in refs}
+        numeric = [r for r in pool if r.isdigit()]
+        numeric.sort(key=_numeric_or_zero)
+        limit = int(self._object_probe().get("max_refs", 12))
+        return numeric[: max(0, limit)]
+
+    def _object_probe(self) -> dict:
+        block = self._cfg().get("object_probe")
+        return block if isinstance(block, dict) else {}
+
+    async def _attribute_objects(self, harness: AuthHarness, templates: list,
+                                 ownership: dict, owned: dict) -> dict:
+        """Ownership for object shapes no collection ever lists.
+
+        `/rest/basket/{id}` is the case this exists for. A basket has no
+        listing endpoint — the application fetches one per session — so
+        nothing in any collection body ever names it, both accounts' views
+        come back identical, and the difference that proves privacy is empty
+        on exactly the endpoint where privacy is the question.
+
+        Each id is fetched as one account and kept only when the response's
+        own ownership marker matches that account, so a record belonging to
+        nobody we hold credentials for is read and discarded rather than
+        claimed. Bounded by both the id pool and a fetch budget.
+        """
+        probe = self._object_probe()
+        if probe.get("enabled") is False:
+            return ownership
+
+        identities = harness.usable
+        if len(identities) < 2:
+            return ownership
+
+        pool = self._ref_pool(owned)
+        if not pool:
+            return ownership
+
+        budget = max(0, int(probe.get("max_fetches", 24)))
+        total_budget = max(0, int(probe.get("max_total_fetches", 240)))
+        miss_limit = max(1, int(probe.get("stop_after_misses", 6)))
+        total_tried = 0
+        attributed_any = 0
+
+        for template in templates:
+            if not self._is_pure_object(template):
+                continue
+            key = template.key
+            current = ownership.get(key, {})
+            if current and all(current.get(i.name) for i in identities):
+                # Already answered from collections; the shared case is most
+                # of the work and needs no extra requests.
+                continue
+
+            # Budgeted per template as well as overall, because the shapes
+            # with no listing endpoint are usually a small id space sitting
+            # behind a much larger one: without an allowance of its own the
+            # first hopeless endpoint consumes the whole run and the one
+            # that matters is never reached.
+            tried = 0
+            mine = 0
+            misses = 0
+            for ref in pool:
+                if tried >= budget or total_tried >= total_budget:
+                    break
+                url = template.url_for(ref)
+                if not url:
+                    continue
+
+                # Try accounts until one actually gets the object back. A
+                # caller-scoped endpoint answers 404 to everyone but the
+                # owner, so the denial itself is what walks us to the right
+                # account; once a body arrives, its ownership markers name
+                # the owner and no further account needs to ask.
+                answered = False
+                for identity in identities:
+                    if tried >= budget or total_tried >= total_budget:
+                        break
+                    result = await self._fetch(harness, identity, url)
+                    tried += 1
+                    total_tried += 1
+                    status = result.get("status", 0)
+                    body = result.get("body", "") or ""
+                    if status in DENIED_STATUSES or status in ABSENT_STATUSES or status == 0:
+                        continue
+                    if fingerprint_body(body)["has_login_form"]:
+                        continue
+
+                    answered = True
+                    markers = _identity_markers(body)
+                    owner = next(
+                        (i.name for i in identities
+                         if markers & i.own_markers()), None)
+                    if owner:
+                        ownership.setdefault(key, {}).setdefault(
+                            owner, set()).add(ref)
+                        attributed_any += 1
+                        mine += 1
+                    # A 200 whose payload names no known owner is an object
+                    # belonging to an account we hold no credentials for, or
+                    # one that carries no owner field at all. Either way a
+                    # second account will read the same thing and decide
+                    # nothing new, so stop rather than spend the budget.
+                    break
+
+                if answered:
+                    misses = 0
+                else:
+                    # Every account was told the object is not there. A run
+                    # of those means the id space starts elsewhere or this is
+                    # not an object route at all, and six is enough to move
+                    # on — without it the empty shapes ahead of the real one
+                    # walk the whole pool and exhaust the budget first.
+                    misses += 1
+                    if misses >= miss_limit:
+                        break
+
+            if tried:
+                note = "" if misses < miss_limit else " — id space not found"
+                self.log(f"    {key}: {mine} attributed / {tried} fetch(es){note}")
+
+            if total_tried >= total_budget:
+                break
+
+        if total_tried:
+            self.log(f"  object ownership: {attributed_any} reference(s) "
+                     f"attributed from {total_tried} fetch(es)")
+        return ownership
 
     # ── Phase 3: cross-account testing ───────────────────────────
 
@@ -678,17 +921,54 @@ class IdorDiffer(BaseModule):
         """Cross-account reads, plus bounded probing of unknown references."""
         results: list[CrossResult] = []
 
-        for attacker in harness.usable:
-            attacker_own = owned.get(attacker.name, set())
-            for victim in harness.usable:
-                if victim.name == attacker.name:
+        # Ownership is scoped to this endpoint when it is known for it, and
+        # falls back to the flat map otherwise (wordlist shapes with no
+        # collection behind them). Only the scoped map can say that one
+        # account owns a record here while another does not.
+        ownership = getattr(self, "_owned_by_tpl", None) or {}
+        scoped = ownership.get(template.key)
+
+        def own_for(name: str) -> set:
+            if scoped is not None:
+                return scoped.get(name, set())
+            return owned.get(name, set())
+
+        by_name = {i.name: i for i in harness.usable}
+        # Two things decide who gets to be the attacker in the report: an
+        # account with no record of its own on this endpoint has nothing to
+        # contrast and goes last, and an ordinary account goes before a
+        # privileged one. An administrator reading a customer's basket may be
+        # exactly what the product intends, so reporting that pair as *the*
+        # finding would hand a triager the reason to close it; two peers
+        # reading each other's records leaves no such argument.
+        names = sorted(
+            [i.name for i in harness.usable],
+            key=lambda n: (
+                0 if scoped is None or scoped.get(n) else 1,
+                1 if by_name[n].privileged else 0,
+            ),
+        )
+
+        for attacker_name in names:
+            attacker_own = own_for(attacker_name)
+            for victim_name in names:
+                if victim_name == attacker_name:
                     continue
-                victim_own = owned.get(victim.name, set())
+                victim_own = own_for(victim_name)
                 # Only test references that are demonstrably the victim's.
-                candidates = sorted(victim_own - attacker_own)
+                candidates = sorted(victim_own - attacker_own,
+                                    key=_numeric_or_zero)
                 for ref in candidates[: self._cap()]:
                     target = template.url_for(ref)
                     if not target:
+                        continue
+                    attacker = next(
+                        (i for i in harness.usable
+                         if i.name == attacker_name), None)
+                    victim = next(
+                        (i for i in harness.usable if i.name == victim_name),
+                        None)
+                    if attacker is None or victim is None:
                         continue
                     results.append(await self._cross_fetch(
                         harness, attacker, victim, target, ref,
