@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -11,10 +12,12 @@ os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import yaml
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QItemSelectionModel, QProcess, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox, QTableWidgetItem
 
 from gui.app import MainWindow, build_scan_args
+from modules import get_all_module_ids
 from state.manager import StateManager
 
 
@@ -533,6 +536,338 @@ def test_actions_and_tools_tabs_populated():
         for row in range(window.tools_table.rowCount())
     }
     assert {"nuclei", "httpx"} <= tools
+
+    window.close()
+    app.processEvents()
+
+
+def test_process_error_restores_buttons_and_pill(monkeypatch):
+    """A FailedToStart must re-enable Run and show a red pill, not hang."""
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.target_input.setText("")
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox, "warning", lambda *args, **kwargs: warnings.append(args)
+    )
+
+    # Simulate a run in progress: disabled buttons, ticking timers, busy pill.
+    window.run_button.setEnabled(False)
+    window.stop_button.setEnabled(True)
+    window._elapsed_timer.start()
+    window._poll_timer.start()
+    window._set_status("busy", "Running")
+
+    window._process_error(QProcess.FailedToStart)
+
+    assert window.run_button.isEnabled()
+    assert not window.stop_button.isEnabled()
+    assert not window._elapsed_timer.isActive()
+    assert not window._poll_timer.isActive()
+    assert window.status_label.property("state") == "error"
+    assert window.status_label.text() == "Failed to start"
+    assert warnings, "a failed start must warn the operator"
+
+    window.close()
+    app.processEvents()
+
+
+def test_process_finished_exit_codes_drive_pill():
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.target_input.setText("")
+    window.report_after_process = False
+
+    # Exit 1: error pill + buttons restored.
+    window.run_button.setEnabled(False)
+    window.running_report = False
+    window._process_finished(1, None)
+    assert window.status_label.property("state") == "error"
+    assert window.status_label.text() == "Failed (exit 1)"
+    assert window.run_button.isEnabled()
+
+    # Exit 0 (report already produced / not requested): ok pill.
+    window.running_report = True  # skip the auto-report spawn
+    window.run_button.setEnabled(False)
+    window._process_finished(0, None)
+    assert window.status_label.property("state") == "ok"
+    assert window.status_label.text() == "Completed"
+    assert window.run_button.isEnabled()
+    assert not window.stop_button.isEnabled()
+
+    window.close()
+    app.processEvents()
+
+
+def test_poll_run_state_updates_progress_and_pill(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.output_dir = tmp_path / "reports"
+    window.target_input.setText("example.com")
+    state_dir = tmp_path / "reports" / "example.com" / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "module.json").write_text(
+        json.dumps(
+            {
+                "completed": ["seed_discovery", "fast_scan", "openredirex"],
+                "runs": [
+                    {"module_id": "seed_discovery", "status": "completed"},
+                    {"module_id": "fast_scan", "status": "completed"},
+                    {"module_id": "openredirex", "status": "completed"},
+                ],
+                "stats": {"total_requests": 7},
+            }
+        )
+    )
+    window._run_started_at = time.monotonic()
+
+    window._poll_run_state()
+
+    total = len(get_all_module_ids())
+    assert window.progress_bar.value() == min(100, int(3 / total * 100))
+    assert window.progress_bar.format() == f"3/{total} modules complete"
+    assert window.completed_value.text() == "3"
+    assert window.incomplete_value.text() == "0"
+    assert window.requests_value.text() == "7"
+    assert window.status_label.text().startswith(f"Running · 3/{total} · ")
+
+    window.close()
+    app.processEvents()
+
+
+def test_verdict_preserves_selection(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.output_dir = tmp_path / "reports"
+    window.target_input.setText("example.com")
+    window._load_findings(_sample_findings())
+
+    window.findings_table.selectRow(0)
+    assert [f["id"] for f in window._selected_findings()] == ["F-1"]
+
+    window._apply_verdict_action("true_positive")
+
+    selected_rows = {index.row() for index in window.findings_table.selectedIndexes()}
+    assert len(selected_rows) == 1
+    row = selected_rows.pop()
+    assert window.findings_table.item(row, 0).text() == "F-1"
+    assert window.verdict_chip.property("verdict") == "true_positive"
+
+    window.close()
+    app.processEvents()
+
+
+def test_multi_select_verdict_round_trip(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.output_dir = tmp_path / "reports"
+    window.target_input.setText("example.com")
+    findings = _sample_findings()
+    window._load_findings(findings)
+
+    model = window.findings_table.model()
+    selection = window.findings_table.selectionModel()
+    selection.clearSelection()
+    # Score-descending order: row 0 = F-1 (90), row 1 = F-3 (55).
+    for row in (0, 1):
+        selection.select(
+            model.index(row, 0),
+            QItemSelectionModel.Select | QItemSelectionModel.Rows,
+        )
+    assert len(window._selected_findings()) == 2
+
+    window._apply_verdict_action("true_positive")
+
+    triage_path = tmp_path / "reports" / "example.com" / "example.com_triage.json"
+    data = json.loads(triage_path.read_text())
+    assert data["F-1"]["verdict"] == "true_positive"
+    assert data["F-3"]["verdict"] == "true_positive"
+    assert "F-2" not in data
+    # Refiltered but the two selected rows stay selected.
+    assert len(window.findings_table.selectedIndexes()) > 0
+    assert len(window._selected_findings()) == 2
+
+    window.close()
+    app.processEvents()
+
+
+def test_detail_action_buttons_set_verdict(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.output_dir = tmp_path / "reports"
+    window.target_input.setText("example.com")
+    window._load_findings(_sample_findings())
+
+    window.findings_table.selectRow(0)
+    window.tp_button.click()
+    # Score-descending order: row 1 is F-3, not F-2.
+    window.findings_table.selectRow(1)
+    window.fp_button.click()
+
+    triage_path = tmp_path / "reports" / "example.com" / "example.com_triage.json"
+    data = json.loads(triage_path.read_text())
+    assert data["F-1"]["verdict"] == "true_positive"
+    assert data["F-3"]["verdict"] == "false_positive"
+
+    window.close()
+    app.processEvents()
+
+
+def test_data_tab_filters(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.output_dir = tmp_path / "reports"
+    window.target_input.setText("example.com")
+
+    # Assets: free-text search across every column with live counts.
+    window._load_assets(
+        [
+            {"type": "domain", "value": "a.example.com", "confidence": "high", "sources": ["seed"]},
+            {"type": "domain", "value": "b.example.org", "confidence": "low", "sources": ["seed"]},
+            {"type": "ip", "value": "203.0.113.9", "confidence": "high", "sources": ["probe"]},
+        ]
+    )
+    search, count_label, status_combo = window._table_filters[window.assets_table]
+    assert status_combo is None
+    assert count_label.text() == "3 of 3"
+    search.setText("example.org")
+    visible = [r for r in range(window.assets_table.rowCount())
+               if not window.assets_table.isRowHidden(r)]
+    assert len(visible) == 1
+    assert window.assets_table.item(visible[0], 1).text() == "b.example.org"
+    assert count_label.text() == "1 of 3"
+    search.setText("")
+    assert count_label.text() == "3 of 3"
+
+    # Modules: status combo narrows to one module, search narrows by id.
+    first_id = get_all_module_ids()[0]
+    window._load_modules(
+        {"runs": [{"module_id": first_id, "status": "timeout"}], "completed": []}
+    )
+    msearch, mcount, mcombo = window._table_filters[window.modules_table]
+    total = window.modules_table.rowCount()
+    assert total == len(get_all_module_ids())
+    mcombo.setCurrentText("timeout")
+    visible = [r for r in range(total)
+               if not window.modules_table.isRowHidden(r)]
+    assert len(visible) == 1
+    assert window.modules_table.item(visible[0], 1).text() == first_id
+    assert mcount.text() == f"1 of {total}"
+    mcombo.setCurrentText("All statuses")
+    msearch.setText(first_id)
+    visible = [r for r in range(total)
+               if not window.modules_table.isRowHidden(r)]
+    assert len(visible) == 1
+    assert window.modules_table.item(visible[0], 1).text() == first_id
+
+    window.close()
+    app.processEvents()
+
+
+def test_init_invokes_load_results(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    calls = []
+    monkeypatch.setattr(MainWindow, "load_results", lambda self: calls.append(1))
+
+    window = MainWindow()
+
+    assert len(calls) == 1, "startup must read results once"
+    window.close()
+    app.processEvents()
+
+
+def test_target_debounce_reloads_once_per_burst(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    calls = []
+    monkeypatch.setattr(MainWindow, "load_results", lambda self: calls.append(1))
+
+    window = MainWindow()
+    baseline = len(calls)
+
+    for text in ("e", "ex", "exa", "exam"):
+        window.target_input.setText(text)
+    QTest.qWait(900)
+    assert len(calls) == baseline + 1, "a burst of keystrokes reloads once"
+
+    window.target_input.setText("example.com")
+    window.target_input.setText("example.org")
+    QTest.qWait(900)
+    assert len(calls) == baseline + 2, "each later burst reloads once"
+
+    window.close()
+    app.processEvents()
+
+
+def test_nav_rail_switches_stacked_screens():
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    assert window.screen_stack.count() == len(window.SCREEN_DEFS) == 6
+
+    for index in range(6):
+        window.nav_buttons[index].click()
+        app.processEvents()
+        assert window.screen_stack.currentIndex() == index
+        assert window.nav_buttons[index].isChecked()
+
+    # Out-of-range switches are ignored, not crashes.
+    window.show_screen(99)
+    assert window.screen_stack.currentIndex() == 5
+    window.show_screen(-1)
+    assert window.screen_stack.currentIndex() == 5
+
+    window.close()
+    app.processEvents()
+
+
+def test_theme_qss_contains_new_selectors():
+    qss_path = Path(__file__).resolve().parent.parent / "gui" / "theme.qss"
+    text = qss_path.read_text()
+    for needle in (
+        "QScrollBar:horizontal",
+        "QSpinBox",
+        ":focus",
+        "#btnPrimary",
+        "#btnDanger",
+        "#verdictChip",
+        "#navRail",
+        "QTableView::corner",
+        "QHeaderView::section",
+        "QTabBar::tab:selected",
+    ):
+        assert needle in text, f"missing theme selector: {needle}"
+
+
+def test_run_screen_keeps_engagement_widgets_reachable():
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.show_screen(0)
+    run_screen = window.screen_stack.widget(0)
+
+    def on_run_screen(widget):
+        node = widget
+        while node is not None:
+            if node is run_screen:
+                return True
+            node = node.parentWidget()
+        return False
+
+    for widget in (
+        window.target_input,
+        window.run_button,
+        window.stop_button,
+        window.mode_combo,
+        window.stage_filter_combo,
+        window.module_combo,
+        window.pentest_check,
+        window.execute_check,
+        window.risk_combo,
+        window.max_actions_spin,
+        window.ai_run_button,
+        window.generate_report_button,
+    ):
+        assert on_run_screen(widget), (
+            f"{widget.objectName() or widget} escaped the run screen"
+        )
 
     window.close()
     app.processEvents()

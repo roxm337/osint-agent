@@ -161,20 +161,36 @@ python -m gui.app        # or: osint-agent-gui
 The GUI drives the same `orchestrator.py` engine (via `QProcess`), so GUI and CLI share
 identical state and config contracts.
 
+- **Six-screen console** — icon nav rail: Run (mission setup + live log), Triage
+  (findings workflow), Graph (asset + attack graph), Data (assets/modules/evidence/
+  submissions with search + status filters and counts), Report, Settings.
+  `Ctrl+1..6` (also shown in the rail tooltips) jump between screens.
+- **Live run feedback** — status pill (`Running · N/total · mm:ss` → `Completed` /
+  `Failed (exit N)`), progress bar and completed/skipped/blocked/incomplete/request
+  metrics that poll `state/module.json` while the engine runs; a failed process start
+  restores the Run button, logs the error in red, and warns via dialog instead of
+  leaving a dead disabled UI.
 - **Engagement group** — `--pentest`, `--execute`, risk ceiling, max actions/chains.
   Execution at MEDIUM and above asks for explicit confirmation first; the effective
   flags and config file are echoed in the ops strip.
-- **Findings triage** — filter/search bar, numeric sort on score/severity/priority,
-  detail pane, and per-finding verdicts (`true_positive` / `false_positive` /
-  `out_of_scope` + notes) persisted to `<output>/<target>/<target>_triage.json`,
-  outside the engine's `state/`.
+- **Findings triage** — filter/search bar (`Ctrl+F`), numeric sort on score/severity/
+  priority, multi-select with verdict bar (`t`/`f`/`o` keys + True/False/Out-of-scope
+  buttons, notes, evidence, filter-by-module), selection preserved across refilters,
+  and per-finding verdicts (`true_positive` / `false_positive` / `out_of_scope` +
+  notes) persisted to `<output>/<target>/<target>_triage.json`, outside the engine's
+  `state/`.
 - **Attack graph tab** — renders `attack_graph.json` (nodes, observed vs. proposed
   probe edges) with the probe-plan summary (risk ceiling, surfaces considered,
   reasons probes were not proposed).
 - **Settings** — LLM, Runtime (rate limits, module timeout, budget limits), Scanner
   (auth + test identities), Actions (registered action list with risk), Tools
   (status + install), API keys, raw YAML, plus File → "Use Config File…".
-- **Dark theme** lives in `gui/theme.qss`.
+- **Shortcuts** — `Enter` runs from the target field, `Ctrl+Return` Run /
+  Operation menu (Stop, Report), `F5`/`Ctrl+R` reload results, `Ctrl+O` config
+  file, `Ctrl+Q` quit.
+- **Dark theme** lives in `gui/theme.qss` (Fusion style + dark palette + QSS). Startup
+  reloads the last target's results, debounced so typing does not re-read disk per
+  keystroke.
 
 ---
 
