@@ -167,16 +167,27 @@ def to_gravis_graph(display_graph: dict, show_labels: bool = False,
             target = str(edge.get("target", ""))
             if source not in nodes or target not in nodes:
                 continue
-            inferred = edge.get("attrs", {}).get("inferred", False)
+            attrs = edge.get("attrs", {}) or {}
+            inferred = attrs.get("inferred", False)
+            proposed = attrs.get("proposed", False)
+            if proposed:
+                color, opacity, size = "#fbbf24", 0.95, 1.7
+                hover = f"proposed probe: {attrs.get('action_id') or edge.get('type', '')}"
+            elif inferred:
+                color, opacity, size = "#94a3b8", 0.44, 1.0
+                hover = escape(edge.get("type", "RELATES_TO"))
+            else:
+                color, opacity, size = "#e11d48", 0.76, 1.4
+                hover = escape(edge.get("type", "RELATES_TO"))
             edges.append({
                 "source": source,
                 "target": target,
                 "label": edge.get("type", ""),
                 "metadata": {
-                    "color": "#94a3b8" if inferred else "#e11d48",
-                    "opacity": 0.44 if inferred else 0.76,
-                    "size": 1.0 if inferred else 1.4,
-                    "hover": escape(edge.get("type", "RELATES_TO")),
+                    "color": color,
+                    "opacity": opacity,
+                    "size": size,
+                    "hover": hover,
                 },
             })
 
@@ -186,7 +197,7 @@ def to_gravis_graph(display_graph: dict, show_labels: bool = False,
             "nodes": nodes,
             "edges": edges,
             "metadata": {
-                "background_color": "#f8fafc",
+                "background_color": "#0b111a",
                 "node_label_size": 11,
                 "edge_label_size": 8,
                 "edge_opacity": 0.55,
@@ -198,13 +209,57 @@ def to_gravis_graph(display_graph: dict, show_labels: bool = False,
 def render_gravis_html(display_graph: dict, show_labels: bool = False,
                        show_edges: bool = True, height: int = 720) -> str:
     """Render a Gravis D3 HTML document for embedding in Qt WebEngine."""
+    graph = to_gravis_graph(display_graph, show_labels=show_labels, show_edges=show_edges)
+    return _render_gravis_document(graph, height)
+
+
+def build_attack_display(attack_graph: dict) -> dict:
+    """Map an attack-graph artifact to the display shape the gravis pipeline renders.
+
+    Attack nodes/edges keep their `proposed` marker in `attrs` so the edge
+    styling can tell a hypothesis from an observed relation, which is the
+    whole point of the tab.
+    """
+    nodes = []
+    for node in attack_graph.get("nodes", []):
+        nodes.append({
+            "type": str(node.get("type", "asset")),
+            "key": str(node.get("id", "")),
+            "value": str(node.get("label") or node.get("id") or ""),
+            "confidence": str(node.get("confidence", "")),
+            "attrs": dict(node.get("attrs") or {}),
+            "sources": [],
+        })
+    edges = []
+    for edge in attack_graph.get("edges", []):
+        attrs = dict(edge.get("attrs") or {})
+        for key in ("action_id", "likelihood", "impact"):
+            if edge.get(key) not in (None, ""):
+                attrs.setdefault(key, edge.get(key))
+        edges.append({
+            "source": str(edge.get("source", "")),
+            "target": str(edge.get("target", "")),
+            "type": str(edge.get("type", "")),
+            "attrs": attrs,
+        })
+    return {"nodes": nodes, "edges": edges}
+
+
+def render_attack_html(attack_graph: dict, show_labels: bool = False,
+                       height: int = 720) -> str:
+    """Render `attack_graph.json` (nodes + edges + probe_plan) as dark-theme D3."""
+    display = build_attack_display(attack_graph)
+    graph = to_gravis_graph(display, show_labels=show_labels, show_edges=True)
+    return _render_gravis_document(graph, height)
+
+
+def _render_gravis_document(graph: dict, height: int) -> str:
     import warnings
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="pkg_resources is deprecated.*")
         import gravis as gv
 
-    graph = to_gravis_graph(display_graph, show_labels=show_labels, show_edges=show_edges)
     fig = gv.d3(
         graph,
         graph_height=height,
@@ -231,10 +286,11 @@ def render_gravis_html(display_graph: dict, show_labels: bool = False,
     )
     html = fig.to_html_standalone()
     html = _patch_gravis_isolated_node_hover(html)
-    html = _patch_gravis_light_theme(html)
+    html = _patch_gravis_dark_theme(html)
     return html.replace(
         "</body>",
-        "<style>body{margin:0;background:#eef2f7;color:#0f172a;font-family:Arial,sans-serif;}</style></body>",
+        "<style>body{margin:0;background:#090d13;color:#dce7f3;"
+        "font-family:Arial,sans-serif;}</style></body>",
     )
 
 
@@ -253,65 +309,79 @@ def _patch_gravis_isolated_node_hover(html: str) -> str:
     )
 
 
-def _patch_gravis_light_theme(html: str) -> str:
-    light_theme = """
+def _patch_gravis_dark_theme(html: str) -> str:
+    """Re-skin Gravis' light default to match the console's dark shell."""
+    dark_theme = """
 <style>
 body {
-    background: #eef2f7 !important;
-    color: #0f172a !important;
+    background: #090d13 !important;
+    color: #dce7f3 !important;
 }
 svg {
-    background: #f8fafc !important;
+    background: #0b111a !important;
 }
 svg text {
-    fill: #0f172a !important;
+    fill: #dce7f3 !important;
 }
 button, select, input, summary, details, label, div, span {
-    color: #0f172a;
+    color: #dce7f3;
 }
 button, select, input {
-    background: #ffffff !important;
-    border: 1px solid #cbd5e1 !important;
+    background: #151f2e !important;
+    border: 1px solid #29384d !important;
     border-radius: 8px !important;
 }
 aside, pre {
-    background: #ffffff !important;
-    color: #0f172a !important;
+    background: #101721 !important;
+    color: #dce7f3 !important;
 }
 details {
-    background: #ffffff !important;
-    border: 1px solid #dbe4ee !important;
+    background: #101721 !important;
+    border: 1px solid #223044 !important;
     border-radius: 10px !important;
 }
 </style>
 """
-    return html.replace("</head>", f"{light_theme}</head>")
+    return html.replace("</head>", f"{dark_theme}</head>")
 
 
 def _type_color(asset_type: str) -> str:
     colors = {
-        "domain": "#2563eb",
-        "subdomain": "#0891b2",
-        "subdomain_group": "#0891b2",
-        "ip": "#7c3aed",
-        "webapp": "#16a34a",
-        "webapp_group": "#16a34a",
-        "port": "#dc2626",
-        "bucket": "#d97706",
-        "bucket_group": "#d97706",
-        "email": "#9333ea",
-        "email_domain": "#9333ea",
-        "email_pattern": "#a16207",
-        "dns_record": "#334155",
-        "dns_record_group": "#334155",
-        "waf": "#475569",
-        "social_media": "#1f2937",
-        "social_media_group": "#1f2937",
-        "exploit_intel": "#111827",
-        "cloud_enum": "#64748b",
-        "breach_data": "#64748b",
+        "domain": "#60a5fa",
+        "subdomain": "#22d3ee",
+        "subdomain_group": "#22d3ee",
+        "ip": "#a78bfa",
+        "webapp": "#4ade80",
+        "webapp_group": "#4ade80",
+        "port": "#f87171",
+        "bucket": "#fbbf24",
+        "bucket_group": "#fbbf24",
+        "email": "#c084fc",
+        "email_domain": "#c084fc",
+        "email_pattern": "#fbbf24",
+        "dns_record": "#94a3b8",
+        "dns_record_group": "#94a3b8",
+        "waf": "#94a3b8",
+        "social_media": "#64748b",
+        "social_media_group": "#64748b",
+        "exploit_intel": "#64748b",
+        "cloud_enum": "#94a3b8",
+        "breach_data": "#94a3b8",
+        # Attack-graph classes (goal, vuln, access states, testable surfaces).
+        "goal": "#fde047",
+        "vuln": "#fb7185",
+        "credential": "#c084fc",
+        "access_state": "#f472b6",
+        "url": "#60a5fa",
+        "parameter": "#a78bfa",
+        "endpoint": "#38bdf8",
+        "api_endpoint": "#38bdf8",
+        "web_path": "#22d3ee",
+        "dom_sink": "#fb923c",
+        "idor_collection": "#f43f5e",
+        "js_file": "#94a3b8",
     }
-    return colors.get(asset_type, "#334155")
+    return colors.get(asset_type, "#64748b")
 
 
 def _label(node: dict, enabled: bool) -> str:
@@ -380,43 +450,3 @@ def graph_positions(nodes: list[dict], width: int = 820, height: int = 560) -> d
             positions[node.get("key")] = (x, y)
 
     return positions
-
-
-def radial_positions(nodes: list[dict], edges: list[dict], width: int = 1000,
-                     height: int = 720) -> dict:
-    if not nodes:
-        return {}
-
-    by_key = {node.get("key"): node for node in nodes}
-    degree = defaultdict(int)
-    for edge in edges:
-        degree[edge.get("source")] += 1
-        degree[edge.get("target")] += 1
-
-    center_x = width / 2
-    center_y = height / 2
-    root = max(nodes, key=lambda node: degree[node.get("key")] + (3 if node.get("type") == "domain" else 0))
-    positions = {root.get("key"): (center_x, center_y)}
-
-    remaining = [node for node in nodes if node.get("key") != root.get("key")]
-    grouped = defaultdict(list)
-    for node in remaining:
-        grouped[node.get("type", "unknown")].append(node)
-
-    type_names = sorted(grouped)
-    type_radius = min(width, height) * 0.34
-    for type_index, type_name in enumerate(type_names):
-        angle = (2 * pi * type_index) / max(len(type_names), 1)
-        group = grouped[type_name]
-        group_x = center_x + cos(angle) * type_radius
-        group_y = center_y + sin(angle) * type_radius
-        spread = 42 + min(90, len(group) * 3)
-        for node_index, node in enumerate(group):
-            node_angle = (2 * pi * node_index) / max(len(group), 1)
-            distance = 0 if len(group) == 1 else spread
-            positions[node.get("key")] = (
-                group_x + cos(node_angle) * distance,
-                group_y + sin(node_angle) * distance,
-            )
-
-    return {key: value for key, value in positions.items() if key in by_key}

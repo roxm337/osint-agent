@@ -11,9 +11,10 @@ from urllib.parse import urlparse
 
 import yaml
 from PySide6.QtCore import QProcess, Qt, QUrl
-from PySide6.QtGui import QAction, QDesktopServices, QFont
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -25,9 +26,11 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -44,53 +47,122 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.graph import build_display_graph, render_gravis_html
+from gui.graph import build_display_graph, render_attack_html, render_gravis_html
+from actions import ActionRegistry
 from agents import get_llm_config
 from core.keyvault import KEY_SPECS, KeyVault
 from modules import MODULE_REGISTRY, get_all_module_ids
 from tools.external import tools_available
+from tools.tool_manager import TOOL_DEFINITIONS
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 ORCHESTRATOR = ROOT_DIR / "orchestrator.py"
 TOOLS_REQUIREMENTS = ROOT_DIR / "tools_requirements.txt"
 
-TOOL_PRIORITIES = {
-    "nuclei": ("minimum", "Template-based vulnerability checks"),
-    "httpx": ("minimum", "HTTP probing and technology signals"),
-    "katana": ("minimum", "Modern crawling and JavaScript endpoint discovery"),
-    "gau": ("minimum", "Archived URLs for parameter discovery"),
-    "ffuf": ("minimum", "Content and path discovery"),
-    "dalfox": ("minimum", "Secondary XSS engine and PoC extraction"),
-    "sqlmap": ("minimum", "SQL injection confirmation"),
-    "arjun": ("minimum", "Hidden parameter discovery"),
-    "paramspider": ("minimum", "Archived parameterized URL discovery"),
-    "whatweb": ("minimum", "Technology fingerprinting"),
-    "interactsh-client": ("minimum", "OOB callback confirmation"),
-    "hakrawler": ("crawl", "Fallback web crawler"),
-    "gobuster": ("crawl", "Content discovery"),
-    "feroxbuster": ("crawl", "Content discovery"),
-    "nmap": ("network", "Network service discovery"),
-    "naabu": ("network", "Fast port scanning"),
-    "masscan": ("network", "Large-scale port scanning"),
-    "dnsx": ("network", "Bulk DNS resolution"),
-    "subfinder": ("network", "Passive subdomain discovery"),
-    "amass": ("network", "Passive subdomain discovery"),
-    "nikto": ("web", "Web server checks"),
-    "wpscan": ("web", "WordPress checks"),
-    "corsy": ("web", "CORS checks"),
-    "smuggler": ("web", "HTTP request smuggling checks"),
-    "openredirex": ("web", "Open redirect checks"),
-    "commix": ("web", "Command injection checks"),
-    "testssl.sh": ("tls", "TLS configuration checks"),
-    "gitleaks": ("osint", "Secret scanning"),
-    "trufflehog": ("osint", "Secret scanning"),
-    "theHarvester": ("osint", "Email and subdomain OSINT"),
-    "maigret": ("osint", "Username OSINT"),
-    "holehe": ("osint", "Email registration checks"),
-    "searchsploit": ("exploit", "Exploit-DB lookup"),
-    "gowitness": ("visual", "Screenshots"),
+STATUS_COLORS = {
+    "completed": "#4ade80",
+    "complete": "#4ade80",
+    "running": "#7dd3fc",
+    "timeout": "#fbbf24",
+    "incomplete": "#fbbf24",
+    "error": "#f87171",
+    "failed": "#f87171",
+    "blocked": "#fb923c",
+    "skipped": "#94a3b8",
 }
+
+SEVERITY_RANK = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+SEVERITY_COLORS = {
+    "CRITICAL": "#fb7185",
+    "HIGH": "#fdba74",
+    "MEDIUM": "#fde047",
+    "LOW": "#93c5fd",
+    "INFO": "#94a3b8",
+}
+CONFIDENCE_RANK = {"TENTATIVE": 0, "FIRM": 1, "CONFIRMED": 2}
+
+EMPTY_GRAPH_HTML = (
+    "<html><body style='font-family:Arial;background:#090d13;padding:24px;"
+    "color:#dce7f3;'>{message}</body></html>"
+)
+VERDICT_LABELS = {
+    "": "-",
+    "true_positive": "true positive",
+    "false_positive": "false positive",
+    "out_of_scope": "out of scope",
+}
+VERDICT_COLORS = {
+    "true_positive": "#4ade80",
+    "false_positive": "#f87171",
+    "out_of_scope": "#fbbf24",
+}
+
+
+def _priority_rank(priority: str) -> int:
+    """P0 sorts first; anything unparseable sinks to the bottom."""
+    text = str(priority or "").strip().upper()
+    if text.startswith("P") and text[1:].isdigit():
+        return int(text[1:])
+    return 99
+
+
+def _bold_font() -> QFont:
+    font = QFont()
+    font.setBold(True)
+    return font
+
+
+def code_font(size: int = 12) -> QFont:
+    """Monospace font stack that exists on macOS, Linux, and Windows."""
+    font = QFont()
+    font.setFamilies(["SF Mono", "Menlo", "Consolas", "DejaVu Sans Mono", "monospace"])
+    font.setPointSize(size)
+    return font
+
+
+def build_scan_args(
+    target: str,
+    output_dir: Path | str,
+    config_path: Path | str,
+    mode: str = "Auto",
+    active: bool = False,
+    module: str | None = None,
+    pentest: bool = False,
+    execute: bool = False,
+    max_risk: str = "LOW",
+    max_actions: int = 25,
+    max_chains: int = 10,
+) -> list[str]:
+    """Build orchestrator argv for a GUI run.
+
+    Kept as a pure function so tests can assert every console control reaches
+    the CLI. `-c` is always passed because Settings writes config.yaml at a
+    path the orchestrator would otherwise never read (it resolves a relative
+    default against the process CWD, which is the repo root we also pin in
+    ``_start_process``).
+    """
+    args = [
+        str(ORCHESTRATOR),
+        "-t", target,
+        "-o", str(output_dir),
+        "-c", str(config_path),
+    ]
+    if active:
+        args.append("--active")
+    # Independent of `active`: both flags may legitimately apply at once.
+    if mode == "LLM":
+        args.extend(["--mode", "llm"])
+    if module:
+        args.extend(["--module", str(module)])
+    if pentest:
+        args.append("--pentest")
+        args.extend(["--max-risk", str(max_risk)])
+        args.extend(["--max-actions", str(int(max_actions))])
+        args.extend(["--max-chains", str(int(max_chains))])
+        if execute:
+            args.append("--execute")
+    return args
 
 
 class MainWindow(QMainWindow):
@@ -104,6 +176,12 @@ class MainWindow(QMainWindow):
         self.current_assets = {"nodes": [], "edges": []}
         self.current_module = {}
         self.current_evidence = {"items": []}
+        self.current_findings: list[dict] = []
+        self.current_attack_graph: dict = {}
+        self._identity_records: list[dict] = []
+        self._triage: dict = {}
+        self._findings_sort: list = [3, Qt.DescendingOrder]
+        self._filtered_findings: list[dict] = []
         self.output_dir = ROOT_DIR / "reports"
         self.config_path = ROOT_DIR / "config.yaml"
         self._build_ui()
@@ -167,6 +245,10 @@ class MainWindow(QMainWindow):
         open_output = QAction("Choose Output Directory", self)
         open_output.triggered.connect(self.choose_output_dir)
         file_menu.addAction(open_output)
+
+        use_config = QAction("Use Config File...", self)
+        use_config.triggered.connect(self.choose_config_file)
+        file_menu.addAction(use_config)
 
         open_target = QAction("Open Target Folder", self)
         open_target.triggered.connect(self.open_target_folder)
@@ -241,6 +323,31 @@ class MainWindow(QMainWindow):
         form.addRow("", self.auto_report_check)
         layout.addWidget(target_box)
 
+        engage_box = QGroupBox("Engagement")
+        engage_form = QFormLayout(engage_box)
+        engage_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.pentest_check = QCheckBox("Attack graph + probe plan (--pentest)")
+        self.execute_check = QCheckBox("Execute proposed chains (--execute)")
+        self.execute_check.setEnabled(False)
+        self.pentest_check.toggled.connect(self.execute_check.setEnabled)
+        self.pentest_check.toggled.connect(self._update_operation_context)
+        self.risk_combo = QComboBox()
+        self.risk_combo.addItems(["SAFE", "LOW", "MEDIUM", "HIGH", "DESTRUCTIVE"])
+        self.risk_combo.setCurrentText("LOW")
+        self.risk_combo.setMinimumWidth(0)
+        self.max_actions_spin = QSpinBox()
+        self.max_actions_spin.setRange(0, 1000)
+        self.max_actions_spin.setValue(25)
+        self.max_chains_spin = QSpinBox()
+        self.max_chains_spin.setRange(0, 1000)
+        self.max_chains_spin.setValue(10)
+        engage_form.addRow("", self.pentest_check)
+        engage_form.addRow("", self.execute_check)
+        engage_form.addRow("Risk ceiling", self.risk_combo)
+        engage_form.addRow("Max actions", self.max_actions_spin)
+        engage_form.addRow("Max chains", self.max_chains_spin)
+        layout.addWidget(engage_box)
+
         ai_box = QGroupBox("AI Assist")
         ai_layout = QVBoxLayout(ai_box)
         self.llm_status_label = QLabel("LLM status: checking")
@@ -299,6 +406,8 @@ class MainWindow(QMainWindow):
         self.requests_value = QLabel("-")
         self.completed_value = QLabel("-")
         self.skipped_value = QLabel("-")
+        self.incomplete_value = QLabel("-")
+        self.blocked_value = QLabel("-")
         self.active_value = QLabel("-")
         self.report_value = QLabel("-")
         self.report_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -314,12 +423,14 @@ class MainWindow(QMainWindow):
             ("Crit/High", self.critical_high_value, "danger"),
             ("Requests", self.requests_value, "info"),
             ("Complete", self.completed_value, "success"),
+            ("Incomplete", self.incomplete_value, "danger"),
         ]
         for index, (label, value_label, tone) in enumerate(metric_cards):
             metrics_grid.addWidget(self._metric_card(label, value_label, tone), index // 2, index % 2)
         summary_layout.addLayout(metrics_grid)
         secondary_layout = QFormLayout()
         secondary_layout.addRow("Skipped", self.skipped_value)
+        secondary_layout.addRow("Blocked", self.blocked_value)
         secondary_layout.addRow("Active modules", self.active_value)
         secondary_layout.addRow("Report", self.report_value)
         summary_layout.addLayout(secondary_layout)
@@ -363,6 +474,7 @@ class MainWindow(QMainWindow):
         settings_tabs.addTab(self._build_llm_settings_tab(), "LLM")
         settings_tabs.addTab(self._build_runtime_settings_tab(), "Runtime")
         settings_tabs.addTab(self._build_scanner_settings_tab(), "Scanner")
+        settings_tabs.addTab(self._build_actions_settings_tab(), "Actions")
         settings_tabs.addTab(self._build_tools_settings_tab(), "Tools")
         settings_tabs.addTab(self._build_keys_settings_tab(), "API Keys")
         settings_tabs.addTab(self._build_raw_config_tab(), "Raw YAML")
@@ -491,6 +603,28 @@ class MainWindow(QMainWindow):
             rate_layout.addWidget(per_minute, row, 2)
         layout.addWidget(rate_box)
 
+        limits_box = QGroupBox("Run Limits")
+        limits_form = QFormLayout(limits_box)
+        limits_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.module_timeout_spin = QSpinBox()
+        self.module_timeout_spin.setRange(10, 7200)
+        self.module_timeout_spin.setSuffix(" s")
+        self.budget_requests_spin = QSpinBox()
+        self.budget_requests_spin.setRange(0, 10_000_000)
+        self.budget_requests_spin.setSpecialValueText("unlimited")
+        self.budget_wall_clock_spin = QSpinBox()
+        self.budget_wall_clock_spin.setRange(0, 86400)
+        self.budget_wall_clock_spin.setSuffix(" s")
+        self.budget_wall_clock_spin.setSpecialValueText("unlimited")
+        self.budget_llm_spin = QSpinBox()
+        self.budget_llm_spin.setRange(0, 1_000_000)
+        self.budget_llm_spin.setSpecialValueText("unlimited")
+        limits_form.addRow("Module timeout", self.module_timeout_spin)
+        limits_form.addRow("Max requests", self.budget_requests_spin)
+        limits_form.addRow("Max wall clock", self.budget_wall_clock_spin)
+        limits_form.addRow("Max LLM calls", self.budget_llm_spin)
+        layout.addWidget(limits_box)
+
         button_row = QHBoxLayout()
         save_button = QPushButton("Save Runtime Settings")
         save_button.clicked.connect(self._save_settings_form)
@@ -538,6 +672,42 @@ class MainWindow(QMainWindow):
         auth_form.addRow("Headers", self.auth_headers_input)
         auth_form.addRow("Auth probe backoff", self.auth_probe_backoff_spin)
         layout.addWidget(auth_box)
+
+        identities_box = QGroupBox("Test Identities (auth.identities)")
+        identities_layout = QVBoxLayout(identities_box)
+        self.identities_table = QTableWidget(0, 6)
+        self.identities_table.setHorizontalHeaderLabels(
+            ["Name", "Bearer token", "Cookies", "Verify URL", "Success marker", "Role"]
+        )
+        identities_header = self.identities_table.horizontalHeader()
+        identities_header.setSectionResizeMode(1, QHeaderView.Stretch)
+        identities_header.setSectionResizeMode(2, QHeaderView.Stretch)
+        identities_header.setSectionResizeMode(3, QHeaderView.Stretch)
+        identities_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        identities_header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        identities_header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.identities_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.identities_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.identities_table.setMaximumHeight(180)
+        identities_layout.addWidget(self.identities_table)
+        identity_buttons = QHBoxLayout()
+        add_identity_button = QPushButton("Add Identity")
+        add_identity_button.clicked.connect(self._add_identity_row)
+        remove_identity_button = QPushButton("Remove Selected")
+        remove_identity_button.clicked.connect(self._remove_identity_rows)
+        identity_buttons.addStretch(1)
+        identity_buttons.addWidget(add_identity_button)
+        identity_buttons.addWidget(remove_identity_button)
+        identities_layout.addLayout(identity_buttons)
+        identities_hint = QLabel(
+            "Two verified identities are what idor_differ needs for horizontal "
+            "comparison. Extra fields (headers, login, owner_id) are preserved; "
+            "edit those in Raw YAML."
+        )
+        identities_hint.setWordWrap(True)
+        identities_hint.setObjectName("opsSecondary")
+        identities_layout.addWidget(identities_hint)
+        layout.addWidget(identities_box)
 
         xss_box = QGroupBox("XSS Detection")
         xss_form = QFormLayout(xss_box)
@@ -613,6 +783,67 @@ class MainWindow(QMainWindow):
         outer.addWidget(scroll, 1)
         return tab
 
+    def _build_actions_settings_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+
+        actions_box = QGroupBox("Registered Actions")
+        actions_layout = QVBoxLayout(actions_box)
+        self.actions_table = QTableWidget(0, 5)
+        self.actions_table.setHorizontalHeaderLabels(
+            ["Action", "Risk", "Detectability", "Requires", "Description"]
+        )
+        actions_header = self.actions_table.horizontalHeader()
+        actions_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        actions_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        actions_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        actions_header.setSectionResizeMode(4, QHeaderView.Stretch)
+        self.actions_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        actions_layout.addWidget(self.actions_table)
+        layout.addWidget(actions_box, 1)
+
+        hint = QLabel(
+            "The risk ceiling (--max-risk / Engagement → Risk ceiling) admits "
+            "actions at or below the selected level; SAFE and LOW admit nothing "
+            "that sends an injection payload."
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("opsSecondary")
+        layout.addWidget(hint)
+        self._refresh_actions_table()
+        return tab
+
+    def _refresh_actions_table(self):
+        if not hasattr(self, "actions_table"):
+            return
+        rank = {"SAFE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "DESTRUCTIVE": 4}
+        colors = {
+            "SAFE": "#4ade80", "LOW": "#93c5fd", "MEDIUM": "#fde047",
+            "HIGH": "#fdba74", "DESTRUCTIVE": "#fb7185",
+        }
+        metas = sorted(
+            ActionRegistry.list(),
+            key=lambda meta: (rank.get(meta.risk.value, 9), meta.id),
+        )
+        self.actions_table.setRowCount(len(metas))
+        for row, meta in enumerate(metas):
+            values = [
+                meta.id,
+                meta.risk.value,
+                meta.detectability,
+                ", ".join(meta.requires),
+                meta.description,
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if col == 1:
+                    color = colors.get(meta.risk.value)
+                    if color:
+                        item.setForeground(QColor(color))
+                self.actions_table.setItem(row, col, item)
+
     def _build_tools_settings_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -622,7 +853,7 @@ class MainWindow(QMainWindow):
         tools_box = QGroupBox("External Tool Readiness")
         tools_layout = QVBoxLayout(tools_box)
         self.tools_table = QTableWidget(0, 4)
-        self.tools_table.setHorizontalHeaderLabels(["Tool", "Ready", "Priority", "Purpose"])
+        self.tools_table.setHorizontalHeaderLabels(["Tool", "Ready", "Categories", "Purpose"])
         self.tools_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.tools_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.tools_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
@@ -633,8 +864,11 @@ class MainWindow(QMainWindow):
         self.refresh_tools_button.clicked.connect(self._refresh_tools_status)
         self.open_tools_requirements_button = QPushButton("Open Requirements")
         self.open_tools_requirements_button.clicked.connect(self.open_tools_requirements)
+        self.install_tools_button = QPushButton("Install Missing")
+        self.install_tools_button.clicked.connect(self.install_missing_tools)
         tool_buttons.addStretch(1)
         tool_buttons.addWidget(self.refresh_tools_button)
+        tool_buttons.addWidget(self.install_tools_button)
         tool_buttons.addWidget(self.open_tools_requirements_button)
         tools_layout.addLayout(tool_buttons)
         layout.addWidget(tools_box, 2)
@@ -644,7 +878,7 @@ class MainWindow(QMainWindow):
         self.tools_requirements_preview = QPlainTextEdit()
         self.tools_requirements_preview.setReadOnly(True)
         self.tools_requirements_preview.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self.tools_requirements_preview.setFont(QFont("Menlo", 11))
+        self.tools_requirements_preview.setFont(code_font(11))
         requirements_layout.addWidget(self.tools_requirements_preview)
         layout.addWidget(requirements_box, 1)
         return tab
@@ -693,7 +927,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         self.raw_config_editor = QPlainTextEdit()
         self.raw_config_editor.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self.raw_config_editor.setFont(QFont("Menlo", 12))
+        self.raw_config_editor.setFont(code_font(12))
         layout.addWidget(self.raw_config_editor, 1)
         button_row = QHBoxLayout()
         validate_button = QPushButton("Apply Raw YAML")
@@ -754,18 +988,83 @@ class MainWindow(QMainWindow):
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self.log_output.setFont(QFont("Menlo", 12))
+        self.log_output.setFont(code_font(12))
         self.results_tabs.addTab(self.log_output, "Log")
 
-        self.findings_table = QTableWidget(0, 8)
+        findings_widget = QWidget()
+        findings_layout = QVBoxLayout(findings_widget)
+        findings_layout.setContentsMargins(0, 0, 0, 0)
+        findings_layout.setSpacing(6)
+
+        filter_row = QHBoxLayout()
+        filter_row.setContentsMargins(0, 0, 0, 0)
+        filter_row.setSpacing(6)
+        self.finding_search = QLineEdit()
+        self.finding_search.setPlaceholderText("Filter title, ID, category or description")
+        self.finding_search.setMinimumWidth(0)
+        self.finding_severity_combo = QComboBox()
+        self.finding_severity_combo.addItems(
+            ["All severities", "CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+        )
+        self.finding_confidence_combo = QComboBox()
+        self.finding_confidence_combo.addItems(
+            ["All confidence", "CONFIRMED", "FIRM", "TENTATIVE"]
+        )
+        self.finding_verified_combo = QComboBox()
+        self.finding_verified_combo.addItems(
+            ["All verification", "Verified only", "Unverified only"]
+        )
+        self.finding_triage_combo = QComboBox()
+        self.finding_triage_combo.addItems([
+            "All triage", "Untriaged only", "True positive", "False positive", "Out of scope",
+        ])
+        self.finding_count_label = QLabel("")
+        self.finding_count_label.setObjectName("opsSecondary")
+        self.finding_search.textChanged.connect(self._apply_finding_filter)
+        self.finding_severity_combo.currentIndexChanged.connect(self._apply_finding_filter)
+        self.finding_confidence_combo.currentIndexChanged.connect(self._apply_finding_filter)
+        self.finding_verified_combo.currentIndexChanged.connect(self._apply_finding_filter)
+        self.finding_triage_combo.currentIndexChanged.connect(self._apply_finding_filter)
+        filter_row.addWidget(self.finding_search, 1)
+        filter_row.addWidget(self.finding_severity_combo)
+        filter_row.addWidget(self.finding_confidence_combo)
+        filter_row.addWidget(self.finding_verified_combo)
+        filter_row.addWidget(self.finding_triage_combo)
+        filter_row.addWidget(self.finding_count_label)
+        findings_layout.addLayout(filter_row)
+
+        self.findings_table = QTableWidget(0, 10)
         self.findings_table.setHorizontalHeaderLabels([
-            "ID", "Priority", "Severity", "Score", "Confidence", "Title", "Category", "Assets",
+            "ID", "Priority", "Severity", "Score", "Confidence",
+            "Title", "Category", "Module", "Verdict", "Assets",
         ])
         header = self.findings_table.horizontalHeader()
         header.setSectionResizeMode(5, QHeaderView.Stretch)
         header.setSectionResizeMode(6, QHeaderView.Stretch)
-        self.findings_table.setSortingEnabled(True)
-        self.results_tabs.addTab(self.findings_table, "Findings")
+        # QTableWidget's built-in sorting only compares DisplayRole strings
+        # ("100" < "10" < "2"), so the table sorts itself through
+        # `_sort_findings` with real ranks instead.
+        self.findings_table.setSortingEnabled(False)
+        header.setSortIndicatorShown(True)
+        header.sectionClicked.connect(self._sort_findings)
+        self.findings_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.findings_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.findings_table.customContextMenuRequested.connect(self._findings_context_menu)
+        self.findings_table.itemSelectionChanged.connect(self._update_finding_detail)
+        self.findings_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+
+        self.finding_detail = QTextEdit()
+        self.finding_detail.setReadOnly(True)
+        self.finding_detail.setLineWrapMode(QTextEdit.NoWrap)
+        self.finding_detail.setMinimumHeight(90)
+
+        finding_splitter = QSplitter(Qt.Vertical)
+        finding_splitter.addWidget(self.findings_table)
+        finding_splitter.addWidget(self.finding_detail)
+        finding_splitter.setStretchFactor(0, 3)
+        finding_splitter.setStretchFactor(1, 1)
+        findings_layout.addWidget(finding_splitter, 1)
+        self.results_tabs.addTab(findings_widget, "Findings")
 
         self.assets_table = QTableWidget(0, 4)
         self.assets_table.setHorizontalHeaderLabels(["Type", "Value", "Confidence", "Sources"])
@@ -818,6 +1117,35 @@ class MainWindow(QMainWindow):
         graph_layout.addWidget(self.graph_view, 1)
         self.results_tabs.addTab(graph_widget, "Graph")
 
+        attack_widget = QWidget()
+        attack_layout = QVBoxLayout(attack_widget)
+        attack_layout.setContentsMargins(0, 0, 0, 0)
+        attack_layout.setSpacing(6)
+        self.attack_graph_summary = QLabel("No attack graph loaded")
+        self.attack_graph_summary.setWordWrap(True)
+        self.attack_graph_summary.setObjectName("opsPrimary")
+        attack_layout.addWidget(self.attack_graph_summary)
+
+        probe_caption = QLabel("Probe plan")
+        probe_caption.setObjectName("subtitle")
+        attack_layout.addWidget(probe_caption)
+        self.probe_plan_label = QLabel("Probe plan: not recorded")
+        self.probe_plan_label.setWordWrap(True)
+        self.probe_plan_label.setObjectName("opsSecondary")
+        attack_layout.addWidget(self.probe_plan_label)
+        self.probe_plan_table = QTableWidget(0, 2)
+        self.probe_plan_table.setHorizontalHeaderLabels(["Reason not proposed", "Surfaces"])
+        self.probe_plan_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.probe_plan_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.probe_plan_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.probe_plan_table.setMaximumHeight(120)
+        attack_layout.addWidget(self.probe_plan_table)
+
+        self.attack_graph_view = QWebEngineView()
+        self.attack_graph_view.setMinimumSize(0, 0)
+        attack_layout.addWidget(self.attack_graph_view, 1)
+        self.results_tabs.addTab(attack_widget, "Attack Graph")
+
         self.submissions_table = QTableWidget(0, 3)
         self.submissions_table.setHorizontalHeaderLabels(["File", "Size", "Path"])
         self.submissions_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
@@ -842,7 +1170,7 @@ class MainWindow(QMainWindow):
         self.report_raw = QPlainTextEdit()
         self.report_raw.setReadOnly(True)
         self.report_raw.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self.report_raw.setFont(QFont("Menlo", 12))
+        self.report_raw.setFont(code_font(12))
         report_tabs.addTab(self.report_preview, "Rendered")
         report_tabs.addTab(self.report_raw, "Markdown")
         report_layout.addWidget(report_tabs, 1)
@@ -864,7 +1192,7 @@ class MainWindow(QMainWindow):
         self.summary_json = QPlainTextEdit()
         self.summary_json.setReadOnly(True)
         self.summary_json.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self.summary_json.setFont(QFont("Menlo", 12))
+        self.summary_json.setFont(code_font(12))
         self.results_tabs.addTab(self.summary_json, "Summary JSON")
 
         results_layout.addWidget(self.results_tabs, 1)
@@ -951,6 +1279,41 @@ class MainWindow(QMainWindow):
             self.output_input.setText(str(self.output_dir))
             self._update_operation_context()
 
+    def choose_config_file(self):
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Config File",
+            str(self.config_path.parent),
+            "YAML (*.yaml *.yml);;All files (*)",
+        )
+        if not selected:
+            return
+        self.config_path = Path(selected)
+        self._load_settings_form()
+        self._update_operation_context()
+        self.status_label.setText(f"Config: {self.config_path.name}")
+
+    def _confirm_engagement(self) -> bool:
+        """Gate chain execution at MEDIUM and above behind an explicit yes."""
+        if not (self.pentest_check.isChecked() and self.execute_check.isChecked()):
+            return True
+        risk = self.risk_combo.currentText()
+        if risk in ("SAFE", "LOW"):
+            return True
+        answer = QMessageBox.warning(
+            self,
+            "Authorisation Required",
+            f"Target: {self.target_input.text().strip()}\n"
+            f"Risk ceiling: {risk}\n"
+            f"Max actions: {self.max_actions_spin.value()} | "
+            f"Max chains: {self.max_chains_spin.value()}\n\n"
+            "This will execute attack actions against the target.\n"
+            "Only continue if you are authorised to test it.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return answer == QMessageBox.Yes
+
     def start_scan(self):
         target = self.target_input.text().strip()
         if not target:
@@ -958,16 +1321,24 @@ class MainWindow(QMainWindow):
             return
         if self.process and self.process.state() != QProcess.NotRunning:
             return
+        if not self._confirm_engagement():
+            return
 
-        args = [str(ORCHESTRATOR), "-t", target, "-o", str(self.output_dir)]
         mode = self.mode_combo.currentText()
-        if self.active_check.isChecked():
-            args.append("--active")
-        elif mode == "LLM":
-            args.extend(["--mode", "llm"])
-
-        if mode == "Single module":
-            args.extend(["--module", self.module_combo.currentData()])
+        module = self.module_combo.currentData() if mode == "Single module" else None
+        args = build_scan_args(
+            target=target,
+            output_dir=self.output_dir,
+            config_path=self.config_path,
+            mode=mode,
+            active=self.active_check.isChecked(),
+            module=module,
+            pentest=self.pentest_check.isChecked(),
+            execute=self.execute_check.isChecked(),
+            max_risk=self.risk_combo.currentText(),
+            max_actions=self.max_actions_spin.value(),
+            max_chains=self.max_chains_spin.value(),
+        )
 
         self.report_after_process = (
             self.auto_report_check.isChecked()
@@ -996,12 +1367,12 @@ class MainWindow(QMainWindow):
             return
         if self.process and self.process.state() != QProcess.NotRunning:
             return
-        args = [
-            str(ORCHESTRATOR),
-            "-t", target,
-            "-o", str(self.output_dir),
-            "--module", module_id,
-        ]
+        args = build_scan_args(
+            target=target,
+            output_dir=self.output_dir,
+            config_path=self.config_path,
+            module=module_id,
+        )
         self._start_process(args, report_run=report_run)
 
     def open_report(self):
@@ -1037,6 +1408,10 @@ class MainWindow(QMainWindow):
         self.process = QProcess(self)
         self.process.setProgram(sys.executable)
         self.process.setArguments(args)
+        # The orchestrator resolves a relative config path (and every report
+        # path) against CWD; without this pin, Settings edits a config.yaml
+        # the engine never reads.
+        self.process.setWorkingDirectory(str(ROOT_DIR))
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         self.process.setProcessEnvironment(self._qt_environment(env))
@@ -1108,6 +1483,8 @@ class MainWindow(QMainWindow):
         self.requests_value.setText(str(stats.get("total_requests", "-")))
         self.completed_value.setText(str(len(module.get("completed", []))))
         self.skipped_value.setText(str(len(module.get("skipped", []))))
+        self.blocked_value.setText(str(len(module.get("blocked", []))))
+        self.incomplete_value.setText(str(self._incomplete_count(module)))
         active_count = sum(1 for mid, entry in MODULE_REGISTRY.items() if entry.get("active"))
         self.active_value.setText(str(active_count))
         risk = summary_bundle.get("risk", {})
@@ -1137,6 +1514,7 @@ class MainWindow(QMainWindow):
         self.current_evidence = evidence
         self._update_operation_context()
         self.refresh_graph()
+        self._load_attack_graph()
         if report_path.exists():
             report_text = report_path.read_text(errors="replace")
             self.report_preview.setMarkdown(report_text)
@@ -1163,7 +1541,13 @@ class MainWindow(QMainWindow):
             module = "orchestrated chain"
 
         self.operation_target_label.setText(f"Target: {target or '-'}")
-        self.operation_mode_label.setText(f"Mode: {mode} | Module: {module}")
+        engagement = ""
+        if hasattr(self, "pentest_check") and self.pentest_check.isChecked():
+            risk = self.risk_combo.currentText() if hasattr(self, "risk_combo") else "LOW"
+            engagement = f" | Pentest: {risk}"
+        self.operation_mode_label.setText(
+            f"Mode: {mode} | Module: {module}{engagement} | Config: {self.config_path.name}"
+        )
         ready, llm_message = self._llm_status()
         self.llm_status_label.setText(llm_message)
         self.llm_status_label.setProperty("ready", ready)
@@ -1178,10 +1562,12 @@ class MainWindow(QMainWindow):
         module_state = self.current_module if isinstance(self.current_module, dict) else {}
         completed = len(module_state.get("completed", []))
         skipped = len(module_state.get("skipped", []))
+        incomplete = self._incomplete_count(module_state)
         total = max(len(get_all_module_ids()), 1)
         progress = min(100, int((completed / total) * 100))
         self.progress_bar.setValue(progress)
-        self.progress_bar.setFormat(f"{completed}/{total} modules complete")
+        suffix = f", {incomplete} incomplete" if incomplete else ""
+        self.progress_bar.setFormat(f"{completed}/{total} modules complete{suffix}")
 
         if self.process and self.process.state() != QProcess.NotRunning:
             return
@@ -1221,26 +1607,305 @@ class MainWindow(QMainWindow):
         return self.output_dir / target / f"{target}_summary.json"
 
     def _load_findings(self, findings: list[dict]):
-        self.findings_table.setSortingEnabled(False)
-        ordered = sorted(findings, key=lambda item: int(item.get("risk_score") or 0), reverse=True)
+        self.current_findings = list(findings)
+        self._triage = self._read_triage()
+        self._apply_finding_filter()
+
+    def _apply_finding_filter(self, *_args):
+        """Reduce the findings table to the rows matching the filter bar."""
+        search = self.finding_search.text().strip().lower()
+        severity = self.finding_severity_combo.currentText()
+        confidence = self.finding_confidence_combo.currentText()
+        verified_mode = self.finding_verified_combo.currentIndex()
+        triage_mode = self.finding_triage_combo.currentIndex()
+        selected: list[dict] = []
+        for finding in self.current_findings:
+            if severity != "All severities" and \
+                    str(finding.get("severity", "")).upper() != severity:
+                continue
+            if confidence != "All confidence" and \
+                    str(finding.get("confidence", "")).upper() != confidence:
+                continue
+            is_verified = bool(finding.get("verified"))
+            if verified_mode == 1 and not is_verified:
+                continue
+            if verified_mode == 2 and is_verified:
+                continue
+            verdict = self._verdict_of(finding)
+            if triage_mode == 1 and verdict:
+                continue
+            if triage_mode == 2 and verdict != "true_positive":
+                continue
+            if triage_mode == 3 and verdict != "false_positive":
+                continue
+            if triage_mode == 4 and verdict != "out_of_scope":
+                continue
+            if search:
+                haystack = " ".join([
+                    str(finding.get("id", "")),
+                    str(finding.get("title", "")),
+                    str(finding.get("category", "")),
+                    str(finding.get("description", "")),
+                ]).lower()
+                if search not in haystack:
+                    continue
+            selected.append(finding)
+        self._filtered_findings = selected
+        self._populate_findings(selected)
+
+    def _finding_sort_key(self, column: int):
+        def key(finding: dict):
+            if column == 0:
+                return str(finding.get("id", ""))
+            if column == 1:
+                return _priority_rank(finding.get("priority"))
+            if column == 2:
+                return SEVERITY_RANK.get(str(finding.get("severity", "")).upper(), -1)
+            if column == 3:
+                return int(finding.get("risk_score") or 0)
+            if column == 4:
+                return CONFIDENCE_RANK.get(str(finding.get("confidence", "")).upper(), -1)
+            if column == 7:
+                return str(finding.get("module_id", "")).lower()
+            if column == 8:
+                return str(self._verdict_of(finding))
+            if column == 9:
+                return ", ".join(finding.get("asset_keys", [])).lower()
+            if column == 6:
+                return str(finding.get("category", "")).lower()
+            return str(finding.get("title", "")).lower()
+
+        return key
+
+    def _sort_findings(self, column: int):
+        order = Qt.DescendingOrder if column == 3 else Qt.AscendingOrder
+        if self._findings_sort[0] == column:
+            order = (
+                Qt.AscendingOrder
+                if self._findings_sort[1] == Qt.DescendingOrder
+                else Qt.DescendingOrder
+            )
+        self._findings_sort = [column, order]
+        self.findings_table.horizontalHeader().setSortIndicator(column, order)
+        self._populate_findings(getattr(self, "_filtered_findings", self.current_findings))
+
+    def _populate_findings(self, findings: list[dict]):
+        column, order = self._findings_sort
+        reverse = order == Qt.DescendingOrder
+        ordered = sorted(findings, key=self._finding_sort_key(column), reverse=reverse)
         self.findings_table.setRowCount(len(ordered))
         for row, finding in enumerate(ordered):
+            verdict = self._verdict_of(finding)
             values = [
-                finding.get("id", ""),
-                finding.get("priority", ""),
-                finding.get("severity", ""),
-                str(finding.get("risk_score", "")),
-                finding.get("confidence", ""),
-                finding.get("title", ""),
-                finding.get("category", ""),
+                str(finding.get("id", "")),
+                str(finding.get("priority") or ""),
+                str(finding.get("severity") or ""),
+                str(finding.get("risk_score") or 0),
+                str(finding.get("confidence") or ""),
+                str(finding.get("title") or ""),
+                str(finding.get("category") or ""),
+                str(finding.get("module_id") or ""),
+                VERDICT_LABELS.get(verdict, verdict),
                 ", ".join(finding.get("asset_keys", [])[:3]),
             ]
+            # Sort keys: numeric rank where a string would sort wrong.
+            sort_keys = [
+                values[0],
+                _priority_rank(values[1]),
+                SEVERITY_RANK.get(values[2].upper(), -1),
+                int(values[3] or 0),
+                CONFIDENCE_RANK.get(values[4].upper(), -1),
+                values[5], values[6], values[7], values[8], values[9],
+            ]
+            severity_color = SEVERITY_COLORS.get(values[2].upper())
+            verdict_color = VERDICT_COLORS.get(verdict)
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if col == 3:
-                    item.setData(Qt.UserRole, int(value or 0))
+                item.setData(Qt.UserRole, sort_keys[col])
+                if col == 2 and severity_color:
+                    item.setForeground(QColor(severity_color))
+                    item.setFont(_bold_font())
+                if col == 8 and verdict_color:
+                    item.setForeground(QColor(verdict_color))
                 self.findings_table.setItem(row, col, item)
-        self.findings_table.setSortingEnabled(True)
+        self.finding_count_label.setText(
+            f"showing {len(ordered)} of {len(self.current_findings)}"
+        )
+        self._update_finding_detail()
+
+    def _verdict_of(self, finding: dict) -> str:
+        entry = self._triage.get(str(finding.get("id", "")), {})
+        if isinstance(entry, dict):
+            return str(entry.get("verdict", ""))
+        return ""
+
+    def _selected_finding(self) -> dict | None:
+        row = self.findings_table.currentRow()
+        if row < 0:
+            return None
+        item = self.findings_table.item(row, 0)
+        if not item:
+            return None
+        finding_id = item.text()
+        for finding in self.current_findings:
+            if str(finding.get("id", "")) == finding_id:
+                return finding
+        return None
+
+    def _update_finding_detail(self):
+        if not hasattr(self, "finding_detail"):
+            return
+        finding = self._selected_finding()
+        if not finding:
+            self.finding_detail.setPlainText(
+                "Select a finding to see its description, remediation and evidence."
+            )
+            return
+        verdict = self._verdict_of(finding)
+        entry = self._triage.get(str(finding.get("id", "")), {})
+        note = str(entry.get("note", "")) if isinstance(entry, dict) else ""
+        lines = [
+            f"{finding.get('id', '')}  —  "
+            f"{finding.get('priority') or '-'} / "
+            f"{finding.get('severity') or '-'} / "
+            f"{finding.get('confidence') or '-'}  "
+            f"(score {finding.get('risk_score', 0)})",
+            f"Module: {finding.get('module_id', '-')}   "
+            f"Category: {finding.get('category', '-')}   "
+            f"Verified: {'yes' if finding.get('verified') else 'no'}",
+            f"Triage: {VERDICT_LABELS.get(verdict, verdict) or 'untriaged'}"
+            + (f"   Note: {note}" if note else ""),
+            "",
+            str(finding.get("description") or "").strip(),
+            "",
+        ]
+        remediation = str(finding.get("remediation") or "").strip()
+        if remediation:
+            lines += ["Remediation:", remediation, ""]
+        inline = finding.get("evidence") or []
+        if inline:
+            lines.append("Evidence:")
+            lines += [f"  - {item}" for item in inline[:12]]
+            if len(inline) > 12:
+                lines.append(f"  ... {len(inline) - 12} more")
+            lines.append("")
+        refs = finding.get("evidence_refs") or []
+        if refs:
+            lines.append("Evidence refs: " + ", ".join(str(r) for r in refs))
+            lines.append("(double-click a row in the Evidence tab to open files)")
+            lines.append("")
+        assets = finding.get("asset_keys") or []
+        if assets:
+            lines.append("Assets:")
+            lines += [f"  - {key}" for key in assets]
+        verification = finding.get("verification")
+        if verification:
+            lines += ["", "Verification detail:", json.dumps(verification, indent=2, default=str)]
+        self.finding_detail.setPlainText("\n".join(lines))
+
+    def _findings_context_menu(self, pos):
+        finding = self._selected_finding()
+        if not finding:
+            return
+        menu = QMenu(self)
+        copy_action = menu.addAction("Copy finding ID")
+        evidence_action = menu.addAction("Open evidence file")
+        menu.addSeparator()
+        verdict_menu = menu.addMenu("Set verdict")
+        verdict_actions = {
+            verdict_menu.addAction(label): verdict
+            for verdict, label in (
+                ("true_positive", "True positive"),
+                ("false_positive", "False positive"),
+                ("out_of_scope", "Out of scope"),
+            )
+        }
+        clear_action = verdict_menu.addAction("Clear verdict")
+        note_action = menu.addAction("Edit triage note...")
+        chosen = menu.exec(self.findings_table.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is copy_action:
+            QApplication.clipboard().setText(str(finding.get("id", "")))
+            self.status_label.setText(f"Copied {finding.get('id')}")
+        elif chosen is evidence_action:
+            self._open_finding_evidence(finding)
+        elif chosen is clear_action:
+            self._set_finding_verdict(finding, "")
+        elif chosen in verdict_actions:
+            self._set_finding_verdict(finding, verdict_actions[chosen])
+        elif chosen is note_action:
+            self._edit_triage_note(finding)
+
+    def _set_finding_verdict(self, finding: dict, verdict: str):
+        finding_id = str(finding.get("id", ""))
+        if not finding_id:
+            return
+        entry = self._triage.setdefault(finding_id, {})
+        if not isinstance(entry, dict):
+            entry = self._triage[finding_id] = {}
+        if verdict:
+            entry["verdict"] = verdict
+        else:
+            entry.pop("verdict", None)
+            if not entry:
+                self._triage.pop(finding_id, None)
+        self._write_triage()
+        self._apply_finding_filter()
+
+    def _edit_triage_note(self, finding: dict):
+        finding_id = str(finding.get("id", ""))
+        entry = self._triage.get(finding_id, {})
+        current = str(entry.get("note", "")) if isinstance(entry, dict) else ""
+        note, accepted = QInputDialog.getText(
+            self, "Triage note", f"Note for {finding_id}:", text=current
+        )
+        if not accepted:
+            return
+        stored = self._triage.setdefault(finding_id, {})
+        if not isinstance(stored, dict):
+            stored = self._triage[finding_id] = {}
+        if note.strip():
+            stored["note"] = note.strip()
+        else:
+            stored.pop("note", None)
+            if not stored:
+                self._triage.pop(finding_id, None)
+        self._write_triage()
+        self._apply_finding_filter()
+
+    def _open_finding_evidence(self, finding: dict):
+        refs = {str(ref) for ref in (finding.get("evidence_refs") or [])}
+        target_dir = self.output_dir / self._target_output_name()
+        for item in self.current_evidence.get("items", []):
+            if str(item.get("id", "")) not in refs:
+                continue
+            path = target_dir / str(item.get("path", ""))
+            if path.exists():
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+                return
+        QMessageBox.information(
+            self, "No Evidence File",
+            "This finding has no evidence file on disk (only inline text or refs "
+            "that no longer resolve).",
+        )
+
+    def _triage_path(self) -> Path:
+        target = self._target_output_name()
+        return self.output_dir / target / f"{target}_triage.json"
+
+    def _read_triage(self) -> dict:
+        data = self._read_json(self._triage_path(), {})
+        return data if isinstance(data, dict) else {}
+
+    def _write_triage(self):
+        path = self._triage_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(self._triage, indent=2, sort_keys=True))
+        except OSError as exc:
+            QMessageBox.warning(self, "Save Failed", str(exc))
+
 
     def _load_assets(self, assets: list[dict]):
         self.assets_table.setRowCount(len(assets))
@@ -1253,6 +1918,35 @@ class MainWindow(QMainWindow):
             ]
             for col, value in enumerate(values):
                 self.assets_table.setItem(row, col, QTableWidgetItem(value))
+
+    def _incomplete_count(self, module: dict) -> int:
+        """Modules whose latest run timed out or errored without ever finishing.
+
+        A deadline kill lands in neither `completed` nor `skipped`, so before
+        this the run read as "not started yet": invisible in every metric and
+        the progress bar denominator treated it as pending forever.
+        """
+        completed = set(module.get("completed", []))
+        skipped = {
+            item.get("module_id") for item in module.get("skipped", [])
+            if isinstance(item, dict)
+        }
+        blocked = {
+            item.get("module_id") for item in module.get("blocked", [])
+            if isinstance(item, dict)
+        }
+        resolved = completed | skipped | blocked
+        count = 0
+        seen: set[str] = set()
+        for run in reversed(module.get("runs", [])):
+            module_id = run.get("module_id", "")
+            if not module_id or module_id in seen:
+                continue
+            seen.add(module_id)
+            status = str(run.get("status", "")).lower()
+            if status in ("timeout", "error", "failed", "incomplete") and module_id not in resolved:
+                count += 1
+        return count
 
     def _load_modules(self, module: dict):
         latest_runs = {}
@@ -1299,6 +1993,14 @@ class MainWindow(QMainWindow):
                 item = QTableWidgetItem(value)
                 if col in (0, 4, 5, 6):
                     item.setData(Qt.UserRole, int(value or 0))
+                if col == 2:
+                    color = STATUS_COLORS.get(status.lower())
+                    if color:
+                        item.setForeground(QColor(color))
+                    if status.lower() in ("timeout", "error", "failed", "incomplete"):
+                        item.setToolTip("coverage incomplete — run did not finish")
+                if col == 7 and value:
+                    item.setToolTip(str(value))
                 self.modules_table.setItem(row, col, item)
         self.modules_table.setSortingEnabled(True)
 
@@ -1358,6 +2060,13 @@ class MainWindow(QMainWindow):
             self.config_record_http_evidence_check.setChecked(bool(modules.get("record_http_evidence", True)))
             self.config_max_empty_spin.setValue(int(modules.get("max_consecutive_empty", 5) or 0))
 
+        if hasattr(self, "module_timeout_spin"):
+            self.module_timeout_spin.setValue(int(config.get("module_timeout", 300) or 300))
+            budget = config.get("budget_limits") or {}
+            self.budget_requests_spin.setValue(int(budget.get("max_requests", 0) or 0))
+            self.budget_wall_clock_spin.setValue(int(budget.get("max_wall_clock_seconds", 0) or 0))
+            self.budget_llm_spin.setValue(int(budget.get("max_llm_calls", 0) or 0))
+
         rate_limits = config.get("rate_limits", {})
         if hasattr(self, "rate_limit_inputs"):
             for name, fields in self.rate_limit_inputs.items():
@@ -1376,6 +2085,19 @@ class MainWindow(QMainWindow):
             self.auth_cookie_input.setText(str(auth.get("cookie", "")))
             self.auth_headers_input.setPlainText(self._headers_to_text(auth.get("headers", {})))
             self.auth_probe_backoff_spin.setValue(int(auth.get("probe_backoff_seconds", 10) or 0))
+
+        if hasattr(self, "identities_table"):
+            entries = auth.get("identities") or []
+            if isinstance(entries, dict):
+                entries = [
+                    {"name": key, **value}
+                    for key, value in entries.items()
+                    if isinstance(value, dict)
+                ]
+            self._identity_records = [
+                dict(entry) for entry in entries if isinstance(entry, dict)
+            ]
+            self._refresh_identities_table()
 
         xss = config.get("xss", {})
         if hasattr(self, "xss_browser_confirm_check"):
@@ -1442,6 +2164,18 @@ class MainWindow(QMainWindow):
                 "record_http_evidence": self.config_record_http_evidence_check.isChecked(),
             })
 
+        if hasattr(self, "module_timeout_spin"):
+            config["module_timeout"] = self.module_timeout_spin.value()
+            budget_limits = dict(
+                config.get("budget_limits") if isinstance(config.get("budget_limits"), dict) else {}
+            )
+            budget_limits.update({
+                "max_requests": self.budget_requests_spin.value(),
+                "max_wall_clock_seconds": self.budget_wall_clock_spin.value(),
+                "max_llm_calls": self.budget_llm_spin.value(),
+            })
+            config["budget_limits"] = budget_limits
+
         if hasattr(self, "rate_limit_inputs"):
             config.setdefault("rate_limits", {})
             for name, fields in self.rate_limit_inputs.items():
@@ -1463,6 +2197,11 @@ class MainWindow(QMainWindow):
                 "bearer_token": self.auth_bearer_input.text().strip(),
                 "probe_backoff_seconds": self.auth_probe_backoff_spin.value(),
             })
+            if hasattr(self, "identities_table"):
+                self._sync_identity_records()
+                config["auth"]["identities"] = [
+                    record for record in self._identity_records if record.get("name")
+                ]
 
         if hasattr(self, "xss_browser_confirm_check"):
             config.setdefault("xss", {})
@@ -1504,6 +2243,107 @@ class MainWindow(QMainWindow):
             self._refresh_tools_status()
             self._update_operation_context()
             self.status_label.setText("Settings saved")
+
+    def _refresh_identities_table(self):
+        if not hasattr(self, "identities_table"):
+            return
+        self.identities_table.setRowCount(len(self._identity_records))
+        for row, record in enumerate(self._identity_records):
+            for col, value in enumerate(self._identity_row_values(record)):
+                self.identities_table.setItem(row, col, QTableWidgetItem(str(value)))
+
+    @staticmethod
+    def _identity_row_values(record: dict) -> list[str]:
+        cookies = record.get("cookies") or {}
+        if isinstance(cookies, dict):
+            cookie_text = "; ".join(f"{key}={value}" for key, value in cookies.items())
+        else:
+            cookie_text = str(cookies)
+        token = str(record.get("bearer_token") or record.get("token") or "")
+        return [
+            str(record.get("name", "")),
+            token,
+            cookie_text,
+            str(record.get("verify_url", "")),
+            str(record.get("success_marker", "")),
+            str(record.get("role", "")),
+        ]
+
+    def _add_identity_row(self):
+        # Table cells are edited without a binding model; sync first so a
+        # rename typed into a row survives the table refresh below.
+        self._sync_identity_records()
+        used = {str(record.get("name", "")) for record in self._identity_records}
+        index = len(self._identity_records) + 1
+        name = f"identity_{index}"
+        while name in used:
+            index += 1
+            name = f"identity_{index}"
+        self._identity_records.append({"name": name})
+        self._refresh_identities_table()
+        self.identities_table.selectRow(len(self._identity_records) - 1)
+
+    def _remove_identity_rows(self):
+        self._sync_identity_records()
+        rows = sorted(
+            {index.row() for index in self.identities_table.selectedIndexes()},
+            reverse=True,
+        )
+        for row in rows:
+            if 0 <= row < len(self._identity_records):
+                self._identity_records.pop(row)
+        if rows:
+            self._refresh_identities_table()
+
+    def _sync_identity_records(self):
+        """Read the table back into records, preserving unknown record keys."""
+        records = []
+        for row in range(self.identities_table.rowCount()):
+            def cell(col: int) -> str:
+                item = self.identities_table.item(row, col)
+                return item.text().strip() if item else ""
+
+            name = cell(0)
+            if row < len(self._identity_records) and isinstance(self._identity_records[row], dict):
+                record = dict(self._identity_records[row])
+            else:
+                record = {}
+            # Keep one record per table row (even nameless ones) so row
+            # indices stay aligned; save filters the empty ones out.
+            record["name"] = name
+
+            token = cell(1)
+            if token:
+                record["bearer_token"] = token
+            else:
+                record.pop("bearer_token", None)
+                record.pop("token", None)
+
+            cookies_text = cell(2)
+            if cookies_text:
+                cookies = {}
+                for pair in cookies_text.split(";"):
+                    if "=" in pair:
+                        key, value = pair.split("=", 1)
+                        cookies[key.strip()] = value.strip()
+                if cookies:
+                    record["cookies"] = cookies
+                else:
+                    record.pop("cookies", None)
+            else:
+                record.pop("cookies", None)
+
+            for key, value in (
+                ("verify_url", cell(3)),
+                ("success_marker", cell(4)),
+                ("role", cell(5)),
+            ):
+                if value:
+                    record[key] = value
+                else:
+                    record.pop(key, None)
+            records.append(record)
+        self._identity_records = records
 
     def _load_raw_config_editor(self):
         if not hasattr(self, "raw_config_editor"):
@@ -1613,8 +2453,7 @@ class MainWindow(QMainWindow):
 
         if not nodes:
             self.graph_view.setHtml(
-                "<html><body style='font-family:Arial;background:#eef2f7;"
-                "padding:24px;color:#334155;'>No asset graph available yet</body></html>"
+                EMPTY_GRAPH_HTML.format(message="No asset graph available yet")
             )
             return
 
@@ -1625,6 +2464,72 @@ class MainWindow(QMainWindow):
             height=max(640, self.graph_view.height() - 20),
         )
         self.graph_view.setHtml(html, QUrl.fromLocalFile(str(ROOT_DIR)))
+
+    def _attack_graph_path(self) -> Path:
+        target = self._target_output_name()
+        return self.output_dir / target / "attack_graph.json"
+
+    def _load_attack_graph(self):
+        if not hasattr(self, "attack_graph_view"):
+            return
+        data = self._read_json(self._attack_graph_path(), {})
+        self.current_attack_graph = data if isinstance(data, dict) else {}
+        self.refresh_attack_graph()
+
+    def refresh_attack_graph(self):
+        if not hasattr(self, "attack_graph_view"):
+            return
+        graph = self.current_attack_graph if isinstance(self.current_attack_graph, dict) else {}
+        nodes = graph.get("nodes") or []
+        edges = graph.get("edges") or []
+        plan = graph.get("probe_plan") or {}
+
+        if not nodes:
+            self.attack_graph_summary.setText("No attack graph loaded")
+            self.probe_plan_label.setText(
+                "Probe plan: not recorded — enable Engagement → Attack graph "
+                "(--pentest) and run."
+            )
+            self.probe_plan_table.setRowCount(0)
+            self.attack_graph_view.setHtml(
+                EMPTY_GRAPH_HTML.format(
+                    message="No attack graph yet. Enable Engagement → Attack graph "
+                            "(--pentest) and run the target."
+                )
+            )
+            return
+
+        proposed = sum(1 for edge in edges if (edge.get("attrs") or {}).get("proposed"))
+        self.attack_graph_summary.setText(
+            f"{len(nodes)} nodes, {len(edges)} edges ({proposed} proposed probe edge(s))"
+        )
+        if plan:
+            self.probe_plan_label.setText(
+                f"ceiling {plan.get('risk_ceiling', '?')} | "
+                f"{plan.get('surfaces_considered', 0)} surfaces considered | "
+                f"{plan.get('probes_proposed', 0)} probes proposed | "
+                f"cap {plan.get('capped_at', '-')}"
+            )
+            reasons = sorted(
+                (plan.get("not_proposed") or {}).items(),
+                key=lambda kv: -int(kv[1] or 0),
+            )
+        else:
+            self.probe_plan_label.setText("Probe plan: not recorded in this artifact")
+            reasons = []
+        self.probe_plan_table.setRowCount(len(reasons))
+        for row, (reason, count) in enumerate(reasons):
+            self.probe_plan_table.setItem(row, 0, QTableWidgetItem(str(reason)))
+            count_item = QTableWidgetItem(str(count))
+            count_item.setData(Qt.UserRole, int(count))
+            self.probe_plan_table.setItem(row, 1, count_item)
+
+        html = render_attack_html(
+            graph,
+            show_labels=len(nodes) <= 40,
+            height=max(560, self.attack_graph_view.height() - 20),
+        )
+        self.attack_graph_view.setHtml(html, QUrl.fromLocalFile(str(ROOT_DIR)))
 
     def _read_json(self, path: Path, default):
         if not path.exists():
@@ -1659,15 +2564,23 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "tools_table"):
             return
         available = tools_available()
-        rows = sorted(TOOL_PRIORITIES.items(), key=lambda item: (item[1][0] != "minimum", item[0]))
-        self.tools_table.setRowCount(len(rows))
-        for row, (tool, (priority, purpose)) in enumerate(rows):
-            ready = available.get(tool)
+        tools = sorted(TOOL_DEFINITIONS, key=lambda tool: tool.name)
+        self.tools_table.setRowCount(len(tools))
+        for row, tool in enumerate(tools):
+            ready = available.get(tool.name)
             if ready is None:
-                ready = shutil.which(tool) is not None
-            values = [tool, "yes" if ready else "no", priority, purpose]
+                ready = shutil.which(tool.name) is not None
+            values = [
+                tool.name,
+                "yes" if ready else "no",
+                ", ".join(tool.categories),
+                tool.description,
+            ]
             for col, value in enumerate(values):
-                self.tools_table.setItem(row, col, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                if col == 1:
+                    item.setForeground(QColor("#4ade80" if ready else "#f87171"))
+                self.tools_table.setItem(row, col, item)
 
     def _load_tools_requirements_preview(self):
         if not hasattr(self, "tools_requirements_preview"):
@@ -1685,6 +2598,21 @@ class MainWindow(QMainWindow):
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(TOOLS_REQUIREMENTS)))
 
+    def install_missing_tools(self):
+        if self.process and self.process.state() != QProcess.NotRunning:
+            return
+        # `--install-tools` still demands -t because the parser marks it
+        # required; the target is irrelevant to the install itself.
+        target = self.target_input.text().strip() or "localhost"
+        args = [
+            str(ORCHESTRATOR),
+            "-t", target,
+            "-o", str(self.output_dir),
+            "-c", str(self.config_path),
+            "--install-tools",
+        ]
+        self._start_process(args)
+
     def _qt_environment(self, env: dict):
         from PySide6.QtCore import QProcessEnvironment
 
@@ -1694,202 +2622,12 @@ class MainWindow(QMainWindow):
         return process_env
 
     def _apply_style(self):
-        self.setStyleSheet("""
-            QMainWindow, QWidget {
-                background: #090d13;
-                color: #dce7f3;
-                font-size: 13px;
-            }
-            #title {
-                color: #f8fafc;
-                font-size: 21px;
-                font-weight: 700;
-                letter-spacing: 0px;
-            }
-            #subtitle {
-                color: #7f8ea3;
-                font-size: 12px;
-            }
-            #status {
-                color: #ffccd2;
-                padding: 7px 12px;
-                border: 1px solid #7f1d1d;
-                border-radius: 4px;
-                background: #2a0f16;
-                font-weight: 700;
-            }
-            #sidePanel, #sideScroll, QGroupBox, QTabWidget::pane {
-                background: #101721;
-                border: 1px solid #223044;
-                border-radius: 6px;
-            }
-            #sideScroll {
-                border: 0;
-            }
-            QScrollArea > QWidget > QWidget {
-                background: #101721;
-            }
-            QScrollBar:vertical {
-                background: #0b111a;
-                width: 10px;
-                margin: 0;
-            }
-            QScrollBar::handle:vertical {
-                background: #334155;
-                border-radius: 4px;
-                min-height: 28px;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0;
-            }
-            QGroupBox {
-                margin-top: 10px;
-                padding: 10px;
-                font-weight: 600;
-                color: #f1f5f9;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 4px;
-                color: #ff6b7a;
-                background: #101721;
-            }
-            QLineEdit, QComboBox, QPlainTextEdit, QTextEdit, QTableWidget {
-                background: #0b111a;
-                border: 1px solid #29384d;
-                border-radius: 4px;
-                color: #e5edf6;
-                padding: 5px;
-                selection-background-color: #9f1239;
-            }
-            QHeaderView::section {
-                background: #151f2e;
-                border: 0;
-                border-right: 1px solid #26364c;
-                color: #9fb0c5;
-                padding: 6px;
-                font-weight: 700;
-            }
-            QTableWidget::item {
-                border-bottom: 1px solid #172233;
-                padding: 4px;
-            }
-            QTabBar::tab {
-                background: #0d1420;
-                color: #9fb0c5;
-                border: 1px solid #26364c;
-                padding: 7px 10px;
-                min-width: 70px;
-            }
-            QTabBar::tab:selected {
-                background: #7f1d1d;
-                color: #ffffff;
-                border-color: #ef4444;
-            }
-            QCheckBox {
-                color: #cbd5e1;
-                spacing: 8px;
-            }
-            QCheckBox::indicator {
-                width: 16px;
-                height: 16px;
-                border: 1px solid #40516b;
-                border-radius: 3px;
-                background: #0b111a;
-            }
-            QCheckBox::indicator:checked {
-                background: #be123c;
-                border-color: #fb7185;
-            }
-            QPushButton {
-                background: #7f1d1d;
-                color: #ffffff;
-                border: 1px solid #ef4444;
-                border-radius: 4px;
-                padding: 8px 10px;
-                font-weight: 600;
-                min-width: 0;
-            }
-            QPushButton:disabled {
-                background: #273244;
-                border-color: #334155;
-                color: #748299;
-            }
-            QPushButton:hover:!disabled {
-                background: #9f1239;
-            }
-            #opsStrip {
-                background: #101721;
-                border: 1px solid #223044;
-                border-left: 3px solid #ef4444;
-                border-radius: 6px;
-            }
-            #opsPrimary {
-                color: #f8fafc;
-                font-size: 15px;
-                font-weight: 700;
-            }
-            #opsSecondary {
-                color: #91a2b8;
-            }
-            #opsState {
-                color: #fecdd3;
-                background: #2a0f16;
-                border: 1px solid #7f1d1d;
-                border-radius: 4px;
-                padding: 9px 12px;
-                font-weight: 700;
-            }
-            QProgressBar {
-                background: #0b111a;
-                border: 1px solid #29384d;
-                border-radius: 4px;
-                color: #dce7f3;
-                text-align: center;
-                min-height: 20px;
-            }
-            QProgressBar::chunk {
-                background: #be123c;
-                border-radius: 3px;
-            }
-            #metricCard {
-                background: #0d1420;
-                border: 1px solid #26364c;
-                border-radius: 6px;
-            }
-            #metricCard[tone="danger"] {
-                border-color: #7f1d1d;
-            }
-            #metricCard[tone="warning"] {
-                border-color: #92400e;
-            }
-            #metricCard[tone="success"] {
-                border-color: #166534;
-            }
-            #metricLabel {
-                color: #7f8ea3;
-                font-size: 10px;
-                font-weight: 700;
-            }
-            #metricValue {
-                color: #f8fafc;
-                font-size: 18px;
-                font-weight: 800;
-            }
-            #assistantStatus {
-                color: #fecdd3;
-                background: #2a0f16;
-                border: 1px solid #7f1d1d;
-                border-radius: 4px;
-                padding: 8px;
-            }
-            #assistantStatus[ready="true"] {
-                color: #bbf7d0;
-                background: #0f2318;
-                border-color: #166534;
-            }
-        """)
+        theme_path = Path(__file__).with_name("theme.qss")
+        try:
+            qss = theme_path.read_text(encoding="utf-8")
+        except OSError:
+            return
+        self.setStyleSheet(qss)
 
 
 def main():

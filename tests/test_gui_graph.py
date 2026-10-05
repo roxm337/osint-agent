@@ -7,9 +7,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from gui.graph import (
     _patch_gravis_isolated_node_hover,
+    build_attack_display,
     build_display_graph,
     build_graph,
     graph_positions,
+    render_attack_html,
     render_gravis_html,
     to_gravis_graph,
 )
@@ -93,3 +95,42 @@ def test_gravis_html_guards_isolated_hover_sets():
 
     assert "adjacency.map.get(node) || new Set()" in patched
     assert "incidence.map.get(node) || new Set()" in patched
+
+
+def test_render_attack_html_is_dark_and_marks_proposed_probes():
+    attack_graph = {
+        "nodes": [
+            {"id": "goal:1", "type": "goal", "label": "steal session"},
+            {"id": "url:1", "type": "url", "label": "https://example.com/api"},
+            {"id": "vuln:1", "type": "vuln", "label": "SQLi"},
+        ],
+        "edges": [
+            {"source": "goal:1", "target": "url:1", "type": "extract",
+             "attrs": {"proposed": True, "action_id": "sqli_probe"}},
+            {"source": "url:1", "target": "vuln:1", "type": "affected_by", "attrs": {}},
+        ],
+        "probe_plan": {"risk_ceiling": "MEDIUM"},
+    }
+
+    html = render_attack_html(attack_graph, show_labels=True, height=560)
+
+    # Dark background and the proposed-probe hover label survive rendering.
+    assert "#090d13" in html
+    assert "proposed probe: sqli_probe" in html
+    assert "steal session" in html
+
+
+def test_build_attack_display_keeps_proposed_marker():
+    attack_graph = {
+        "nodes": [{"id": "a", "type": "goal"}],
+        "edges": [
+            {"source": "a", "target": "b", "type": "pivot",
+             "attrs": {"proposed": True, "action_id": "http_probe"}},
+        ],
+    }
+
+    display = build_attack_display(attack_graph)
+
+    edge = display["edges"][0]
+    assert edge["attrs"]["proposed"] is True
+    assert edge["attrs"]["action_id"] == "http_probe"

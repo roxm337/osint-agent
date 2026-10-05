@@ -161,6 +161,21 @@ python -m gui.app        # or: osint-agent-gui
 The GUI drives the same `orchestrator.py` engine (via `QProcess`), so GUI and CLI share
 identical state and config contracts.
 
+- **Engagement group** — `--pentest`, `--execute`, risk ceiling, max actions/chains.
+  Execution at MEDIUM and above asks for explicit confirmation first; the effective
+  flags and config file are echoed in the ops strip.
+- **Findings triage** — filter/search bar, numeric sort on score/severity/priority,
+  detail pane, and per-finding verdicts (`true_positive` / `false_positive` /
+  `out_of_scope` + notes) persisted to `<output>/<target>/<target>_triage.json`,
+  outside the engine's `state/`.
+- **Attack graph tab** — renders `attack_graph.json` (nodes, observed vs. proposed
+  probe edges) with the probe-plan summary (risk ceiling, surfaces considered,
+  reasons probes were not proposed).
+- **Settings** — LLM, Runtime (rate limits, module timeout, budget limits), Scanner
+  (auth + test identities), Actions (registered action list with risk), Tools
+  (status + install), API keys, raw YAML, plus File → "Use Config File…".
+- **Dark theme** lives in `gui/theme.qss`.
+
 ---
 
 ## Pipeline stages
@@ -201,8 +216,9 @@ python -m pytest --ignore=tests/test_gui_app.py --ignore=tests/test_gui_graph.py
 ```
 
 The suite covers core state, scoring, evidence, external-tool parsing, per-stage
-modules, the attack planner, and the action registry. **101 tests pass** including the
-GUI extras.
+modules, the attack planner, the action registry, and the GUI (findings triage,
+engagement gating, settings round-trips, attack-graph tab). **603 tests pass**
+including the GUI extras.
 
 ---
 
