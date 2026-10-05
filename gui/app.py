@@ -6,16 +6,19 @@ import json
 import os
 import shutil
 import sys
+import time
+from html import escape as html_escape
 from pathlib import Path
 from urllib.parse import urlparse
 
 import yaml
-from PySide6.QtCore import QProcess, Qt, QUrl
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont
+from PySide6.QtCore import QEvent, QProcess, QSize, QSettings, Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QKeySequence, QPalette, QShortcut
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -39,10 +42,13 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -121,6 +127,42 @@ def code_font(size: int = 12) -> QFont:
     return font
 
 
+def _dark_palette() -> QPalette:
+    """Dark Fusion palette.
+
+    Stylesheets do not cover every paint path — the tab-bar base line,
+    scroll-area corners and disabled texts still read the app palette, which
+    defaults to the light system theme and leaks white lines into the UI.
+    """
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor("#101721"))
+    palette.setColor(QPalette.WindowText, QColor("#dce7f3"))
+    palette.setColor(QPalette.Base, QColor("#0b111a"))
+    palette.setColor(QPalette.AlternateBase, QColor("#0d1420"))
+    palette.setColor(QPalette.ToolTipBase, QColor("#151f2e"))
+    palette.setColor(QPalette.ToolTipText, QColor("#e5edf6"))
+    palette.setColor(QPalette.Text, QColor("#e5edf6"))
+    palette.setColor(QPalette.Button, QColor("#151f2e"))
+    palette.setColor(QPalette.ButtonText, QColor("#dce7f3"))
+    palette.setColor(QPalette.BrightText, QColor("#f87171"))
+    palette.setColor(QPalette.Link, QColor("#7dd3fc"))
+    palette.setColor(QPalette.LinkVisited, QColor("#93c5fd"))
+    palette.setColor(QPalette.Highlight, QColor("#9f1239"))
+    palette.setColor(QPalette.HighlightedText, QColor("#ffffff"))
+    # Grayscale roles: QStyle frame/base lines (tab-bar base, scroll corners)
+    # read Light/Mid/Dark and would otherwise stay light-theme white.
+    palette.setColor(QPalette.Light, QColor("#3b5675"))
+    palette.setColor(QPalette.Midlight, QColor("#2b3c54"))
+    palette.setColor(QPalette.Mid, QColor("#223044"))
+    palette.setColor(QPalette.Dark, QColor("#172233"))
+    palette.setColor(QPalette.Shadow, QColor("#000000"))
+    palette.setColor(QPalette.Disabled, QPalette.WindowText, QColor("#5b6a80"))
+    palette.setColor(QPalette.Disabled, QPalette.Text, QColor("#5b6a80"))
+    palette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor("#5b6a80"))
+    palette.setColor(QPalette.Disabled, QPalette.HighlightedText, QColor("#5b6a80"))
+    return palette
+
+
 def build_scan_args(
     target: str,
     output_dir: Path | str,
@@ -166,10 +208,25 @@ def build_scan_args(
 
 
 class MainWindow(QMainWindow):
+    SCREEN_DEFS = [
+        ("run", "Run", QStyle.SP_MediaPlay,
+         "Control room: mission setup, run controls, live log"),
+        ("triage", "Triage", QStyle.SP_DialogApplyButton,
+         "Findings triage: filters, verdicts, detail pane"),
+        ("graph", "Graph", QStyle.SP_ComputerIcon,
+         "Asset graph and attack graph with probe plan"),
+        ("data", "Data", QStyle.SP_DirIcon,
+         "Assets, modules, evidence and submissions"),
+        ("report", "Report", QStyle.SP_FileIcon,
+         "Report, attack plan and summary JSON"),
+        ("settings", "Settings", QStyle.SP_FileDialogDetailedView,
+         "LLM, runtime, scanner, tools and config editor"),
+    ]
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("OSINT Agent")
-        self.resize(1280, 820)
+        self._settings = QSettings("osintAgent", "gui")
         self.process: QProcess | None = None
         self.running_report = False
         self.report_after_process = False
@@ -184,7 +241,24 @@ class MainWindow(QMainWindow):
         self._filtered_findings: list[dict] = []
         self.output_dir = ROOT_DIR / "reports"
         self.config_path = ROOT_DIR / "config.yaml"
+        self._run_started_at: float | None = None
+        # Timers exist before _build_ui so signal wiring in it is safe.
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._tick_run_progress)
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(750)
+        self._poll_timer.timeout.connect(self._poll_run_state)
+        # Debounced reload: typing a target must not re-read disk per keystroke.
+        self._target_reload_timer = QTimer(self)
+        self._target_reload_timer.setSingleShot(True)
+        self._target_reload_timer.setInterval(600)
+        self._target_reload_timer.timeout.connect(self.load_results)
         self._build_ui()
+        self.target_input.textChanged.connect(
+            lambda *_: self._target_reload_timer.start()
+        )
+        self._restore_window_state()
         self._apply_style()
         self._load_settings_form()
         self._refresh_module_list()
@@ -192,6 +266,44 @@ class MainWindow(QMainWindow):
         self._refresh_tools_status()
         self._prefer_llm_if_ready()
         self._update_operation_context()
+        # First window of a session opens on data, not on empty widgets.
+        last_target = self._settings.value("target", "", type=str)
+        if last_target:
+            self.target_input.setText(last_target)
+        try:
+            self.load_results()
+        except Exception:
+            pass  # a corrupt state file must never block startup
+        self._target_reload_timer.stop()
+
+    def _restore_window_state(self):
+        geometry = self._settings.value("geometry")
+        if geometry is not None:
+            try:
+                self.restoreGeometry(geometry)
+            except TypeError:
+                self.resize(1280, 820)
+        else:
+            self.resize(1280, 820)
+        self.setMinimumSize(1100, 720)
+        screen = self._settings.value("screen", 0, type=int)
+        self.show_screen(screen if isinstance(screen, int) else 0)
+
+    def closeEvent(self, event):
+        # A closing window must cancel pending work: the debounced target
+        # reload would otherwise fire from a hidden window long after close.
+        self._target_reload_timer.stop()
+        self._elapsed_timer.stop()
+        self._poll_timer.stop()
+        # Offscreen (test) runs must not clobber the operator's saved layout.
+        if os.environ.get("QT_QPA_PLATFORM") != "offscreen":
+            self._settings.setValue("geometry", self.saveGeometry())
+            self._settings.setValue(
+                "target", self.target_input.text().strip()
+            )
+            if hasattr(self, "screen_stack"):
+                self._settings.setValue("screen", self.screen_stack.currentIndex())
+        super().closeEvent(event)
 
     def _build_ui(self):
         root = QWidget()
@@ -200,6 +312,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
 
         header = QHBoxLayout()
+        header.setSpacing(10)
         title_stack = QVBoxLayout()
         title = QLabel("RED TEAM OPS CONSOLE")
         title.setObjectName("title")
@@ -207,38 +320,86 @@ class MainWindow(QMainWindow):
         subtitle.setObjectName("subtitle")
         title_stack.addWidget(title)
         title_stack.addWidget(subtitle)
+        header.addLayout(title_stack)
+
+        self.config_chip = QLabel(self.config_path.name)
+        self.config_chip.setObjectName("contextChip")
+        self.config_chip.setToolTip(str(self.config_path))
+        self.output_chip = QLabel(self._display_path(self.output_dir, 3))
+        self.output_chip.setObjectName("contextChip")
+        self.output_chip.setToolTip(str(self.output_dir))
+        header.addSpacing(8)
+        header.addWidget(self.config_chip)
+        header.addWidget(self.output_chip)
+        header.addStretch(1)
+
         self.status_label = QLabel("Idle")
         self.status_label.setObjectName("status")
-        header.addLayout(title_stack)
-        header.addStretch(1)
+        self.status_label.setProperty("state", "idle")
         header.addWidget(self.status_label)
         layout.addLayout(header)
 
-        workspace = QTabWidget()
-        workspace.setObjectName("workspaceTabs")
-        workspace.setDocumentMode(True)
-        workspace.tabBar().setUsesScrollButtons(True)
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        body.addWidget(self._build_nav_rail())
 
-        operations = QWidget()
-        operations_layout = QVBoxLayout(operations)
-        operations_layout.setContentsMargins(0, 0, 0, 0)
-        splitter = QSplitter(Qt.Horizontal)
-        results = self._build_results()
-        splitter.addWidget(self._build_controls())
-        splitter.addWidget(results)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setCollapsible(0, False)
-        splitter.setCollapsible(1, False)
-        splitter.setSizes([380, 1020])
-        operations_layout.addWidget(splitter, 1)
+        self.screen_stack = QStackedWidget()
+        self.screen_stack.setObjectName("screenStack")
+        # Build order must match SCREEN_DEFS (rail index == stack index).
+        self.screen_stack.addWidget(self._build_run_screen())
+        self.screen_stack.addWidget(self._build_triage_screen())
+        self.screen_stack.addWidget(self._build_graph_screen())
+        self.screen_stack.addWidget(self._build_data_screen())
+        self.screen_stack.addWidget(self._build_report_screen())
+        self.screen_stack.addWidget(self._build_settings_panel())
+        body.addWidget(self.screen_stack, 1)
+        layout.addLayout(body, 1)
 
-        workspace.addTab(operations, "Operations")
-        workspace.addTab(self._build_settings_panel(), "Settings")
-        layout.addWidget(workspace, 1)
+        self.status_bar_label = QLabel("")
+        self.status_bar_label.setObjectName("statusBarLabel")
+        self.statusBar().addWidget(self.status_bar_label, 1)
 
         self.setCentralWidget(root)
         self._build_menu()
+
+    def _build_nav_rail(self) -> QWidget:
+        rail = QWidget()
+        rail.setObjectName("navRail")
+        rail.setFixedWidth(78)
+        rail_layout = QVBoxLayout(rail)
+        rail_layout.setContentsMargins(6, 8, 6, 8)
+        rail_layout.setSpacing(4)
+        self.nav_group = QButtonGroup(self)
+        self.nav_group.setExclusive(True)
+        self.nav_buttons: list[QToolButton] = []
+        for index, (_key, label, icon, tip) in enumerate(self.SCREEN_DEFS):
+            button = QToolButton()
+            button.setObjectName("navButton")
+            button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+            button.setCheckable(True)
+            button.setAutoRaise(True)
+            button.setIcon(self.style().standardIcon(icon))
+            button.setIconSize(QSize(20, 20))
+            button.setText(label)
+            button.setToolTip(f"{tip}  (Ctrl+{index + 1})")
+            button.setFixedSize(66, 60)
+            button.clicked.connect(lambda _checked=False, i=index: self.show_screen(i))
+            self.nav_group.addButton(button, index)
+            self.nav_buttons.append(button)
+            rail_layout.addWidget(button)
+        rail_layout.addStretch(1)
+        if self.nav_buttons:
+            self.nav_buttons[0].setChecked(True)
+        return rail
+
+    def show_screen(self, index: int) -> None:
+        """Switch the stacked screen and keep rail, stack and settings in sync."""
+        if not 0 <= index < self.screen_stack.count():
+            return
+        self.screen_stack.setCurrentIndex(index)
+        if index < len(self.nav_buttons):
+            self.nav_buttons[index].setChecked(True)
+        self._settings.setValue("screen", index)
 
     def _build_menu(self):
         file_menu = self.menuBar().addMenu("File")
@@ -247,6 +408,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(open_output)
 
         use_config = QAction("Use Config File...", self)
+        use_config.setShortcut(QKeySequence("Ctrl+O"))
         use_config.triggered.connect(self.choose_config_file)
         file_menu.addAction(use_config)
 
@@ -255,8 +417,29 @@ class MainWindow(QMainWindow):
         file_menu.addAction(open_target)
 
         reload_report = QAction("Reload Current Results", self)
+        reload_report.setShortcuts([QKeySequence("F5"), QKeySequence("Ctrl+R")])
         reload_report.triggered.connect(self.load_results)
         file_menu.addAction(reload_report)
+
+        file_menu.addSeparator()
+        quit_action = QAction("Quit", self)
+        quit_action.setShortcut(QKeySequence("Ctrl+Q"))
+        quit_action.triggered.connect(self.close)
+        file_menu.addAction(quit_action)
+
+        operation_menu = self.menuBar().addMenu("Operation")
+        run_action = QAction("Run", self)
+        run_action.setShortcut(QKeySequence("Ctrl+Return"))
+        run_action.triggered.connect(self.start_scan)
+        operation_menu.addAction(run_action)
+
+        stop_action = QAction("Stop", self)
+        stop_action.triggered.connect(self.stop_scan)
+        operation_menu.addAction(stop_action)
+
+        report_action = QAction("Generate Report", self)
+        report_action.triggered.connect(self.generate_report)
+        operation_menu.addAction(report_action)
 
         settings_menu = self.menuBar().addMenu("Settings")
         reload_settings = QAction("Reload Config", self)
@@ -266,6 +449,12 @@ class MainWindow(QMainWindow):
         save_settings = QAction("Save Config", self)
         save_settings.triggered.connect(self._save_settings_form)
         settings_menu.addAction(save_settings)
+
+        # Ctrl+1..6 jump straight to a screen (the rail's tooltip order).
+        for index in range(len(self.SCREEN_DEFS)):
+            shortcut = QShortcut(QKeySequence(f"Ctrl+{index + 1}"), self)
+            shortcut.setContext(Qt.ApplicationShortcut)
+            shortcut.activated.connect(lambda i=index: self.show_screen(i))
 
     def _build_controls(self) -> QWidget:
         panel = QFrame()
@@ -280,6 +469,8 @@ class MainWindow(QMainWindow):
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.target_input = QLineEdit("get-ads.agency")
         self.target_input.setPlaceholderText("example.com")
+        # Enter in the target field is the classic "just run it" gesture.
+        self.target_input.returnPressed.connect(self.start_scan)
         self.target_input.setMinimumWidth(0)
         self.target_input.textChanged.connect(self._update_operation_context)
         self.output_input = QLineEdit(str(self.output_dir))
@@ -298,6 +489,10 @@ class MainWindow(QMainWindow):
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Auto", "LLM", "Single module"])
         self.mode_combo.setMinimumWidth(0)
+        self.mode_combo.setToolTip(
+            "Auto: run active modules. LLM: AI-guided run. "
+            "Single module: only the module selected below."
+        )
         self.mode_combo.currentIndexChanged.connect(self._sync_mode)
         self.mode_combo.currentIndexChanged.connect(self._update_operation_context)
         self.stage_filter_combo = QComboBox()
@@ -305,9 +500,15 @@ class MainWindow(QMainWindow):
         self.stage_filter_combo.addItem("All stages", 0)
         for stage in range(1, 7):
             self.stage_filter_combo.addItem(f"Stage {stage}", stage)
+        self.stage_filter_combo.setToolTip(
+            "Restrict the module list (and Auto runs) to one pipeline stage."
+        )
         self.stage_filter_combo.currentIndexChanged.connect(self._refresh_module_list)
         self.module_combo = QComboBox()
         self.module_combo.setMinimumWidth(0)
+        self.module_combo.setToolTip(
+            "Used by Single module mode and by the plan/probe actions."
+        )
         self.module_combo.currentIndexChanged.connect(self._update_module_hint)
         self.module_combo.currentIndexChanged.connect(self._update_operation_context)
         self.module_hint = QLabel("-")
@@ -335,6 +536,9 @@ class MainWindow(QMainWindow):
         self.risk_combo.addItems(["SAFE", "LOW", "MEDIUM", "HIGH", "DESTRUCTIVE"])
         self.risk_combo.setCurrentText("LOW")
         self.risk_combo.setMinimumWidth(0)
+        self.risk_combo.setToolTip(
+            "Highest action risk the AI attack plan may propose (pentest mode)."
+        )
         self.max_actions_spin = QSpinBox()
         self.max_actions_spin.setRange(0, 1000)
         self.max_actions_spin.setValue(25)
@@ -355,8 +559,10 @@ class MainWindow(QMainWindow):
         self.llm_status_label.setObjectName("assistantStatus")
         self.llm_status_label.setMinimumWidth(0)
         self.ai_run_button = QPushButton("AI Guided Run")
+        self.ai_run_button.setObjectName("btnPrimary")
         self.ai_run_button.clicked.connect(self.start_llm_scan)
         self.ai_plan_button = QPushButton("AI Attack Plan")
+        self.ai_plan_button.setObjectName("btnPrimary")
         self.ai_plan_button.clicked.connect(self.generate_attack_plan)
         ai_layout.addWidget(self.llm_status_label)
         ai_layout.addWidget(self.ai_run_button)
@@ -366,8 +572,12 @@ class MainWindow(QMainWindow):
         action_box = QGroupBox("Execution Controls")
         action_layout = QGridLayout(action_box)
         self.run_button = QPushButton("Run")
+        self.run_button.setObjectName("btnPrimary")
+        self.run_button.setDefault(True)
+        self.run_button.setAutoDefault(True)
         self.run_button.clicked.connect(self.start_scan)
         self.stop_button = QPushButton("Stop")
+        self.stop_button.setObjectName("btnDanger")
         self.stop_button.clicked.connect(self.stop_scan)
         self.stop_button.setEnabled(False)
         self.reload_button = QPushButton("Reload")
@@ -375,6 +585,7 @@ class MainWindow(QMainWindow):
         self.clear_button = QPushButton("Clear Log")
         self.clear_button.clicked.connect(self.log_output.clear)
         self.generate_report_button = QPushButton("Report")
+        self.generate_report_button.setObjectName("btnPrimary")
         self.generate_report_button.clicked.connect(self.generate_report)
         self.prioritize_button = QPushButton("Prioritize")
         self.prioritize_button.clicked.connect(self.prioritize_findings)
@@ -436,21 +647,6 @@ class MainWindow(QMainWindow):
         summary_layout.addLayout(secondary_layout)
         layout.addWidget(summary_box)
 
-        key_box = QGroupBox("Access Readiness")
-        key_layout = QVBoxLayout(key_box)
-        self.keys_table = QTableWidget(0, 3)
-        self.keys_table.setHorizontalHeaderLabels(["Service", "Ready", "Key"])
-        self.keys_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.keys_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.keys_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.keys_table.setMinimumWidth(0)
-        self.keys_table.setMaximumHeight(180)
-        key_layout.addWidget(self.keys_table)
-        self.refresh_keys_button = QPushButton("Refresh Keys")
-        self.refresh_keys_button.clicked.connect(self._refresh_key_status)
-        key_layout.addWidget(self.refresh_keys_button)
-        layout.addWidget(key_box)
-
         layout.addStretch(1)
         scroll = QScrollArea()
         scroll.setObjectName("sideScroll")
@@ -471,6 +667,9 @@ class MainWindow(QMainWindow):
         settings_tabs = QTabWidget()
         settings_tabs.setDocumentMode(True)
         settings_tabs.tabBar().setUsesScrollButtons(True)
+        # Fusion draws CE_TabBarBase with the light palette — a stray white
+        # line across the strip; we style the pane border instead.
+        settings_tabs.tabBar().setDrawBase(False)
         settings_tabs.addTab(self._build_llm_settings_tab(), "LLM")
         settings_tabs.addTab(self._build_runtime_settings_tab(), "Runtime")
         settings_tabs.addTab(self._build_scanner_settings_tab(), "Scanner")
@@ -889,6 +1088,21 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(12)
 
+        readiness_box = QGroupBox("Access Readiness")
+        readiness_layout = QVBoxLayout(readiness_box)
+        self.keys_table = QTableWidget(0, 3)
+        self.keys_table.setHorizontalHeaderLabels(["Service", "Ready", "Key"])
+        self.keys_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.keys_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.keys_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.keys_table.setMinimumWidth(0)
+        self.keys_table.setMaximumHeight(180)
+        readiness_layout.addWidget(self.keys_table)
+        self.refresh_keys_button = QPushButton("Refresh Keys")
+        self.refresh_keys_button.clicked.connect(self._refresh_key_status)
+        readiness_layout.addWidget(self.refresh_keys_button)
+        layout.addWidget(readiness_box)
+
         key_box = QGroupBox("Service API Keys")
         key_layout = QGridLayout(key_box)
         key_layout.addWidget(QLabel("Service"), 0, 0)
@@ -940,13 +1154,8 @@ class MainWindow(QMainWindow):
         layout.addLayout(button_row)
         return tab
 
-    def _build_results(self) -> QWidget:
-        results_widget = QWidget()
-        results_widget.setMinimumWidth(0)
-        results_layout = QVBoxLayout(results_widget)
-        results_layout.setContentsMargins(0, 0, 0, 0)
-        results_layout.setSpacing(10)
-
+    def _build_ops_strip(self) -> QFrame:
+        """Live run context: target, mode, state pill, progress, exposure."""
         ops_strip = QFrame()
         ops_strip.setObjectName("opsStrip")
         ops_layout = QGridLayout(ops_strip)
@@ -961,6 +1170,7 @@ class MainWindow(QMainWindow):
         self.operation_mode_label.setMinimumWidth(0)
         self.operation_state_label = QLabel("Ready")
         self.operation_state_label.setObjectName("opsState")
+        self.operation_state_label.setProperty("state", "idle")
         self.operation_state_label.setMinimumWidth(0)
         self.progress_bar = QProgressBar()
         self.progress_bar.setMinimumWidth(0)
@@ -978,20 +1188,51 @@ class MainWindow(QMainWindow):
         ops_layout.addWidget(self.exposure_label, 1, 2)
         ops_layout.setColumnStretch(0, 2)
         ops_layout.setColumnStretch(2, 3)
-        results_layout.addWidget(ops_strip)
+        return ops_strip
 
-        self.results_tabs = QTabWidget()
-        self.results_tabs.setDocumentMode(True)
-        self.results_tabs.tabBar().setUsesScrollButtons(True)
-        self.results_tabs.tabBar().setElideMode(Qt.ElideRight)
+    def _build_run_screen(self) -> QWidget:
+        """Screen 0: mission setup + live log (was: side panel + ops strip + Log tab)."""
+        page = QWidget()
+        page.setObjectName("screenRun")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
 
+        # Right pane first: the control panel wires buttons to log_output.
+        right = QWidget()
+        right.setMinimumWidth(420)
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(10)
+        right_layout.addWidget(self._build_ops_strip())
+
+        log_caption = QLabel("Run log")
+        log_caption.setObjectName("sectionCaption")
+        right_layout.addWidget(log_caption)
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.log_output.setFont(code_font(12))
-        self.results_tabs.addTab(self.log_output, "Log")
+        self.log_output.setPlaceholderText(
+            "Output from orchestrator.py appears here once a run starts."
+        )
+        right_layout.addWidget(self.log_output, 1)
 
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self._build_controls())
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        splitter.setSizes([380, 900])
+        layout.addWidget(splitter, 1)
+        return page
+
+    def _build_triage_screen(self) -> QWidget:
+        """Screen 1: findings filter bar, table and detail pane (was: Findings tab)."""
         findings_widget = QWidget()
+        findings_widget.setObjectName("screenTriage")
         findings_layout = QVBoxLayout(findings_widget)
         findings_layout.setContentsMargins(0, 0, 0, 0)
         findings_layout.setSpacing(6)
@@ -1018,18 +1259,23 @@ class MainWindow(QMainWindow):
         self.finding_triage_combo.addItems([
             "All triage", "Untriaged only", "True positive", "False positive", "Out of scope",
         ])
-        self.finding_count_label = QLabel("")
+        self.finding_count_label = QLabel("showing 0 of 0")
         self.finding_count_label.setObjectName("opsSecondary")
+        self.finding_search.setClearButtonEnabled(True)
         self.finding_search.textChanged.connect(self._apply_finding_filter)
         self.finding_severity_combo.currentIndexChanged.connect(self._apply_finding_filter)
         self.finding_confidence_combo.currentIndexChanged.connect(self._apply_finding_filter)
         self.finding_verified_combo.currentIndexChanged.connect(self._apply_finding_filter)
         self.finding_triage_combo.currentIndexChanged.connect(self._apply_finding_filter)
+        reset_filters_button = QPushButton("Reset")
+        reset_filters_button.setObjectName("btnGhost")
+        reset_filters_button.clicked.connect(self._reset_finding_filters)
         filter_row.addWidget(self.finding_search, 1)
         filter_row.addWidget(self.finding_severity_combo)
         filter_row.addWidget(self.finding_confidence_combo)
         filter_row.addWidget(self.finding_verified_combo)
         filter_row.addWidget(self.finding_triage_combo)
+        filter_row.addWidget(reset_filters_button)
         filter_row.addWidget(self.finding_count_label)
         findings_layout.addLayout(filter_row)
 
@@ -1048,6 +1294,7 @@ class MainWindow(QMainWindow):
         header.setSortIndicatorShown(True)
         header.sectionClicked.connect(self._sort_findings)
         self.findings_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.findings_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.findings_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.findings_table.customContextMenuRequested.connect(self._findings_context_menu)
         self.findings_table.itemSelectionChanged.connect(self._update_finding_detail)
@@ -1056,36 +1303,156 @@ class MainWindow(QMainWindow):
         self.finding_detail = QTextEdit()
         self.finding_detail.setReadOnly(True)
         self.finding_detail.setLineWrapMode(QTextEdit.NoWrap)
-        self.finding_detail.setMinimumHeight(90)
+        self.finding_detail.setMinimumHeight(160)
+        self.finding_detail.setPlaceholderText(
+            "Select a finding to see its description, remediation and evidence."
+        )
+
+        # Verdict bar: the analyst's primary controls, not buried in a menu.
+        detail_container = QWidget()
+        detail_layout = QVBoxLayout(detail_container)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        detail_layout.setSpacing(4)
+        verdict_row = QHBoxLayout()
+        verdict_row.setSpacing(6)
+        self.verdict_chip = QLabel("Untriaged")
+        self.verdict_chip.setObjectName("verdictChip")
+        self.verdict_chip.setProperty("verdict", "none")
+        verdict_row.addWidget(self.verdict_chip)
+        self.tp_button = QPushButton("True positive")
+        self.tp_button.setObjectName("btnVerdict")
+        self.tp_button.setToolTip("Mark selected finding(s) as true positive (t)")
+        self.tp_button.clicked.connect(lambda: self._apply_verdict_action("true_positive"))
+        self.fp_button = QPushButton("False positive")
+        self.fp_button.setObjectName("btnVerdict")
+        self.fp_button.setToolTip("Mark selected finding(s) as false positive (f)")
+        self.fp_button.clicked.connect(lambda: self._apply_verdict_action("false_positive"))
+        self.oos_button = QPushButton("Out of scope")
+        self.oos_button.setObjectName("btnVerdict")
+        self.oos_button.setToolTip("Mark selected finding(s) as out of scope (o)")
+        self.oos_button.clicked.connect(lambda: self._apply_verdict_action("out_of_scope"))
+        self.note_button = QPushButton("Note…")
+        self.note_button.setObjectName("btnGhost")
+        self.note_button.clicked.connect(self._edit_selected_note)
+        self.open_evidence_button = QPushButton("Open evidence")
+        self.open_evidence_button.setObjectName("btnGhost")
+        self.open_evidence_button.clicked.connect(self._open_selected_evidence)
+        self.filter_module_button = QPushButton("Filter by module")
+        self.filter_module_button.setObjectName("btnGhost")
+        self.filter_module_button.clicked.connect(self._filter_by_selected_module)
+        verdict_row.addWidget(self.tp_button)
+        verdict_row.addWidget(self.fp_button)
+        verdict_row.addWidget(self.oos_button)
+        verdict_row.addSpacing(8)
+        verdict_row.addWidget(self.note_button)
+        verdict_row.addWidget(self.open_evidence_button)
+        verdict_row.addWidget(self.filter_module_button)
+        verdict_row.addStretch(1)
+        detail_layout.addLayout(verdict_row)
+        detail_layout.addWidget(self.finding_detail, 1)
 
         finding_splitter = QSplitter(Qt.Vertical)
         finding_splitter.addWidget(self.findings_table)
-        finding_splitter.addWidget(self.finding_detail)
+        finding_splitter.addWidget(detail_container)
         finding_splitter.setStretchFactor(0, 3)
-        finding_splitter.setStretchFactor(1, 1)
+        finding_splitter.setStretchFactor(1, 2)
         findings_layout.addWidget(finding_splitter, 1)
-        self.results_tabs.addTab(findings_widget, "Findings")
 
-        self.assets_table = QTableWidget(0, 4)
-        self.assets_table.setHorizontalHeaderLabels(["Type", "Value", "Confidence", "Sources"])
-        self.assets_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.results_tabs.addTab(self.assets_table, "Assets")
+        # Keyboard: focus filter, triage letters when the table has focus.
+        find_shortcut = QShortcut(QKeySequence.Find, findings_widget)
+        find_shortcut.activated.connect(self.focus_finding_filter)
+        self.findings_table.installEventFilter(self)
+        return findings_widget
 
-        self.modules_table = QTableWidget(0, 8)
-        self.modules_table.setHorizontalHeaderLabels([
-            "Stage", "Module", "Status", "Detectability", "Requests", "Assets +", "Findings +", "Error",
-        ])
-        self.modules_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.modules_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
-        self.modules_table.setSortingEnabled(True)
-        self.results_tabs.addTab(self.modules_table, "Modules")
+    def eventFilter(self, obj, event):
+        if obj is getattr(self, "findings_table", None) and event.type() == QEvent.KeyPress:
+            key = event.key()
+            mapping = {
+                Qt.Key_T: "true_positive",
+                Qt.Key_F: "false_positive",
+                Qt.Key_O: "out_of_scope",
+            }
+            if key in mapping and event.modifiers() in (Qt.NoModifier, Qt.ShiftModifier):
+                self._apply_verdict_action(mapping[key])
+                return True
+        return super().eventFilter(obj, event)
 
-        self.evidence_table = QTableWidget(0, 5)
-        self.evidence_table.setHorizontalHeaderLabels(["ID", "Module", "Type", "Subject", "Path"])
-        self.evidence_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.evidence_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
-        self.evidence_table.cellDoubleClicked.connect(self._open_evidence_cell)
-        self.results_tabs.addTab(self.evidence_table, "Evidence")
+    def focus_finding_filter(self):
+        self.show_screen(1)
+        self.finding_search.setFocus()
+        self.finding_search.selectAll()
+
+    def _reset_finding_filters(self):
+        self.finding_search.clear()
+        self.finding_severity_combo.setCurrentIndex(0)
+        self.finding_confidence_combo.setCurrentIndex(0)
+        self.finding_verified_combo.setCurrentIndex(0)
+        self.finding_triage_combo.setCurrentIndex(0)
+
+    def _selected_findings(self) -> list[dict]:
+        """Every selected row, not just the current one — a 10-row selection
+        must not silently apply a verdict to a single finding."""
+        rows = sorted({index.row() for index in self.findings_table.selectedIndexes()})
+        by_id = {str(f.get("id", "")): f for f in self.current_findings}
+        picked = []
+        for row in rows:
+            item = self.findings_table.item(row, 0)
+            if item:
+                finding = by_id.get(item.text())
+                if finding is not None:
+                    picked.append(finding)
+        return picked
+
+    def _apply_verdict_action(self, verdict: str):
+        findings = self._selected_findings()
+        if not findings:
+            self.statusBar().showMessage("Select a finding first", 3000)
+            return
+        for finding in findings:
+            self._set_finding_verdict(finding, verdict, refilter=False)
+        self._apply_finding_filter()
+        label = VERDICT_LABELS.get(verdict, verdict) or "Untriaged"
+        if len(findings) == 1:
+            self.statusBar().showMessage(f"{findings[0].get('id')} → {label}", 4000)
+        else:
+            self.statusBar().showMessage(
+                f"{len(findings)} findings → {label}", 4000
+            )
+
+    def _edit_selected_note(self):
+        finding = self._selected_finding()
+        if not finding:
+            self.statusBar().showMessage("Select a finding first", 3000)
+            return
+        self._edit_triage_note(finding)
+
+    def _open_selected_evidence(self):
+        finding = self._selected_finding()
+        if not finding:
+            self.statusBar().showMessage("Select a finding first", 3000)
+            return
+        self._open_finding_evidence(finding)
+
+    def _filter_by_selected_module(self):
+        finding = self._selected_finding()
+        if not finding:
+            self.statusBar().showMessage("Select a finding first", 3000)
+            return
+        module_id = str(finding.get("module_id", ""))
+        if module_id:
+            self.finding_search.setText(module_id)
+
+    def _build_graph_screen(self) -> QWidget:
+        """Screen 2: asset graph + attack graph side by side in sub-tabs."""
+        page = QWidget()
+        page.setObjectName("screenGraph")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        tabs = QTabWidget()
+        tabs.setObjectName("screenTabs")
+        tabs.setDocumentMode(True)
+        tabs.tabBar().setUsesScrollButtons(True)
+        tabs.tabBar().setDrawBase(False)
 
         graph_widget = QWidget()
         graph_layout = QVBoxLayout(graph_widget)
@@ -1113,9 +1480,12 @@ class MainWindow(QMainWindow):
         graph_header.setColumnStretch(0, 1)
         graph_layout.addLayout(graph_header)
         self.graph_view = QWebEngineView()
+        # Default page background is white — a jarring flash before the
+        # dark graph html paints (and a white block in headless runs).
+        self.graph_view.page().setBackgroundColor(QColor("#090d13"))
         self.graph_view.setMinimumSize(0, 0)
         graph_layout.addWidget(self.graph_view, 1)
-        self.results_tabs.addTab(graph_widget, "Graph")
+        tabs.addTab(graph_widget, "Asset Graph")
 
         attack_widget = QWidget()
         attack_layout = QVBoxLayout(attack_widget)
@@ -1142,61 +1512,228 @@ class MainWindow(QMainWindow):
         attack_layout.addWidget(self.probe_plan_table)
 
         self.attack_graph_view = QWebEngineView()
+        self.attack_graph_view.page().setBackgroundColor(QColor("#090d13"))
         self.attack_graph_view.setMinimumSize(0, 0)
         attack_layout.addWidget(self.attack_graph_view, 1)
-        self.results_tabs.addTab(attack_widget, "Attack Graph")
+        tabs.addTab(attack_widget, "Attack Graph")
+
+        layout.addWidget(tabs, 1)
+        return page
+
+    def _build_data_screen(self) -> QWidget:
+        """Screen 3: assets, modules, evidence, submissions in sub-tabs."""
+        page = QWidget()
+        page.setObjectName("screenData")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        tabs = QTabWidget()
+        tabs.setObjectName("screenTabs")
+        tabs.setDocumentMode(True)
+        tabs.tabBar().setUsesScrollButtons(True)
+        tabs.tabBar().setDrawBase(False)
+        self._table_filters: dict[QTableWidget, tuple[QLineEdit, QLabel, QComboBox | None]] = {}
+
+        self.assets_table = QTableWidget(0, 4)
+        self.assets_table.setHorizontalHeaderLabels(["Type", "Value", "Confidence", "Sources"])
+        self.assets_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        tabs.addTab(self._wrap_data_tab(self.assets_table, "Filter assets…"), "Assets")
+
+        self.modules_table = QTableWidget(0, 8)
+        self.modules_table.setHorizontalHeaderLabels([
+            "Stage", "Module", "Status", "Detectability", "Requests", "Assets +", "Findings +", "Error",
+        ])
+        self.modules_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.modules_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
+        self.modules_table.setSortingEnabled(True)
+        status_combo = QComboBox()
+        status_combo.setObjectName("filterCombo")
+        status_combo.addItem("All statuses")
+        for status in (
+            "completed", "running", "pending", "timeout", "incomplete",
+            "error", "failed", "blocked", "skipped",
+        ):
+            status_combo.addItem(status)
+        status_combo.setToolTip("Show only modules with this status")
+        tabs.addTab(
+            self._wrap_data_tab(self.modules_table, "Filter modules…", status_combo),
+            "Modules",
+        )
+
+        self.evidence_table = QTableWidget(0, 5)
+        self.evidence_table.setHorizontalHeaderLabels(["ID", "Module", "Type", "Subject", "Path"])
+        self.evidence_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.evidence_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.evidence_table.cellDoubleClicked.connect(self._open_evidence_cell)
+        tabs.addTab(self._wrap_data_tab(self.evidence_table, "Filter evidence…"), "Evidence")
 
         self.submissions_table = QTableWidget(0, 3)
         self.submissions_table.setHorizontalHeaderLabels(["File", "Size", "Path"])
         self.submissions_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.submissions_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.submissions_table.cellDoubleClicked.connect(self._open_submission_cell)
-        self.results_tabs.addTab(self.submissions_table, "Submissions")
+        tabs.addTab(
+            self._wrap_data_tab(self.submissions_table, "Filter submissions…"),
+            "Submissions",
+        )
 
-        report_widget = QWidget()
-        report_layout = QVBoxLayout(report_widget)
-        report_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(tabs, 1)
+        return page
+
+    def _wrap_data_tab(
+        self, table: QTableWidget, placeholder: str, status_combo: QComboBox | None = None
+    ) -> QWidget:
+        """Filter bar + table, with search, status combo, and live counts."""
+        page = QWidget()
+        bar_layout = QHBoxLayout()
+        bar_layout.setContentsMargins(0, 0, 0, 0)
+        bar_layout.setSpacing(6)
+        search = QLineEdit()
+        search.setPlaceholderText(placeholder)
+        search.setClearButtonEnabled(True)
+        count_label = QLabel("0 of 0")
+        count_label.setObjectName("opsSecondary")
+        bar_layout.addWidget(search, 1)
+        if status_combo is not None:
+            bar_layout.addWidget(status_combo)
+        bar_layout.addWidget(count_label)
+        table_layout = QVBoxLayout(page)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.setSpacing(4)
+        table_layout.addLayout(bar_layout)
+        table_layout.addWidget(table, 1)
+
+        self._table_filters[table] = (search, count_label, status_combo)
+        search.textChanged.connect(lambda _text, t=table: self._apply_table_filter(t))
+        if status_combo is not None:
+            status_combo.currentIndexChanged.connect(
+                lambda _index, t=table: self._apply_table_filter(t)
+            )
+        # Sorting moves rows under a live filter; re-apply so hidden rows
+        # stay hidden in the new order.
+        table.horizontalHeader().sortIndicatorChanged.connect(
+            lambda _order, _sec, t=table: self._apply_table_filter(t)
+        )
+        table.setSortingEnabled(True)
+        table.horizontalHeader().setSortIndicatorShown(True)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setContextMenuPolicy(Qt.CustomContextMenu)
+        table.customContextMenuRequested.connect(
+            lambda pos, t=table: self._table_context_menu(t, pos)
+        )
+        return page
+
+    def _apply_table_filter(self, table: QTableWidget):
+        entry = getattr(self, "_table_filters", {}).get(table)
+        if not entry:
+            return
+        search, count_label, status_combo = entry
+        query = search.text().strip().lower()
+        status = ""
+        if status_combo is not None and status_combo.currentIndex() > 0:
+            status = status_combo.currentText().strip().lower()
+        total = table.rowCount()
+        visible = 0
+        for row in range(total):
+            matches_query = not query
+            if query:
+                for col in range(table.columnCount()):
+                    item = table.item(row, col)
+                    if item and query in item.text().lower():
+                        matches_query = True
+                        break
+            matches_status = True
+            if status:
+                item = table.item(row, 2)
+                matches_status = item is not None and item.text().strip().lower() == status
+            show = matches_query and matches_status
+            table.setRowHidden(row, not show)
+            if show:
+                visible += 1
+        count_label.setText(f"{visible} of {total}")
+
+    def _table_context_menu(self, table: QTableWidget, pos):
+        index = table.indexAt(pos)
+        menu = QMenu(self)
+        copy_cell_action = menu.addAction("Copy cell")
+        copy_row_action = menu.addAction("Copy row")
+        copy_tsv_action = menu.addAction("Copy selected rows (TSV)")
+        chosen = menu.exec(table.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        clipboard = QApplication.clipboard()
+        if chosen is copy_cell_action:
+            item = table.item(index.row(), index.column()) if index.isValid() else None
+            if item:
+                clipboard.setText(item.text())
+                self.statusBar().showMessage("Cell copied", 2000)
+        elif chosen is copy_row_action:
+            row = index.row()
+            texts = []
+            for col in range(table.columnCount()):
+                item = table.item(row, col)
+                texts.append(item.text() if item else "")
+            clipboard.setText("\t".join(texts))
+            self.statusBar().showMessage(f"Row {row + 1} copied", 2000)
+        elif chosen is copy_tsv_action:
+            rows = sorted({i.row() for i in table.selectedIndexes()})
+            lines = []
+            for row in rows:
+                texts = []
+                for col in range(table.columnCount()):
+                    item = table.item(row, col)
+                    texts.append(item.text() if item else "")
+                lines.append("\t".join(texts))
+            clipboard.setText("\n".join(lines))
+            self.statusBar().showMessage(f"{len(lines)} row(s) copied", 2000)
+
+    def _build_report_screen(self) -> QWidget:
+        """Screen 4: report preview, markdown, attack plan, summary JSON."""
+        page = QWidget()
+        page.setObjectName("screenReport")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        path_row = QHBoxLayout()
+        path_row.setSpacing(16)
         self.report_path_label = QLabel("No report loaded")
         self.report_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.report_path_label.setWordWrap(True)
         self.report_path_label.setMinimumWidth(0)
-        report_layout.addWidget(self.report_path_label)
+        self.attack_plan_path_label = QLabel("No attack plan loaded")
+        self.attack_plan_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.attack_plan_path_label.setWordWrap(True)
+        self.attack_plan_path_label.setMinimumWidth(0)
+        path_row.addWidget(self.report_path_label, 1)
+        path_row.addWidget(self.attack_plan_path_label, 1)
+        layout.addLayout(path_row)
 
-        report_tabs = QTabWidget()
-        report_tabs.tabBar().setUsesScrollButtons(True)
-        report_tabs.tabBar().setElideMode(Qt.ElideRight)
+        tabs = QTabWidget()
+        tabs.setObjectName("screenTabs")
+        tabs.setDocumentMode(True)
+        tabs.tabBar().setUsesScrollButtons(True)
+        tabs.tabBar().setElideMode(Qt.ElideRight)
+        tabs.tabBar().setDrawBase(False)
         self.report_preview = QTextEdit()
         self.report_preview.setReadOnly(True)
         self.report_raw = QPlainTextEdit()
         self.report_raw.setReadOnly(True)
         self.report_raw.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.report_raw.setFont(code_font(12))
-        report_tabs.addTab(self.report_preview, "Rendered")
-        report_tabs.addTab(self.report_raw, "Markdown")
-        report_layout.addWidget(report_tabs, 1)
-        self.results_tabs.addTab(report_widget, "Report")
-
-        attack_plan_widget = QWidget()
-        attack_plan_layout = QVBoxLayout(attack_plan_widget)
-        attack_plan_layout.setContentsMargins(0, 0, 0, 0)
-        self.attack_plan_path_label = QLabel("No attack plan loaded")
-        self.attack_plan_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.attack_plan_path_label.setWordWrap(True)
-        self.attack_plan_path_label.setMinimumWidth(0)
-        attack_plan_layout.addWidget(self.attack_plan_path_label)
         self.attack_plan_preview = QTextEdit()
         self.attack_plan_preview.setReadOnly(True)
-        attack_plan_layout.addWidget(self.attack_plan_preview, 1)
-        self.results_tabs.addTab(attack_plan_widget, "Attack Plan")
-
         self.summary_json = QPlainTextEdit()
         self.summary_json.setReadOnly(True)
         self.summary_json.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.summary_json.setFont(code_font(12))
-        self.results_tabs.addTab(self.summary_json, "Summary JSON")
-
-        results_layout.addWidget(self.results_tabs, 1)
-        return results_widget
+        tabs.addTab(self.report_preview, "Rendered")
+        tabs.addTab(self.report_raw, "Markdown")
+        tabs.addTab(self.attack_plan_preview, "Attack Plan")
+        tabs.addTab(self.summary_json, "Summary JSON")
+        layout.addWidget(tabs, 1)
+        return page
 
     def _metric_card(self, label: str, value_label: QLabel, tone: str) -> QFrame:
         card = QFrame()
@@ -1320,6 +1857,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Target Required", "Enter a target domain.")
             return
         if self.process and self.process.state() != QProcess.NotRunning:
+            self.statusBar().showMessage("Already running — wait for the current process", 3000)
             return
         if not self._confirm_engagement():
             return
@@ -1366,6 +1904,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Target Required", "Enter a target domain.")
             return
         if self.process and self.process.state() != QProcess.NotRunning:
+            self.statusBar().showMessage("Already running — wait for the current process", 3000)
             return
         args = build_scan_args(
             target=target,
@@ -1389,14 +1928,84 @@ class MainWindow(QMainWindow):
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
+    def _set_status(self, state: str, text: str, ops_text: str | None = None):
+        """Drive the header pill and ops-strip badge from one state value.
+
+        `state` is one of idle / busy / ok / error; theme.qss styles each via
+        `[state="..."]` so a failure can never look like a success.
+        """
+        self.status_label.setText(text)
+        self.status_label.setProperty("state", state)
+        self.status_label.style().unpolish(self.status_label)
+        self.status_label.style().polish(self.status_label)
+        if hasattr(self, "operation_state_label"):
+            self.operation_state_label.setText(ops_text or text)
+            self.operation_state_label.setProperty("state", state)
+            self.operation_state_label.style().unpolish(self.operation_state_label)
+            self.operation_state_label.style().polish(self.operation_state_label)
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        total = int(max(0, seconds))
+        return f"{total // 60:02d}:{total % 60:02d}"
+
+    def _stop_run_timers(self):
+        self._elapsed_timer.stop()
+        self._poll_timer.stop()
+        self._run_started_at = None
+
+    def _tick_run_progress(self):
+        if self._run_started_at is None:
+            return
+        elapsed = self._format_elapsed(time.monotonic() - self._run_started_at)
+        total = max(len(get_all_module_ids()), 1)
+        completed = len((self.current_module or {}).get("completed", []))
+        self.status_label.setText(f"Running · {completed}/{total} · {elapsed}")
+
+    def _poll_run_state(self):
+        """Tail state/module.json so metrics move while the engine runs.
+
+        The orchestrator persists state at least five times per run, so a
+        750ms poll shows module completions almost immediately instead of
+        freezing the progress bar at its pre-run value.
+        """
+        target_dir = self.output_dir / self._target_output_name()
+        module = self._read_json(target_dir / "state" / "module.json", {})
+        if isinstance(module, dict) and module:
+            self.current_module = module
+            stats = module.get("stats", {})
+            completed = len(module.get("completed", []))
+            total = max(len(get_all_module_ids()), 1)
+            self.progress_bar.setValue(min(100, int((completed / total) * 100)))
+            suffix = f", {self._incomplete_count(module)} incomplete" \
+                if self._incomplete_count(module) else ""
+            self.progress_bar.setFormat(f"{completed}/{total} modules complete{suffix}")
+            self.completed_value.setText(str(completed))
+            self.skipped_value.setText(str(len(module.get("skipped", []))))
+            self.blocked_value.setText(str(len(module.get("blocked", []))))
+            self.incomplete_value.setText(str(self._incomplete_count(module)))
+            self.requests_value.setText(str(stats.get("total_requests", "-")))
+        self._tick_run_progress()
+
+    def _restore_run_buttons(self):
+        self.run_button.setEnabled(True)
+        self.ai_run_button.setEnabled(True)
+        self.ai_plan_button.setEnabled(True)
+        self.generate_report_button.setEnabled(True)
+        self.prioritize_button.setEnabled(True)
+        self.submission_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+
     def _start_process(self, args: list[str], report_run: bool = False):
         self.running_report = report_run
-        self.log_output.appendPlainText(f"$ {sys.executable} {' '.join(args)}\n")
-        self.status_label.setText("Running")
-        self.operation_state_label.setText("Operation active")
-        if report_run:
-            self.status_label.setText("Generating report")
-            self.operation_state_label.setText("Report generation")
+        stamp = time.strftime("%H:%M:%S")
+        self.log_output.appendPlainText(
+            f"\n── run {stamp} {'(report)' if report_run else ''} ──\n"
+            f"$ {sys.executable} {' '.join(args)}\n"
+        )
+        ops_text = "Report generation" if report_run else "Operation active"
+        pill_text = "Generating report" if report_run else "Running"
+        self._set_status("busy", pill_text, ops_text)
         self.run_button.setEnabled(False)
         self.ai_run_button.setEnabled(False)
         self.ai_plan_button.setEnabled(False)
@@ -1418,13 +2027,42 @@ class MainWindow(QMainWindow):
         self.process.readyReadStandardOutput.connect(self._read_stdout)
         self.process.readyReadStandardError.connect(self._read_stderr)
         self.process.finished.connect(self._process_finished)
+        self.process.errorOccurred.connect(self._process_error)
         self.process.start()
+        self._run_started_at = time.monotonic()
+        self._elapsed_timer.start()
+        self._poll_timer.start()
+
+    def _process_error(self, error):
+        """A failed start never fires `finished` — without this the Run
+        button would stay disabled forever."""
+        if error != QProcess.FailedToStart:
+            # Crashes still emit `finished`; just mark the log now.
+            self.log_output.appendHtml(
+                f'<span style="color:#f87171">process error: '
+                f"{html_escape(self.process.errorString() if self.process else str(error))}"
+                "</span>"
+            )
+            return
+        self._stop_run_timers()
+        detail = self.process.errorString() if self.process else str(error)
+        self._restore_run_buttons()
+        self._set_status("error", "Failed to start")
+        self.log_output.appendHtml(
+            f'<span style="color:#f87171">failed to start orchestrator: '
+            f"{html_escape(detail)}</span>"
+        )
+        QMessageBox.warning(
+            self, "Run Failed",
+            f"Could not start the orchestrator:\n{detail}",
+        )
 
     def stop_scan(self):
         if self.process and self.process.state() != QProcess.NotRunning:
             self.process.terminate()
             if not self.process.waitForFinished(2000):
                 self.process.kill()
+        self._stop_run_timers()
 
     def _read_stdout(self):
         if not self.process:
@@ -1436,9 +2074,12 @@ class MainWindow(QMainWindow):
         if not self.process:
             return
         text = bytes(self.process.readAllStandardError()).decode("utf-8", errors="replace")
-        self.log_output.appendPlainText(text.rstrip())
+        self.log_output.appendHtml(
+            f'<span style="color:#f87171">{html_escape(text.rstrip())}</span>'
+        )
 
     def _process_finished(self, exit_code: int, _status):
+        self._stop_run_timers()
         was_report = self.running_report
         self.running_report = False
         self.load_results()
@@ -1452,15 +2093,16 @@ class MainWindow(QMainWindow):
             return
 
         self.report_after_process = False
-        self.status_label.setText(f"Finished ({exit_code})")
-        self.operation_state_label.setText(f"Finished ({exit_code})")
-        self.run_button.setEnabled(True)
-        self.ai_run_button.setEnabled(True)
-        self.ai_plan_button.setEnabled(True)
-        self.generate_report_button.setEnabled(True)
-        self.prioritize_button.setEnabled(True)
-        self.submission_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
+        if exit_code == 0:
+            self._set_status("ok", "Completed", "Results loaded")
+            self.log_output.appendPlainText("── run finished successfully ──")
+        else:
+            self._set_status("error", f"Failed (exit {exit_code})", f"Failed (exit {exit_code})")
+            self.log_output.appendHtml(
+                f'<span style="color:#f87171">── run failed with exit code '
+                f"{exit_code} ──</span>"
+            )
+        self._restore_run_buttons()
         self._sync_mode()
 
     def load_results(self):
@@ -1558,6 +2200,14 @@ class MainWindow(QMainWindow):
             self.llm_settings_status.setProperty("ready", ready)
             self.llm_settings_status.style().unpolish(self.llm_settings_status)
             self.llm_settings_status.style().polish(self.llm_settings_status)
+
+        self.config_chip.setText(self.config_path.name)
+        self.config_chip.setToolTip(str(self.config_path))
+        self.output_chip.setText(self._display_path(self.output_dir, 3))
+        self.output_chip.setToolTip(str(self.output_dir))
+        self.status_bar_label.setText(
+            f"config: {self.config_path}   ·   output: {self.output_dir}"
+        )
 
         module_state = self.current_module if isinstance(self.current_module, dict) else {}
         completed = len(module_state.get("completed", []))
@@ -1690,6 +2340,12 @@ class MainWindow(QMainWindow):
         self._populate_findings(getattr(self, "_filtered_findings", self.current_findings))
 
     def _populate_findings(self, findings: list[dict]):
+        # Keep the analyst's place: repopulating after a verdict/note used to
+        # clear the selection and reset the detail pane mid-triage.
+        previous = self._selected_finding()
+        previous_id = str(previous.get("id", "")) if previous else ""
+        scroll_value = self.findings_table.verticalScrollBar().value()
+
         column, order = self._findings_sort
         reverse = order == Qt.DescendingOrder
         ordered = sorted(findings, key=self._finding_sort_key(column), reverse=reverse)
@@ -1731,6 +2387,13 @@ class MainWindow(QMainWindow):
         self.finding_count_label.setText(
             f"showing {len(ordered)} of {len(self.current_findings)}"
         )
+        if previous_id:
+            for row in range(self.findings_table.rowCount()):
+                item = self.findings_table.item(row, 0)
+                if item and item.text() == previous_id:
+                    self.findings_table.selectRow(row)
+                    self.findings_table.verticalScrollBar().setValue(scroll_value)
+                    break
         self._update_finding_detail()
 
     def _verdict_of(self, finding: dict) -> str:
@@ -1760,8 +2423,19 @@ class MainWindow(QMainWindow):
             self.finding_detail.setPlainText(
                 "Select a finding to see its description, remediation and evidence."
             )
+            if hasattr(self, "verdict_chip"):
+                self.verdict_chip.setText("Untriaged")
+                self.verdict_chip.setProperty("verdict", "")
+                self.verdict_chip.style().unpolish(self.verdict_chip)
+                self.verdict_chip.style().polish(self.verdict_chip)
             return
         verdict = self._verdict_of(finding)
+        if hasattr(self, "verdict_chip"):
+            chip_text = VERDICT_LABELS.get(verdict, verdict) if verdict else "Untriaged"
+            self.verdict_chip.setText(chip_text)
+            self.verdict_chip.setProperty("verdict", verdict or "none")
+            self.verdict_chip.style().unpolish(self.verdict_chip)
+            self.verdict_chip.style().polish(self.verdict_chip)
         entry = self._triage.get(str(finding.get("id", "")), {})
         note = str(entry.get("note", "")) if isinstance(entry, dict) else ""
         lines = [
@@ -1804,14 +2478,20 @@ class MainWindow(QMainWindow):
         self.finding_detail.setPlainText("\n".join(lines))
 
     def _findings_context_menu(self, pos):
-        finding = self._selected_finding()
-        if not finding:
+        findings = self._selected_findings()
+        if not findings:
             return
+        finding = findings[0]
+        count = len(findings)
         menu = QMenu(self)
-        copy_action = menu.addAction("Copy finding ID")
+        copy_action = menu.addAction(
+            "Copy finding ID" if count == 1 else f"Copy finding ID ({count} findings)"
+        )
         evidence_action = menu.addAction("Open evidence file")
         menu.addSeparator()
-        verdict_menu = menu.addMenu("Set verdict")
+        verdict_menu = menu.addMenu(
+            "Set verdict" if count == 1 else f"Set verdict on {count} findings"
+        )
         verdict_actions = {
             verdict_menu.addAction(label): verdict
             for verdict, label in (
@@ -1826,18 +2506,36 @@ class MainWindow(QMainWindow):
         if chosen is None:
             return
         if chosen is copy_action:
-            QApplication.clipboard().setText(str(finding.get("id", "")))
-            self.status_label.setText(f"Copied {finding.get('id')}")
+            if count == 1:
+                QApplication.clipboard().setText(str(finding.get("id", "")))
+            else:
+                QApplication.clipboard().setText(
+                    "\n".join(str(f.get("id", "")) for f in findings)
+                )
+            self.statusBar().showMessage(f"Copied {count} finding id(s)", 3000)
         elif chosen is evidence_action:
             self._open_finding_evidence(finding)
         elif chosen is clear_action:
-            self._set_finding_verdict(finding, "")
+            for selected in findings:
+                self._set_finding_verdict(selected, "", refilter=False)
+            self._apply_finding_filter()
+            if count > 1:
+                self.statusBar().showMessage(
+                    f"Cleared verdict on {count} findings", 4000
+                )
         elif chosen in verdict_actions:
-            self._set_finding_verdict(finding, verdict_actions[chosen])
+            verdict = verdict_actions[chosen]
+            for selected in findings:
+                self._set_finding_verdict(selected, verdict, refilter=False)
+            self._apply_finding_filter()
+            if count > 1:
+                self.statusBar().showMessage(
+                    f"{count} findings → {VERDICT_LABELS.get(verdict, verdict)}", 4000
+                )
         elif chosen is note_action:
             self._edit_triage_note(finding)
 
-    def _set_finding_verdict(self, finding: dict, verdict: str):
+    def _set_finding_verdict(self, finding: dict, verdict: str, refilter: bool = True):
         finding_id = str(finding.get("id", ""))
         if not finding_id:
             return
@@ -1851,7 +2549,8 @@ class MainWindow(QMainWindow):
             if not entry:
                 self._triage.pop(finding_id, None)
         self._write_triage()
-        self._apply_finding_filter()
+        if refilter:
+            self._apply_finding_filter()
 
     def _edit_triage_note(self, finding: dict):
         finding_id = str(finding.get("id", ""))
@@ -1908,6 +2607,7 @@ class MainWindow(QMainWindow):
 
 
     def _load_assets(self, assets: list[dict]):
+        self.assets_table.setSortingEnabled(False)
         self.assets_table.setRowCount(len(assets))
         for row, asset in enumerate(assets):
             values = [
@@ -1918,6 +2618,8 @@ class MainWindow(QMainWindow):
             ]
             for col, value in enumerate(values):
                 self.assets_table.setItem(row, col, QTableWidgetItem(value))
+        self.assets_table.setSortingEnabled(True)
+        self._apply_table_filter(self.assets_table)
 
     def _incomplete_count(self, module: dict) -> int:
         """Modules whose latest run timed out or errored without ever finishing.
@@ -2003,8 +2705,10 @@ class MainWindow(QMainWindow):
                     item.setToolTip(str(value))
                 self.modules_table.setItem(row, col, item)
         self.modules_table.setSortingEnabled(True)
+        self._apply_table_filter(self.modules_table)
 
     def _load_evidence(self, items: list[dict]):
+        self.evidence_table.setSortingEnabled(False)
         self.evidence_table.setRowCount(len(items))
         for row, item in enumerate(items):
             values = [
@@ -2016,16 +2720,24 @@ class MainWindow(QMainWindow):
             ]
             for col, value in enumerate(values):
                 self.evidence_table.setItem(row, col, QTableWidgetItem(value))
+        self.evidence_table.setSortingEnabled(True)
+        self._apply_table_filter(self.evidence_table)
 
     def _load_submissions(self):
         target = self._target_output_name()
         submission_dir = self.output_dir / target / "submissions"
         files = sorted(submission_dir.glob("*.md")) if submission_dir.exists() else []
+        self.submissions_table.setSortingEnabled(False)
         self.submissions_table.setRowCount(len(files))
         for row, path in enumerate(files):
             values = [path.name, str(path.stat().st_size), str(path)]
             for col, value in enumerate(values):
-                self.submissions_table.setItem(row, col, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                if col == 1:
+                    item.setData(Qt.UserRole, path.stat().st_size)
+                self.submissions_table.setItem(row, col, item)
+        self.submissions_table.setSortingEnabled(True)
+        self._apply_table_filter(self.submissions_table)
 
     def _load_summary_json(self, summary: dict):
         if summary:
@@ -2455,6 +3167,7 @@ class MainWindow(QMainWindow):
             self.graph_view.setHtml(
                 EMPTY_GRAPH_HTML.format(message="No asset graph available yet")
             )
+            self._graph_render_key = None
             return
 
         html = render_gravis_html(
@@ -2463,7 +3176,26 @@ class MainWindow(QMainWindow):
             show_edges=self.graph_edges_check.isChecked(),
             height=max(640, self.graph_view.height() - 20),
         )
-        self.graph_view.setHtml(html, QUrl.fromLocalFile(str(ROOT_DIR)))
+        # Skip identical re-renders (load_results runs on many events) and
+        # defer the paint so startup/refresh work doesn't block the UI thread.
+        render_key = (
+            len(nodes),
+            len(edges),
+            str(nodes[0].get("id", "")) if nodes else "",
+            str(nodes[-1].get("id", "")) if nodes else "",
+            self.graph_labels_check.isChecked(),
+            self.graph_edges_check.isChecked(),
+            self.graph_aggregate_check.isChecked(),
+        )
+        if getattr(self, "_graph_render_key", None) == render_key:
+            return
+        self._graph_render_key = render_key
+        QTimer.singleShot(
+            0,
+            lambda: self.graph_view.setHtml(
+                html, QUrl.fromLocalFile(str(ROOT_DIR))
+            ),
+        )
 
     def _attack_graph_path(self) -> Path:
         target = self._target_output_name()
@@ -2497,6 +3229,7 @@ class MainWindow(QMainWindow):
                             "(--pentest) and run the target."
                 )
             )
+            self._attack_render_key = None
             return
 
         proposed = sum(1 for edge in edges if (edge.get("attrs") or {}).get("proposed"))
@@ -2529,7 +3262,21 @@ class MainWindow(QMainWindow):
             show_labels=len(nodes) <= 40,
             height=max(560, self.attack_graph_view.height() - 20),
         )
-        self.attack_graph_view.setHtml(html, QUrl.fromLocalFile(str(ROOT_DIR)))
+        render_key = (
+            len(nodes),
+            len(edges),
+            str(nodes[0].get("id", "")) if nodes else "",
+            str(nodes[-1].get("id", "")) if nodes else "",
+        )
+        if getattr(self, "_attack_render_key", None) == render_key:
+            return
+        self._attack_render_key = render_key
+        QTimer.singleShot(
+            0,
+            lambda: self.attack_graph_view.setHtml(
+                html, QUrl.fromLocalFile(str(ROOT_DIR))
+            ),
+        )
 
     def _read_json(self, path: Path, default):
         if not path.exists():
@@ -2600,6 +3347,7 @@ class MainWindow(QMainWindow):
 
     def install_missing_tools(self):
         if self.process and self.process.state() != QProcess.NotRunning:
+            self.statusBar().showMessage("Already running — wait for the current process", 3000)
             return
         # `--install-tools` still demands -t because the parser marks it
         # required; the target is irrelevant to the install itself.
@@ -2622,6 +3370,9 @@ class MainWindow(QMainWindow):
         return process_env
 
     def _apply_style(self):
+        app = QApplication.instance()
+        if app is not None:
+            app.setPalette(_dark_palette())
         theme_path = Path(__file__).with_name("theme.qss")
         try:
             qss = theme_path.read_text(encoding="utf-8")
@@ -2632,6 +3383,9 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    # Fusion gives consistent cross-platform rendering under our stylesheet
+    # (macOS native style ignores large parts of a QSS theme).
+    app.setStyle("Fusion")
     window = MainWindow()
     window.show()
     return app.exec()
