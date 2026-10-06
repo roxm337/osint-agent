@@ -324,10 +324,55 @@ def _render_finding(finding: dict, evidence_items: list[dict]) -> list[str]:
             item = evidence_by_id.get(evidence_ref, {})
             path = item.get("path", evidence_ref)
             lines.append(f"  - `{_escape_text(path)}`")
+    reproduce = _reproduce_lines(finding)
+    if reproduce:
+        lines.append("- **Reproduce:**")
+        lines.extend(f"  - {_escape_text(line)}" if line else "  -"
+                     for line in reproduce)
     if finding.get("remediation"):
         lines.append(f"- **Remediation:** {_escape_text(finding['remediation'])}")
     lines.append("")
     return lines
+
+
+def _reproduce_lines(finding: dict) -> list[str]:
+    """One re-run command per finding, read-only by construction.
+
+    The bounty index already renders per-category PoCs; the main report
+    showed the proof shape but never the command. A verified finding
+    without a re-run line is a claim the reader cannot check, so this
+    mirrors the same sources: verification URL first, then the first
+    http asset key as fallback. Unverified findings get nothing — there
+    is nothing proven to reproduce.
+    """
+    if not finding.get("verified"):
+        return []
+    verification = finding.get("verification") or {}
+    url = str(verification.get("url") or "").strip()
+    if not url:
+        for key in finding.get("asset_keys", []) or []:
+            candidate = str(key).split(":", 1)[1] if ":" in str(key) else ""
+            if candidate.startswith(("http://", "https://")):
+                url = candidate
+                break
+    if not url:
+        return []
+    method = str(verification.get("method") or verification.get("action_id")
+                 or "").strip()
+    param = str(verification.get("param") or "").strip()
+    if param and "?" not in url:
+        return [f"curl -i -sS --max-time 25 '{url}?{param}=PROBE'  # {method}"]
+    if method.startswith("batch_"):
+        return [f"curl -sS --max-time 25 -X POST -H 'Content-Type: application/json' "
+                f"-d '[{{\"query\":\"{{ __typename }}\"}},{{\"query\":\"{{ __typename }}\"}}]' "
+                f"'{url}'  # {method}"]
+    if "introspection" in method or "graphql" in method or "get_query" in method \
+            or "field_suggestion" in method:
+        return [f"curl -sS --max-time 25 -X POST -H 'Content-Type: application/json' "
+                f"-d '{{\"query\":\"{{ __typename }}\"}}' '{url}'  # {method}"]
+    if method:
+        return [f"curl -i -sS --max-time 25 '{url}'  # {method}"]
+    return [f"curl -i -sS --max-time 25 '{url}'"]
 
 
 def _render_evidence_index(items: list[dict]) -> list[str]:

@@ -156,6 +156,9 @@ class GraphQLAudit(BaseModule):
                 ],
                 evidence_refs=[evidence_id],
                 remediation="Disable introspection in production. Use query depth limits and complexity analysis.",
+                verified=True,
+                verification={"method": "introspection_schema_returned",
+                              "url": endpoint},
             )
 
             # Look for sensitive types in schema. A type NAME is not a
@@ -209,6 +212,9 @@ class GraphQLAudit(BaseModule):
                         f"Suggestion response: {suggestion_body[:300]}",
                     ],
                     remediation="Disable field suggestions in production GraphQL configuration.",
+                    verified=True,
+                    verification={"method": "field_suggestion_returned",
+                                  "url": endpoint},
                 )
 
         # 3. Batch query test
@@ -235,6 +241,9 @@ class GraphQLAudit(BaseModule):
                                     "queries in a single request.",
                         evidence=[f"Batch response: {str(b3_data)[:300]}"],
                         remediation="Limit batch query size or disable batching in production.",
+                        verified=True,
+                        verification={"method": "batch_query_accepted",
+                                      "url": endpoint},
                     )
                     break
             except (json.JSONDecodeError, TypeError):
@@ -258,6 +267,9 @@ class GraphQLAudit(BaseModule):
                 evidence=[f"GET query response: {b4[:200]}"],
                 remediation="Only accept POST requests for GraphQL mutations; "
                             "disable query execution via GET.",
+                verified=True,
+                verification={"method": "get_query_accepted",
+                              "url": endpoint},
             )
 
     async def _probe_sensitive_reads(self, endpoint: str,

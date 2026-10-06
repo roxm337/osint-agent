@@ -246,3 +246,66 @@ def test_prototype_prefers_discovered_write_surface():
     module = PrototypePollution(state, _config())
     urls = module._endpoints({}, "https://example.test")
     assert urls[0] == "https://example.test/api/1"
+
+
+# ── graphql verified flags ──
+
+def test_graphql_introspection_marks_verified():
+    from modules.graphql_module import GraphQLAudit
+    state = _state()
+    module = GraphQLAudit(state, _config())
+    schema = {"__schema": {"types": [
+        {"name": "User", "kind": "OBJECT"},
+        {"name": "Query", "kind": "OBJECT"},
+    ]}, "mutationType": None}
+
+    async def fake_curl(url, **kwargs):
+        import json as _json
+        data = kwargs.get("data", "") or ""
+        if "invalidFieldNameXYZ" in data:
+            return {"status": 200,
+                    "body": '{"errors":[{"message":"Did you mean User?"}]}'}
+        if isinstance(data, str) and data.startswith("["):
+            return {"status": 200, "body": "[]"}
+        if url.endswith("?query=%7B__typename%7D"):
+            return {"status": 200, "body": "{}"}
+        return {"status": 200,
+                "body": _json.dumps({"data": {"__schema": schema["__schema"]}})}
+
+    import modules.graphql_module as gm
+    with patch.object(gm, "curl", new=fake_curl):
+        _run(module._audit_endpoint("https://example.test/graphql"))
+    by_title = {f["title"]: f for f in state.findings["findings"]}
+    key = "GraphQL Introspection Enabled: https://example.test/graphql"
+    assert key in by_title
+    assert by_title[key]["verified"] is True
+    assert by_title[key]["verification"]["method"] == \
+        "introspection_schema_returned"
+
+
+# ── reporting reproduce ──
+
+def test_reporting_renders_reproduce_for_verified():
+    from core.reporting import _render_finding
+    finding = {"id": "FINDING-0001", "title": "GraphQL Batch",
+               "severity": "MEDIUM", "confidence": "CONFIRMED",
+               "category": "API Security", "description": "d",
+               "evidence": [], "remediation": "r",
+               "asset_keys": ["url:https://example.test/graphql"],
+               "verified": True,
+               "verification": {"method": "batch_query_accepted",
+                                "url": "https://example.test/graphql"}}
+    lines = _render_finding(finding, [])
+    assert any("Reproduce" in line for line in lines)
+    assert any("batch_query_accepted" in line for line in lines)
+
+
+def test_reporting_no_reproduce_when_unverified():
+    from core.reporting import _render_finding
+    finding = {"id": "FINDING-0001", "title": "Inventory",
+               "severity": "INFO", "confidence": "FIRM",
+               "category": "Content Discovery", "description": "d",
+               "evidence": [], "remediation": "r", "asset_keys": [],
+               "verified": False, "verification": {}}
+    lines = _render_finding(finding, [])
+    assert not any("Reproduce" in line for line in lines)

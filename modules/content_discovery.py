@@ -207,6 +207,9 @@ class ContentDiscovery(BaseModule):
                     "disclosure. Otherwise confirm the page requires "
                     "authentication before serving it."
                 ),
+                verified=True,
+                verification={"method": "ffuf_dominant_group_served",
+                              "url": served[0]["url"] if served else ""},
             )
 
         if protected:
