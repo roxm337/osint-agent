@@ -288,9 +288,19 @@ def _render_finding(finding: dict, evidence_items: list[dict]) -> list[str]:
     ]
     if finding.get("verification"):
         v = finding["verification"]
-        method = v.get("method", "")
+        # Chain-executor proofs record action_id/selected_because/url/param;
+        # module proofs record method. Render whichever shape is present —
+        # previously only `method` was read, so executor proofs rendered
+        # as verified-with-no-method-shown.
+        method = (v.get("method") or v.get("action_id") or "").strip()
         if method:
             lines.append(f"- **Verification Method:** `{_escape_text(method)}`")
+        if v.get("selected_because"):
+            lines.append(f"- **Selected Because:** {_escape_text(v['selected_because'])}")
+        if v.get("url"):
+            lines.append(f"- **Verified URL:** `{_escape_text(v['url'])}`")
+        if v.get("param"):
+            lines.append(f"- **Verified Parameter:** `{_escape_text(v['param'])}`")
     if finding.get("asset_keys"):
         lines.append("- **Affected Assets:**")
         for asset_key in finding["asset_keys"]:

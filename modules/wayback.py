@@ -1,5 +1,6 @@
 """Stage 2: Wayback Machine + URLScan — URL mining, JS extraction, parameter analysis."""
 
+import asyncio
 import re
 from urllib.parse import urlparse, parse_qs
 from modules.base import BaseModule
@@ -131,54 +132,134 @@ class WaybackMachine(BaseModule):
                 attrs={"url": api_url, "source": "historical"},
             )
 
-        # Findings: sensitive URL parameters (potential secret leakage)
+        # Findings: sensitive URL parameters (potential secret leakage).
+        # An archived ?key= is history, not a leak: only live URLs whose
+        # values are secret-shaped get HIGH. Everything else is context.
         sensitive_param_urls = categories["sensitive_param"]
         if sensitive_param_urls:
             found_params = set()
             for url in sensitive_param_urls[:20]:
                 params = parse_qs(urlparse(url).query)
                 found_params.update(k for k in params if k.lower() in SENSITIVE_URL_PARAMS)
+            live = await self._live_check(sensitive_param_urls, limit=8)
+            live_with_values = {
+                url: result for url, result in live.items() if result["live"]
+            }
+            secret_shaped = {}
+            for url in live_with_values:
+                values = []
+                for value in parse_qs(urlparse(url).query).values():
+                    values.extend(value)
+                hits = [v for v in values if _secret_shaped(v)]
+                if hits:
+                    secret_shaped[url] = hits[:3]
+            if secret_shaped:
+                self.state.add_finding(
+                    title="Live URLs With Secret-Shaped Parameter Values",
+                    severity="HIGH",
+                    confidence="FIRM",
+                    category="Credential Exposure",
+                    description=(
+                        f"{len(secret_shaped)} currently reachable URL(s) carry "
+                        "secret-shaped parameter values. Rotate them; never "
+                        "pass secrets in URL parameters."),
+                    evidence=[f"{url} :: {', '.join(vals)}"
+                              for url, vals in list(secret_shaped.items())[:10]],
+                    remediation="Rotate any credentials found in historical URLs; "
+                                "never pass secrets in URL parameters.",
+                )
+            elif live_with_values:
+                self.state.add_finding(
+                    title="Live Historical URLs With Sensitive Parameter Names",
+                    severity="LOW",
+                    confidence="FIRM",
+                    category="Credential Exposure",
+                    description=(
+                        f"{len(live_with_values)} archived URL(s) with sensitive "
+                        f"parameter names ({sorted(found_params)}) are still "
+                        "reachable, but no value is secret-shaped. Watch these "
+                        "parameters during active testing."),
+                    evidence=list(live_with_values)[:10],
+                    remediation="Confirm handlers validate these parameters; "
+                                "never pass secrets in URL parameters.",
+                )
+            else:
+                self.state.add_finding(
+                    title="Sensitive Parameters in Historical URLs (Archive Only)",
+                    severity="INFO",
+                    confidence="FIRM",
+                    category="Credential Exposure",
+                    description=(
+                        f"{len(sensitive_param_urls)} historical URL(s) with "
+                        f"sensitive parameter names ({sorted(found_params)}); "
+                        "none is reachable now. Archive context only."),
+                    evidence=[url for url in sensitive_param_urls[:10]],
+                    remediation="Rotate any credentials found in historical URLs; "
+                                "never pass secrets in URL parameters.",
+                )
 
-            self.state.add_finding(
-                title="Sensitive Parameters in Historical URLs",
-                severity="HIGH",
-                confidence="FIRM",
-                category="Credential Exposure",
-                description=f"Wayback Machine contains {len(sensitive_param_urls)} historical URLs "
-                            f"with sensitive parameter names: {sorted(found_params)}. "
-                            f"These may contain leaked API keys or tokens.",
-                evidence=[url for url in sensitive_param_urls[:10]],
-                remediation="Rotate any credentials found in historical URLs; "
-                            "never pass secrets in URL parameters.",
-            )
-
-        # Findings: sensitive file extensions in history
+        # Findings: sensitive file extensions in history. A live 200 with a
+        # body that is not the site default is exposure; anything else is
+        # archive context.
         sensitive_files = categories["sensitive_file"]
         if sensitive_files:
-            self.state.add_finding(
-                title="Sensitive File URLs in Archive",
-                severity="MEDIUM",
-                confidence="FIRM",
-                category="Information Disclosure",
-                description=f"{len(sensitive_files)} historically accessed sensitive files "
-                            f"found (.env, .bak, .sql, .conf, .log, etc.).",
-                evidence=[url for url in sensitive_files[:10]],
-                remediation="Verify these files are no longer accessible; check current state.",
-            )
+            live = await self._live_check(sensitive_files, limit=8)
+            confirmed = [url for url, result in live.items() if result["live"]]
+            if confirmed:
+                self.state.add_finding(
+                    title="Sensitive Files Reachable Now",
+                    severity="MEDIUM",
+                    confidence="FIRM",
+                    category="Information Disclosure",
+                    description=f"{len(confirmed)} historically sensitive file(s) "
+                                "return live content distinct from the site default.",
+                    evidence=[f"{url} (HTTP {live[url]['status']})"
+                              for url in confirmed[:10]],
+                    remediation="Verify these files are no longer accessible; check current state.",
+                )
+            else:
+                self.state.add_finding(
+                    title="Sensitive File URLs in Archive (Not Live)",
+                    severity="INFO",
+                    confidence="FIRM",
+                    category="Information Disclosure",
+                    description=f"{len(sensitive_files)} historically accessed sensitive files "
+                                f"found (.env, .bak, .sql, .conf, .log, etc.); "
+                                "none is reachable now.",
+                    evidence=[url for url in sensitive_files[:10]],
+                    remediation="Verify these files are no longer accessible; check current state.",
+                )
 
-        # Findings: admin paths in history
+        # Findings: admin paths in history. A live 200/401/403 is
+        # authenticated surface worth noting; dead paths are context.
         admin_paths = categories["admin_path"]
         if admin_paths:
             unique_admin = list({urlparse(u).path for u in admin_paths})[:15]
-            self.state.add_finding(
-                title="Admin/Internal Paths in Archive",
-                severity="LOW",
-                confidence="FIRM",
-                category="Attack Surface",
-                description=f"{len(admin_paths)} historical admin/internal paths enumerated.",
-                evidence=unique_admin[:10],
-                remediation="Verify admin paths require authentication and are not publicly accessible.",
-            )
+            live = await self._live_check(admin_paths, limit=8)
+            live_admin = sorted({urlparse(u).path for u, result in live.items()
+                                 if result["live"]})
+            if live_admin:
+                self.state.add_finding(
+                    title="Admin/Internal Paths Reachable Now",
+                    severity="LOW",
+                    confidence="FIRM",
+                    category="Attack Surface",
+                    description=f"{len(live_admin)} admin/internal path(s) answer "
+                                "live (200 with distinct content, or auth challenge).",
+                    evidence=live_admin[:10],
+                    remediation="Verify admin paths require authentication and are not publicly accessible.",
+                )
+            else:
+                self.state.add_finding(
+                    title="Admin/Internal Paths in Archive (Not Live)",
+                    severity="INFO",
+                    confidence="FIRM",
+                    category="Attack Surface",
+                    description=f"{len(admin_paths)} historical admin/internal paths enumerated; "
+                                "none answers live.",
+                    evidence=unique_admin[:10],
+                    remediation="Verify admin paths require authentication and are not publicly accessible.",
+                )
 
         # Store main asset
         top_params = sorted(unique_params.items(), key=lambda x: -x[1])[:30]
@@ -208,3 +289,84 @@ class WaybackMachine(BaseModule):
             f"Sensitive params: {len(sensitive_param_urls)}"
         )
         return "done"
+
+    async def _live_check(self, urls: list, limit: int = 8) -> dict:
+        """Fetch the live equivalent of archived URLs.
+
+        Returns {original_url: {"live", "status", "note"}}. Liveness is
+        judged through the shared site profile, not a bare status: a 200
+        of the SPA shell is the catch-all talking, and only a response
+        distinct from the site's own default counts as live. Only
+        in-scope hosts are probed.
+        """
+        from core.response_fingerprint import fingerprint as make_fingerprint
+        from core.site_profile import get_profile
+
+        base = (self.base_url or f"https://{self.domain}").rstrip("/")
+
+        async def fetch(path: str):
+            try:
+                result = await curl_with_status(base + path, timeout=10)
+            except Exception:
+                return 0, "", ""
+            return (result.get("status", 0),
+                    result.get("body", "") or "", "")
+
+        try:
+            profile = await get_profile(base, fetch)
+        except Exception:
+            profile = None
+
+        targets = []
+        for original in urls[:limit]:
+            try:
+                parsed = urlparse(str(original))
+            except Exception:
+                continue
+            host = (parsed.hostname or "").lower()
+            apex = self.domain.lower()
+            if host != apex and not host.endswith("." + apex):
+                continue
+            live_path = (parsed.path or "/")
+            if parsed.query:
+                live_path += "?" + parsed.query
+            targets.append((original, live_path))
+
+        semaphore = asyncio.Semaphore(6)
+
+        async def probe(original: str, live_path: str):
+            async with semaphore:
+                status, body, _content_type = await fetch(live_path)
+            if profile is not None:
+                is_default = profile.baseline.catch_all(
+                    make_fingerprint(status, body))
+            else:
+                is_default = not body
+            if status == 200 and body and not is_default:
+                return original, {"live": True, "status": status,
+                                  "note": "live 200, distinct from site default"}
+            if status in (401, 403):
+                return original, {"live": True, "status": status,
+                                  "note": f"live {status} (protected)"}
+            return original, {"live": False, "status": status,
+                              "note": f"HTTP {status}"}
+
+        probed = await asyncio.gather(
+            *(probe(original, live_path) for original, live_path in targets),
+            return_exceptions=True,
+        )
+        return {original: result for original, result in probed
+                if isinstance(result, dict)}
+
+
+def _secret_shaped(value: str) -> bool:
+    """Could this query value be a real credential, not a placeholder?"""
+    text = str(value or "")
+    if len(text) < 16:
+        return False
+    lowered = text.lower()
+    if any(marker in lowered for marker in (
+            "example", "test", "demo", "sample", "public", "undefined",
+            "null", "none", "default", "changeme", "xxx")):
+        return False
+    return len(set(text)) >= 8

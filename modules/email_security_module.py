@@ -129,7 +129,7 @@ class EmailSecurity(BaseModule):
             elif "~all" in spf_record:
                 self.state.add_finding(
                     title=f"SPF ~all (softfail) on {domain}",
-                    severity="MEDIUM" if role == "primary" else "LOW",
+                    severity="LOW",
                     confidence="CONFIRMED",
                     category="Email Security",
                     description=(
@@ -172,7 +172,7 @@ class EmailSecurity(BaseModule):
             if "p=none" in dmarc_text:
                 self.state.add_finding(
                     title=f"DMARC p=none on {domain} (monitor-only)",
-                    severity="MEDIUM" if role == "primary" else "LOW",
+                    severity="LOW",
                     confidence="CONFIRMED",
                     category="Email Security",
                     description=(

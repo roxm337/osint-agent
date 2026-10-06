@@ -42,24 +42,105 @@ async def verify_differential(ctx: ActionContext) -> ActionResult:
     produces="VerificationResult",
     idempotent=True,
     timeout=120,
-    description="Run a probe N times to check reproducibility for CONFIRMED confidence",
+    description=(
+        "Confirm a suspected anomaly by re-running it N times: a `marker` "
+        "string must persist in every response, or `baseline_url` vs `url` "
+        "must diverge reproducibly. A stable fetch of an unmodified URL "
+        "proves reachability only and never confirms a vulnerability."
+    ),
     category="verify",
 )
 async def verify_reproducible(ctx: ActionContext) -> ActionResult:
     checker = ReproducibilityChecker(min_reps=ctx.params.get("reps", 3))
     url = ctx.params["url"]
+    method = ctx.params.get("method", "GET")
+    marker = str(ctx.params.get("marker") or "").strip()
+    baseline_url = str(ctx.params.get("baseline_url") or "").strip()
 
-    async def probe(url=url):
+    async def probe(target=url):
         from tools.wrappers import curl
-        return await curl(url, output="full")
+        return await curl(target, method=method, output="full")
 
+    if marker:
+        # The thing we injected must be present in every rep. Stable
+        # presence of a canary is confirmation; a stable page is not.
+        bodies = []
+        statuses = []
+        for _ in range(checker.min_reps):
+            response = await probe()
+            bodies.append(response.get("body", "") or "")
+            statuses.append(response.get("status", 0))
+        hits = sum(1 for body in bodies if marker in body)
+        if bodies and hits == len(bodies):
+            return ActionResult(
+                success=True,
+                confidence="CONFIRMED",
+                data={"marker_hits": hits, "reps": len(bodies),
+                      "status": statuses[0] if statuses else 0},
+                evidence={"marker": marker, "reps": len(bodies),
+                          "statuses": statuses},
+            )
+        return ActionResult(
+            success=False,
+            confidence="FIRM" if hits else "TENTATIVE",
+            data={"marker_hits": hits, "reps": len(bodies)},
+            evidence={"marker": marker, "reps": len(bodies),
+                      "statuses": statuses},
+            error=(f"marker present in {hits}/{len(bodies)} reps — "
+                   "not a stable confirmation"),
+        )
+
+    if baseline_url:
+        analyzer = DifferentialAnalyzer()
+        base = await analyzer.baseline(baseline_url, method=method)
+        test_result = await analyzer.test(url, method=method)
+        verdict = analyzer.compare(base, test_result)
+        if verdict.confidence.value not in ("FIRM", "CONFIRMED"):
+            return ActionResult(
+                success=False,
+                confidence=verdict.confidence.value,
+                data={"divergence_score": verdict.score},
+                evidence=verdict.evidence,
+                error=f"no divergence to confirm: {verdict.reason}",
+            )
+        repro = await checker.check(
+            lambda: analyzer.test(url, method=method))
+        if repro.confidence.value == "CONFIRMED":
+            return ActionResult(
+                success=True,
+                confidence="CONFIRMED",
+                data={"divergence_score": verdict.score,
+                      "match_rate": repro.score, "reps": checker.min_reps},
+                evidence={**verdict.evidence, **repro.evidence},
+            )
+        return ActionResult(
+            success=False,
+            confidence="FIRM",
+            data={"divergence_score": verdict.score},
+            evidence=verdict.evidence,
+            error="diverged once but not reproducibly — flapping, not proof",
+        )
+
+    # No marker, no baseline: an unmodified fetch. Reproducibility of a
+    # 200 OK is reachability, and reachability is not a vulnerability —
+    # returning success here is how static JS bundles became seventeen
+    # CONFIRMED "exploitation" findings. Record the stability facts for
+    # the audit trail and decline to confirm.
     verdict = await checker.check(probe)
-
+    first_status = 0
+    try:
+        first = await probe()
+        first_status = first.get("status", 0)
+    except Exception:
+        pass
     return ActionResult(
-        success=verdict.confidence.value == "CONFIRMED",
-        confidence=verdict.confidence.value,
-        data={"match_rate": verdict.score, "reps": checker.min_reps},
+        success=False,
+        confidence="TENTATIVE",
+        data={"match_rate": verdict.score, "reps": checker.min_reps,
+              "status": first_status},
         evidence=verdict.evidence,
+        error=(f"HTTP {first_status} stable across {checker.min_reps} reps — "
+               "reachability only, nothing to confirm"),
     )
 
 
@@ -121,17 +202,22 @@ async def verify_composite(ctx: ActionContext) -> ActionResult:
         lambda: oracle.differential.test(url, method=method)
     )
 
-    # Composite scoring
+    # Composite scoring. Reproducibility strengthens a divergence that
+    # already exists; on its own it confirms nothing — a stable page is
+    # not a vulnerability, and treating it as one is how static assets
+    # became CONFIRMED findings.
     scores = []
-    if diff_verdict.confidence.value in ("FIRM", "CONFIRMED"):
+    diff_strong = diff_verdict.confidence.value in ("FIRM", "CONFIRMED")
+    repro_strong = repro_verdict.confidence.value == "CONFIRMED"
+    if diff_strong:
         scores.append(diff_verdict.score)
-    if repro_verdict.confidence.value == "CONFIRMED":
+    if diff_strong and repro_strong:
         scores.append(repro_verdict.score * 1.2)  # reproducibility is a stronger signal
 
     confidence = "TENTATIVE"
-    if repro_verdict.confidence.value == "CONFIRMED":
+    if diff_strong and repro_strong:
         confidence = "CONFIRMED"
-    elif diff_verdict.confidence.value == "FIRM" and scores:
+    elif diff_strong:
         confidence = "FIRM"
 
     composite_score = max(scores) if scores else 0.0
@@ -144,4 +230,7 @@ async def verify_composite(ctx: ActionContext) -> ActionResult:
             "differential": diff_verdict.evidence,
             "reproducibility": repro_verdict.evidence,
         },
+        error="" if confidence in ("FIRM", "CONFIRMED") else (
+            f"no stable divergence: {diff_verdict.reason}; {repro_verdict.reason}"
+        ),
     )

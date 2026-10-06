@@ -10,6 +10,22 @@ SEVERITY_FROM_SCORE = (
     (0, "INFO"),
 )
 
+# Confidence is about proof on THIS host. A TENTATIVE guess must never
+# outrank a CONFIRMED hit, no matter what its raw score says. KEV
+# membership bypasses the discount: CISA KEV means exploited in the wild,
+# which is confirmation — just not on this host. (Keyword-matched KEV
+# without version proof is a matcher bug, fixed in exploit_lookup, not
+# something the scorer can see.)
+CONFIDENCE_DISCOUNT = {
+    "CONFIRMED": 1.0,
+    "FIRM": 0.85,
+    "TENTATIVE": 0.55,
+}
+
+# Without host-level proof, nothing is CRITICAL. A sqlmap FIRM or a
+# dalfox FIRM sorts as HIGH until OAST/execution promotes it.
+UNCONFIRMED_SCORE_CAP = 89
+
 
 def prioritize_findings(findings: list[dict], scoring_config: dict | None = None) -> list[dict]:
     """Update findings in place with normalized priority metadata."""
@@ -53,6 +69,18 @@ def prioritize_findings(findings: list[dict], scoring_config: dict | None = None
 
         existing_score = int(finding.get("risk_score") or 0)
         score = max(existing_score, score)
+
+        confidence = str(finding.get("confidence", "TENTATIVE")).upper()
+        confirmed = (
+            bool(finding.get("verified"))
+            or confidence == "CONFIRMED"
+            or kev
+        )
+        if not confirmed:
+            score = min(
+                int(score * CONFIDENCE_DISCOUNT.get(confidence, 0.55)),
+                UNCONFIRMED_SCORE_CAP,
+            )
         finding["risk_score"] = score
         finding["priority"] = _priority_from_score(score)
         finding["priority_factors"] = {
@@ -60,15 +88,21 @@ def prioritize_findings(findings: list[dict], scoring_config: dict | None = None
             "epss": epss,
             "kev": kev,
             "exposure": exposure,
+            "confidence_discount": CONFIDENCE_DISCOUNT.get(confidence, 0.55)
+            if not confirmed else 1.0,
         }
-        finding["severity"] = _max_severity(
+        severity = _max_severity(
             finding.get("severity", "INFO"),
             _severity_from_score(score),
         )
+        if not confirmed and severity == "CRITICAL":
+            severity = "HIGH"
+        finding["severity"] = severity
         prioritized.append(finding)
 
     prioritized.sort(
         key=lambda item: (
+            bool(item.get("verified")),
             int(item.get("risk_score") or 0),
             str(item.get("severity", "")),
             str(item.get("created_at", "")),

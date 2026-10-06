@@ -1,5 +1,7 @@
 """Stage 4: Nuclei vulnerability scan with technology-targeted templates."""
 
+import time
+
 from modules.base import BaseModule
 from tools.external import nuclei_scan, nuclei_multi, tool_available
 
@@ -14,6 +16,16 @@ SEVERITY_MAP = {
 
 # Tags to always run (passive/low-noise)
 BASE_TAGS = ["osint", "exposure", "misconfiguration", "token-spray", "default-login"]
+
+# Highest-signal, fastest tags first. A run that is cut short by the module
+# deadline keeps the credential/exposure batches instead of dying inside one
+# giant invocation with zero findings to show for it.
+TAG_BATCHES = [
+    ["token-spray", "default-login"],
+    ["osint"],
+    ["exposure"],
+    ["misconfiguration"],
+]
 
 # Tags to run when specific tech is detected
 TECH_TAG_MAP = {
@@ -72,63 +84,187 @@ class NucleiScan(BaseModule):
 
         # Build tag list. Do not add the broad "cve" tag to first-pass scans;
         # it creates a very large template run. Use detected tech tags first.
-        tags = list(BASE_TAGS)
-        for tech, tech_tags in TECH_TAG_MAP.items():
+        tech_tags = []
+        for tech, tags in TECH_TAG_MAP.items():
             if any(tech.lower() in dt.lower() for dt in detected_tech):
-                tags.extend(tech_tags)
-                self.log(f"  Adding tags for {tech}: {tech_tags}")
+                self.log(f"  Adding tags for {tech}: {tags}")
+                tech_tags.extend(tags)
+        tech_tags = sorted(set(tech_tags))
 
-        first_pass_tags = sorted(set(tags))
+        groups = [list(batch) for batch in TAG_BATCHES]
+        if tech_tags:
+            groups.append(tech_tags)
 
-        # Phase 1: General scan with all tags
-        self.log(f"  Phase 1: Scanning with tags: {', '.join(first_pass_tags[:12])}...")
-        result = await nuclei_scan(
-            target_url,
-            rate_limit=rate_limit,
-            timeout=600,
-            tags=first_pass_tags,
-            severity=["low", "medium", "high", "critical"],
-        )
-        all_matches = result.get("results", [])
+        # Time-box: the orchestrator kills the module at its deadline and
+        # anything buffered in memory dies with it, so findings land per
+        # batch and the run stops while there is still time to write them.
+        try:
+            deadline = float(self.config.get("module_timeout", 300) or 300)
+        except (TypeError, ValueError):
+            deadline = 300.0
+        nuclei_cfg = self.config.get("nuclei", {})
+        max_seconds = nuclei_cfg.get("max_seconds")
+        try:
+            max_seconds = float(max_seconds) if max_seconds else deadline - 60.0
+        except (TypeError, ValueError):
+            max_seconds = deadline - 60.0
+        batch_cap = nuclei_cfg.get("batch_seconds", 150)
+        try:
+            batch_cap = float(batch_cap or 150)
+        except (TypeError, ValueError):
+            batch_cap = 150.0
+        started = time.monotonic()
+        stop_at = started + max(60.0, max_seconds)
 
-        cve_tags_used = []
-        if self._allow_full_cve_pass(target_url, webapp_assets):
-            cve_tags_used = ["cve"]
-            self.log("  Phase 2: Confirmed apex CVE scan enabled")
-            result2 = await nuclei_scan(
-                target_url,
-                rate_limit=rate_limit,
-                timeout=900,
-                tags=cve_tags_used,
-                severity=["medium", "high", "critical"],
-            )
-            all_matches.extend(result2.get("results", []))
-
-        # Deduplicate by template_id + matched_at
         seen = set()
-        unique_matches = []
-        for m in all_matches:
-            key = (m.get("template_id", ""), m.get("matched_at", ""))
-            if key not in seen:
-                seen.add(key)
-                unique_matches.append(m)
+        all_matches = []
+        low_info_all = []
+        finding_counts = {}
+        tags_used = []
+        for position, group in enumerate(groups):
+            remaining = stop_at - time.monotonic()
+            batches_left = len(groups) - position
+            if remaining < 40:
+                self.log(f"  Time-box hit with {batches_left} tag group(s) "
+                         f"unrun ({remaining:.0f}s left) — keeping what landed")
+                break
+            batch_timeout = max(40.0, min(batch_cap, (remaining - 20.0) / batches_left))
+            self.log(f"  Batch {position + 1}/{len(groups)} tags "
+                     f"{','.join(group)} (timeout {batch_timeout:.0f}s)...")
+            try:
+                result = await nuclei_scan(
+                    target_url,
+                    rate_limit=rate_limit,
+                    timeout=int(batch_timeout),
+                    tags=group,
+                    severity=["low", "medium", "high", "critical"],
+                )
+            except Exception as exc:
+                self.log(f"  Batch {','.join(group)} raised: {exc} — continuing")
+                continue
+            batch_matches = result.get("results", []) or []
+            if result.get("error") == "timeout" and not batch_matches:
+                self.log(f"  Batch {','.join(group)} timed out with no "
+                         "matches — continuing with the next batch")
+                continue
+            fresh = []
+            for match in batch_matches:
+                key = (match.get("template_id", ""), match.get("matched_at", ""))
+                if key not in seen:
+                    seen.add(key)
+                    fresh.append(match)
+            if not fresh:
+                continue
+            tags_used.extend(group)
+            all_matches.extend(fresh)
+            low_info_all.extend(
+                self._record_matches(fresh, finding_counts, target_url,
+                                     group, detected_tech))
 
+        if self._allow_full_cve_pass(target_url, webapp_assets):
+            remaining = stop_at - time.monotonic()
+            if remaining > 150:
+                cve_timeout = int(min(600, remaining - 45))
+                self.log(f"  Confirmed apex CVE scan enabled "
+                         f"(timeout {cve_timeout}s)")
+                try:
+                    result = await nuclei_scan(
+                        target_url,
+                        rate_limit=rate_limit,
+                        timeout=cve_timeout,
+                        tags=["cve"],
+                        severity=["medium", "high", "critical"],
+                    )
+                except Exception as exc:
+                    self.log(f"  CVE batch raised: {exc}")
+                    result = {"results": []}
+                cve_matches = result.get("results", []) or []
+                fresh = []
+                for match in cve_matches:
+                    key = (match.get("template_id", ""), match.get("matched_at", ""))
+                    if key not in seen:
+                        seen.add(key)
+                        fresh.append(match)
+                if fresh:
+                    tags_used.append("cve")
+                    all_matches.extend(fresh)
+                    low_info_all.extend(
+                        self._record_matches(fresh, finding_counts,
+                                             target_url, ["cve"],
+                                             detected_tech))
+            else:
+                self.log(f"  Skipping CVE pass: only {remaining:.0f}s left in "
+                         "the time-box")
+
+        # One consolidated LOW/INFO appendix, not one per batch: per-batch
+        # summaries share a title and would otherwise merge with a stale
+        # count while the evidence kept growing underneath it.
+        if low_info_all:
+            summary_evidence = self.state.add_evidence(
+                self.id, "nuclei", target_url,
+                {"target": target_url, "tags_used": sorted(set(tags_used)),
+                 "low_info_matches": len(low_info_all)},
+            )
+            self.state.add_finding(
+                title=f"Nuclei: {len(low_info_all)} Low/Info Matches",
+                severity="LOW",
+                confidence="FIRM",
+                category="Vulnerability Scan",
+                description=(f"Nuclei found {len(low_info_all)} "
+                             "low/informational matches."),
+                evidence=[
+                    f"{m.get('template_id')}: {m.get('matched_at')}"
+                    for m in low_info_all[:30]
+                ],
+                evidence_refs=[summary_evidence],
+                remediation="Review low/info findings for false positive triage.",
+                asset_keys=[f"webapp:{target_url}"],
+            )
+            finding_counts["LOW"] = finding_counts.get("LOW", 0) + 1
+
+        self.state.add_asset(
+            "nuclei_scan",
+            f"nuclei:{self.domain}",
+            self.domain,
+            confidence="CONFIRMED",
+            sources=["nuclei"],
+            attrs={
+                "total_matches": len(all_matches),
+                "by_severity": finding_counts,
+                "tags_used": sorted(set(tags_used)),
+                "detected_tech": sorted(detected_tech),
+            },
+        )
+        self.state.complete_module(self.id)
+        self.log(
+            f"nuclei: {len(all_matches)} matches — "
+            + " | ".join(f"{sev}:{cnt}" for sev, cnt in sorted(finding_counts.items()))
+        )
+        return "done"
+
+    def _record_matches(self, matches: list, finding_counts: dict,
+                        target_url: str, tags: list, detected_tech: set) -> list:
+        """Persist one batch of matches as evidence + findings immediately.
+
+        Findings land per batch rather than at the end of the run, so a
+        module deadline kills at most the in-flight batch instead of the
+        whole scan. Returns the batch's LOW/INFO matches: those accumulate
+        into a single appendix at the end of the run.
+        """
         evidence_id = self.state.add_evidence(
             self.id,
             "nuclei",
             target_url,
             {
                 "target": target_url,
-                "tags_used": first_pass_tags + cve_tags_used,
+                "tags_used": list(tags),
                 "detected_tech": sorted(detected_tech),
-                "total_matches": len(unique_matches),
-                "exit_code": result.get("exit_code"),
+                "total_matches": len(matches),
             },
         )
 
-        finding_counts = {}
-        for match in unique_matches:
-            severity = SEVERITY_MAP.get(match.get("severity", "INFO"), "INFO")
+        for match in matches:
+            severity = SEVERITY_MAP.get(str(match.get("severity", "INFO")).upper(), "INFO")
             finding_counts[severity] = finding_counts.get(severity, 0) + 1
 
             # Create individual findings for HIGH/CRITICAL
@@ -168,44 +304,10 @@ class NucleiScan(BaseModule):
                     asset_keys=[f"webapp:{target_url}"],
                 )
 
-        # Batch LOW/INFO findings
-        low_info = [m for m in unique_matches
-                    if SEVERITY_MAP.get(m.get("severity", "INFO")) in ("LOW", "INFO")]
-        if low_info:
-            self.state.add_finding(
-                title=f"Nuclei: {len(low_info)} Low/Info Matches",
-                severity="LOW",
-                confidence="FIRM",
-                category="Vulnerability Scan",
-                description=f"Nuclei found {len(low_info)} low/informational matches.",
-                evidence=[
-                    f"{m.get('template_id')}: {m.get('matched_at')}"
-                    for m in low_info[:20]
-                ],
-                evidence_refs=[evidence_id],
-                remediation="Review low/info findings for false positive triage.",
-                asset_keys=[f"webapp:{target_url}"],
-            )
-
-        self.state.add_asset(
-            "nuclei_scan",
-            f"nuclei:{self.domain}",
-            self.domain,
-            confidence="CONFIRMED",
-            sources=["nuclei"],
-            attrs={
-                "total_matches": len(unique_matches),
-                "by_severity": finding_counts,
-                "tags_used": first_pass_tags + cve_tags_used,
-                "detected_tech": sorted(detected_tech),
-            },
-        )
-        self.state.complete_module(self.id)
-        self.log(
-            f"nuclei: {len(unique_matches)} matches — "
-            + " | ".join(f"{sev}:{cnt}" for sev, cnt in sorted(finding_counts.items()))
-        )
-        return "done"
+        # LOW/INFO matches accumulate for one end-of-run appendix.
+        return [m for m in matches
+                if SEVERITY_MAP.get(str(m.get("severity", "INFO")).upper())
+                in ("LOW", "INFO")]
 
     def _allow_full_cve_pass(self, target_url: str, webapp_assets: list[dict]) -> bool:
         nuclei_cfg = self.config.get("nuclei", {})

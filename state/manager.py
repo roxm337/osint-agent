@@ -155,15 +155,39 @@ class StateManager:
                     risk_score: Optional[int] = None,
                     verified: bool = False,
                     verification: Optional[dict] = None) -> str:
-        fid = f"FINDING-{len(self.findings['findings']) + 1:04d}"
+        from core.scoring import score_finding
         if risk_score is None:
-            from core.scoring import score_finding
             risk_score = score_finding(
                 severity, confidence, asset_keys, category,
                 verified=verified,
             )
         # Tag with the module currently running so future re-runs can replace it.
         current_module = self.module.get("current") or ""
+        # Same claim, same category, same assets: one finding, not N. The
+        # chain executor used to file one "Proven: ..." finding per graph
+        # edge, so a JS bundle reachable from two chains showed up twice
+        # with identical text; re-runs stacked a third copy on top. Merging
+        # keeps the strongest severity/confidence and unions the evidence
+        # instead. Asset keys are part of the key: two endpoints with the
+        # same/title-shaped claim (IDOR on baskets/200 vs invoices/200) are
+        # two findings, not one.
+        dedupe_key = (str(title or "").strip().lower(),
+                      str(category or "").strip().lower(),
+                      tuple(sorted(str(k) for k in (asset_keys or []))))
+        if dedupe_key[0]:
+            for existing in self.findings["findings"]:
+                if (str(existing.get("title", "")).strip().lower(),
+                        str(existing.get("category", "")).strip().lower(),
+                        tuple(sorted(str(k) for k in (existing.get("asset_keys") or [])))) == dedupe_key:
+                    self._merge_finding(
+                        existing, severity, confidence, risk_score,
+                        description, evidence, remediation, asset_keys,
+                        evidence_refs, verified, verification,
+                        current_module,
+                    )
+                    self._dirty = True
+                    return existing["id"]
+        fid = f"FINDING-{len(self.findings['findings']) + 1:04d}"
         finding = {
             "id": fid,
             "module_id": current_module,
@@ -185,6 +209,40 @@ class StateManager:
         self.module["stats"]["total_findings"] = len(self.findings["findings"])
         self._dirty = True
         return fid
+
+    @staticmethod
+    def _merge_finding(existing: dict, severity: str, confidence: str,
+                       risk_score: int, description: str,
+                       evidence: Optional[list], remediation: str,
+                       asset_keys: Optional[list],
+                       evidence_refs: Optional[list], verified: bool,
+                       verification: Optional[dict],
+                       current_module: str) -> None:
+        """Fold a duplicate claim into the finding already on record."""
+        if int(risk_score or 0) > int(existing.get("risk_score") or 0):
+            existing["severity"] = severity
+            existing["confidence"] = confidence
+            existing["risk_score"] = risk_score
+            if description and not existing.get("description"):
+                existing["description"] = description
+        if verified:
+            existing["verified"] = True
+        if current_module and not existing.get("module_id"):
+            existing["module_id"] = current_module
+        if remediation and not existing.get("remediation"):
+            existing["remediation"] = remediation
+        for key, items in (("evidence", evidence or []),
+                           ("evidence_refs", evidence_refs or []),
+                           ("asset_keys", asset_keys or [])):
+            merged = list(existing.get(key) or [])
+            for item in items:
+                if item not in merged:
+                    merged.append(item)
+            existing[key] = merged[:50]
+        if verification:
+            merged_verification = dict(verification)
+            merged_verification.update(existing.get("verification") or {})
+            existing["verification"] = merged_verification
 
     def get_findings_by_severity(self, severity: str) -> list:
         return [f for f in self.findings["findings"] if f["severity"] == severity]

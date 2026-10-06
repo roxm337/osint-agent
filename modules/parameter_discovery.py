@@ -1,11 +1,27 @@
 """Stage 4: Parameter discovery from archives, crawls, and optional tools."""
 
+import asyncio
+
 from modules.base import BaseModule
 from tools.external import (
     arjun_scan,
     extract_parameters_from_urls,
     paramspider_scan,
     tool_available,
+)
+from tools.wrappers import curl
+
+# When crawls and archives yield zero parameters (clean-URL apps like
+# Next.js), injection modules all skip and the active phase loses its
+# targets. Seeding probes a bounded set of live pages with inert marker
+# values under common names; a page that reflects the marker is a real
+# reflection point, which is exactly what XSS/SQLi/open-redirect need.
+# The marker is alphanumeric noise — no payload, no special characters —
+# so seeding detects reflection without testing any vulnerability.
+SEED_MARKER = "zxqseed9k2"
+SEED_PARAM_NAMES = (
+    "q", "s", "search", "query", "keyword", "id", "page", "lang",
+    "redirect", "url", "next", "return", "callback", "debug",
 )
 
 
@@ -61,6 +77,9 @@ class ParameterDiscovery(BaseModule):
 
         unique = _dedupe_parameters(parameters)
         if not unique:
+            seeded = await self._seed_reflection_params()
+            unique = _dedupe_parameters(seeded)
+        if not unique:
             self.state.skip_module(self.id, "no parameters discovered")
             return "skipped"
 
@@ -75,7 +94,7 @@ class ParameterDiscovery(BaseModule):
                 sources=[self.id],
                 attrs=item,
             )
-            if _sensitive_parameter(item["parameter"]):
+            if _sensitive_parameter(item["parameter"]) and not item.get("seeded"):
                 sensitive.append(item)
 
         if sensitive:
@@ -132,6 +151,71 @@ class ParameterDiscovery(BaseModule):
             targets.append(self.base_url)
         return targets
 
+    async def _seed_reflection_params(self) -> list[dict]:
+        """Probe live pages for reflection under common parameter names.
+
+        Bounded and inert: at most a dozen pages times a dozen names, one
+        GET each, marker value is noise. Anything reflecting the marker
+        becomes a `parameter` asset so the injection modules have targets
+        instead of skipping the whole active phase.
+        """
+        cfg = self.config.get("modules", {}).get(self.id, {})
+        if isinstance(cfg, dict) and cfg.get("seed_when_empty") is False:
+            return []
+        names = list(SEED_PARAM_NAMES)
+        if isinstance(cfg, dict) and cfg.get("seed_params"):
+            names = [str(p) for p in cfg["seed_params"] if p][:24]
+        pages = []
+        for page in [self.base_url] + self._scan_targets():
+            clean = str(page or "").split("?")[0].rstrip("/") or str(page or "")
+            if clean.startswith(("http://", "https://")) and clean not in pages:
+                pages.append(clean)
+        max_pages = int(cfg.get("seed_targets", 10)) if isinstance(cfg, dict) else 10
+        pages = pages[:max(1, max_pages)]
+        self.log(f"  No parameters from crawl — seeding reflection on "
+                 f"{len(pages)} page(s) x {len(names)} names...")
+
+        semaphore = asyncio.Semaphore(8)
+
+        async def probe(page: str, name: str):
+            from urllib.parse import urlencode, urlparse, urlunparse
+            parsed = urlparse(page)
+            query = urlencode({name: SEED_MARKER})
+            url = urlunparse(parsed._replace(query=query))
+            async with semaphore:
+                try:
+                    result = await curl(url, output="full",
+                                        follow_redirects=False, timeout=10)
+                except Exception:
+                    return None
+            body = result.get("body", "") or ""
+            if SEED_MARKER in body:
+                return {"url": page, "parameter": name,
+                        "example_value": SEED_MARKER,
+                        "sources": ["reflection_seed"],
+                        "source": "reflection_seed",
+                        "seeded": True,
+                        "status": result.get("status", 0)}
+            return None
+
+        probed = await asyncio.gather(
+            *(probe(page, name) for page in pages for name in names),
+            return_exceptions=True,
+        )
+        seeded = [p for p in probed if isinstance(p, dict)]
+        self.log(f"  Reflection seeding: {len(seeded)} reflecting "
+                 f"(page, param) pairs from {len(pages) * len(names)} probes")
+        if seeded:
+            self.state.add_evidence(
+                self.id,
+                "reflection_seed",
+                self.domain,
+                {"pages": pages, "names": names, "marker": SEED_MARKER,
+                 "reflecting": len(seeded),
+                 "pairs": [(p["url"], p["parameter"]) for p in seeded[:50]]},
+            )
+        return seeded
+
 
 def _dedupe_parameters(items: list[dict]) -> list[dict]:
     seen = set()
@@ -151,6 +235,7 @@ def _dedupe_parameters(items: list[dict]) -> list[dict]:
             "example_value": item.get("example_value", ""),
             "sources": item.get("sources", []),
             "source": item.get("source", ""),
+            "seeded": bool(item.get("seeded")),
         })
     return unique
 

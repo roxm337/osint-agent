@@ -1,7 +1,6 @@
 """Stage 3: VirusTotal keyed enrichment."""
 
-import ipaddress
-
+from core.validators import is_routable_ip
 from modules.base import BaseModule
 from tools.wrappers import (
     virustotal_domain,
@@ -20,10 +19,7 @@ def _reputable(ip: str) -> bool:
     from the internet, so nothing about them says how the target looks from
     outside.
     """
-    try:
-        return ipaddress.ip_address(ip).is_global
-    except ValueError:
-        return False
+    return is_routable_ip(ip)
 
 
 class VirusTotalEnrich(BaseModule):
@@ -88,18 +84,30 @@ class VirusTotalEnrich(BaseModule):
 
         domain_stats = _vt_stats(domain_result)
         if domain_stats["malicious"] or domain_stats["suspicious"]:
+            # One vendor flagging a domain is routine noise (parked-domain
+            # lists, overly broad heuristics); three or more independent
+            # vendors is a reputation signal worth a HIGH. Suspicious-only
+            # votes are context, not a finding with a score.
+            if domain_stats["malicious"] >= 3:
+                severity = "HIGH"
+            elif domain_stats["malicious"]:
+                severity = "LOW"
+            else:
+                severity = "INFO"
+            vendors = ", ".join(domain_stats["vendors"][:8]) or "none named"
             self.state.add_finding(
                 title="VirusTotal Reputation Signal on Domain",
-                severity="HIGH" if domain_stats["malicious"] else "MEDIUM",
+                severity=severity,
                 confidence="FIRM",
                 category="Threat Intelligence",
                 description=(
                     "VirusTotal returned malicious or suspicious reputation votes "
-                    "for the target domain."
+                    f"for the target domain (flagged by: {vendors})."
                 ),
                 evidence=[
                     f"malicious={domain_stats['malicious']}",
                     f"suspicious={domain_stats['suspicious']}",
+                    f"vendors={vendors}",
                 ],
                 evidence_refs=evidence_refs,
                 asset_keys=[f"domain:{self.domain}"],
@@ -111,15 +119,19 @@ class VirusTotalEnrich(BaseModule):
             if stats["malicious"] or stats["suspicious"]
         ]
         if bad_ips:
+            worst = max(ip_results[ip]["malicious"] for ip in bad_ips)
+            severity = "HIGH" if worst >= 3 else (
+                "LOW" if worst else "INFO")
             self.state.add_finding(
                 title=f"VirusTotal IP Reputation Signals: {len(bad_ips)} IP(s)",
-                severity="HIGH",
+                severity=severity,
                 confidence="FIRM",
                 category="Threat Intelligence",
                 description="VirusTotal returned suspicious or malicious votes for in-scope IPs.",
                 evidence=[
                     f"{ip}: malicious={ip_results[ip]['malicious']}, "
-                    f"suspicious={ip_results[ip]['suspicious']}"
+                    f"suspicious={ip_results[ip]['suspicious']}, "
+                    f"vendors={', '.join(ip_results[ip]['vendors'][:5]) or 'none named'}"
                     for ip in bad_ips[:10]
                 ],
                 evidence_refs=evidence_refs,
@@ -148,9 +160,16 @@ class VirusTotalEnrich(BaseModule):
 def _vt_stats(result: dict) -> dict:
     attrs = result.get("data", {}).get("attributes", {}) if isinstance(result, dict) else {}
     stats = attrs.get("last_analysis_stats", {}) if isinstance(attrs, dict) else {}
+    vendors = []
+    results = attrs.get("last_analysis_results", {}) if isinstance(attrs, dict) else {}
+    if isinstance(results, dict):
+        for vendor, verdict in results.items():
+            if isinstance(verdict, dict) and verdict.get("category") in ("malicious", "suspicious"):
+                vendors.append(str(vendor))
     return {
         "malicious": int(stats.get("malicious") or 0),
         "suspicious": int(stats.get("suspicious") or 0),
         "harmless": int(stats.get("harmless") or 0),
         "undetected": int(stats.get("undetected") or 0),
+        "vendors": sorted(vendors),
     }

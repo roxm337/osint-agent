@@ -180,6 +180,11 @@ def _describe(result: "CrossResult") -> tuple:
     """Turn a probe outcome into a title, severity, and report body."""
     url = result.template.url
     markers = ", ".join(result.shared_markers[:6]) or "no owner markers present"
+    # The endpoint belongs in the title: two collections exposing the same
+    # object id ("baskets/200" vs "invoices/200") are two findings, and a
+    # title without the path merges them into one.
+    from urllib.parse import urlparse
+    endpoint = urlparse(url).path or url
 
     if result.kind == "anonymous":
         return (
@@ -194,7 +199,7 @@ def _describe(result: "CrossResult") -> tuple:
         verb = result.notes.split()[0] if result.notes else "Write"
         return (
             f"Cross-account {verb} accepted: {result.attacker} can modify "
-            f"{result.victim}'s object via {result.object_ref}",
+            f"{result.victim}'s object via {result.object_ref} ({endpoint})",
             result.severity,
             f"{verb} {url} as '{result.attacker}' returned HTTP {result.status} "
             f"for an object owned by '{result.victim}'. The server accepted a "
@@ -205,7 +210,7 @@ def _describe(result: "CrossResult") -> tuple:
     if result.victim == "unknown":
         return (
             f"IDOR: {result.attacker} can read an unowned record via "
-            f"{result.object_ref}",
+            f"{result.object_ref} ({endpoint})",
             result.severity,
             f"Requesting {url} as '{result.attacker}' returned HTTP "
             f"{result.status} for reference {result.object_ref}, which is not "
@@ -217,7 +222,7 @@ def _describe(result: "CrossResult") -> tuple:
 
     return (
         f"IDOR: {result.attacker} can read {result.victim}'s object via "
-        f"{result.object_ref}",
+        f"{result.object_ref} ({endpoint})",
         result.severity,
         f"Requesting {url} as '{result.attacker}' returned HTTP {result.status} "
         f"containing data owned by '{result.victim}'. Shared identifying "
@@ -1304,6 +1309,7 @@ class IdorDiffer(BaseModule):
                 category="broken-access-control",
                 description=description,
                 evidence=[f"idor_{result.kind}:{result.object_ref}"],
+                asset_keys=[f"url:{result.template.url}"],
                 remediation=(
                     "Authorise the object against the authenticated principal on "
                     "every request rather than trusting the identifier in the path. "

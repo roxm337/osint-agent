@@ -181,6 +181,10 @@ class FastExposureScan(BaseModule):
         return self.base_url.rstrip("/")
 
     async def _check_headers(self, base_url: str, timeout: int) -> list[dict]:
+        # tech_detection already reports this exact fact with its own header
+        # set; a second finding with a different title is noise, not coverage.
+        if self.state.is_module_complete("tech_detection"):
+            return []
         result = await curl(base_url, output="headers", timeout=timeout)
         headers_text = str(result.get("body", ""))
         headers = _parse_headers(headers_text)

@@ -22,6 +22,7 @@ documentation page is a nuisance.
 """
 
 import json
+import time
 from urllib.parse import urlparse, urlunparse
 
 from core.auth_harness import AuthHarness
@@ -98,17 +99,31 @@ class OpenRedirectScan(BaseModule):
             return "skipped"
 
         payloads = _payloads(PROBE_HOST)
+        try:
+            deadline = float(self.config.get("module_timeout", 300) or 300)
+        except (TypeError, ValueError):
+            deadline = 300.0
+        stop_at = time.monotonic() + max(60.0, deadline - 60.0)
         findings = []
+        tested = 0
         for url, param in targets:
+            if time.monotonic() >= stop_at:
+                self.log(f"  Time-box hit after {tested}/{len(targets)} "
+                         "targets — keeping the confirms found so far")
+                break
             finding = await self._probe(harness, identity, url, param, payloads)
+            tested += 1
             if finding:
                 findings.append(finding)
                 self.state.add_finding(**finding)
 
-        await self._openredirex_corroboration([u for u, _ in targets])
+        if time.monotonic() < stop_at - 30:
+            await self._openredirex_corroboration([u for u, _ in targets])
+        else:
+            self.log("  Skipping openredirex corroboration: inside the time-box")
 
         self.state.complete_module(self.id)
-        self.log(f"open redirect: {len(findings)} confirmed of {len(targets)} target(s)")
+        self.log(f"open redirect: {len(findings)} confirmed of {tested} target(s)")
         return "done"
 
     async def _probe(self, harness: AuthHarness, identity, url: str,
@@ -187,7 +202,7 @@ class OpenRedirectScan(BaseModule):
         if not tool_available("openredirex") or not urls:
             return
         try:
-            result = await openredirex_scan(urls[:20], timeout=180)
+            result = await openredirex_scan(urls[:20], timeout=60)
         except Exception as exc:  # a broken helper must not fail the module
             self.log(f"openredirex failed: {exc}")
             return
