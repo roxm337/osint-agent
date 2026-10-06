@@ -180,6 +180,9 @@ class WAFMapping(BaseModule):
                           f"Blocks: {len(waf_blocks)} paths",
                           f"Allows: {len(waf_allows)} paths"],
                 remediation="Map allowed paths to find WAF gaps.",
+                verified=True,
+                verification={"method": "waf_fingerprint_probes",
+                              "url": base_url},
             )
 
         # WAF gap finding (what's allowed that shouldn't be). There has to be a
@@ -197,6 +200,9 @@ class WAFMapping(BaseModule):
                             f"{[a['path'] for a in sensitive_allowed]}.",
                 evidence=[f"Allowed sensitive paths: {sensitive_allowed}"],
                 remediation="Add WAF rules to protect sensitive paths.",
+                verified=True,
+                verification={"method": "waf_gap_probes",
+                              "url": base_url},
             )
         elif sensitive_allowed:
             self.log(f"  {len(sensitive_allowed)} sensitive path(s) served 200 with "

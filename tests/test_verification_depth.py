@@ -468,3 +468,93 @@ def test_tls_cert_expired_is_verified():
     match = next(f for f in state.findings["findings"] if "Expired" in f["title"])
     assert match["severity"] == "CRITICAL"
     assert match["verified"] is True
+
+
+# ── audit-clean wave: origin, tech, TLS hygiene, REST docs ──
+
+def test_origin_confirmed_is_verified():
+    import modules.origin_discovery as od
+    from modules.origin_discovery import OriginDiscovery
+    state = _state()
+    module = OriginDiscovery(state, _config())
+
+    async def fake_curl(url, **kwargs):
+        return {"status": 200, "body": "x" * 300,
+                "headers": "cf-ray: 1"}
+
+    async def fake_gather(self, cdn):
+        return [{"ip": "1.2.3.4", "source": "history"}]
+
+    async def fake_verify(self, ip, base_hash):
+        return ("confirmed", "byte-identical body")
+
+    with patch.object(od, "curl", new=fake_curl), \
+         patch.object(OriginDiscovery, "_gather_candidates",
+                      new=fake_gather), \
+         patch.object(OriginDiscovery, "_verify_origin",
+                      new=fake_verify):
+        _run(module.run())
+    match = next(f for f in state.findings["findings"]
+                 if "Origin IP Discovered" in f["title"])
+    assert match["severity"] == "HIGH"
+    assert match["verified"] is True
+
+
+def test_tech_detect_observations_are_verified():
+    import modules.tech_detect as td
+    from modules.tech_detect import TechDetection
+    state = _state()
+    module = TechDetection(state, _config())
+
+    async def fake_curl(url, **kwargs):
+        return {"status": 200, "body": "<html></html>",
+                "headers": "HTTP/1.1 200 OK\nServer: nginx/1.2.3\n"}
+
+    with patch.object(td, "curl", new=fake_curl):
+        _run(module.run())
+    by_title = {f["title"]: f for f in state.findings["findings"]}
+    assert "Missing Security Headers" in by_title
+    assert "Server Version Disclosure" in by_title
+    assert by_title["Missing Security Headers"]["verified"] is True
+    assert by_title["Server Version Disclosure"]["verified"] is True
+
+
+def test_tls_hsts_observations_are_verified():
+    from modules.tls_audit import TLSAudit
+    import modules.tls_audit as tls
+    state = _state()
+    module = TLSAudit(state, _config())
+    headers = ("strict-transport-security: max-age=60\n")
+    with patch.object(tls, "cert_info",
+                      new=AsyncMock(return_value={})), \
+         patch.object(tls, "tls_protocols",
+                      new=AsyncMock(return_value={"tls1_3": True})), \
+         patch.object(tls, "curl",
+                      new=AsyncMock(return_value={"body": headers})), \
+         patch("tools.external.tool_available", return_value=False):
+        _run(module._audit_endpoint("example.test", 443))
+    by_title = {f["title"]: f for f in state.findings["findings"]}
+    assert "HSTS Missing preload Directive" in by_title
+    assert "HSTS max-age Too Short" in by_title
+    assert by_title["HSTS Missing preload Directive"]["verified"] is True
+    assert by_title["HSTS max-age Too Short"]["verified"] is True
+
+
+def test_rest_api_docs_exposed_is_verified():
+    import modules.rest_api as ra
+    from modules.rest_api import RestAPIAudit
+    state = _state()
+    module = RestAPIAudit(state, _config())
+
+    async def fake_status(url, **kwargs):
+        if url.endswith("/openapi.json"):
+            return {"status": 200,
+                    "body": '{"openapi":"3.0.0","paths":{"/a":{}}}',
+                    "final_url": url}
+        return {"status": 404, "body": "", "final_url": url}
+
+    with patch.object(ra, "curl_with_status", new=fake_status):
+        _run(module._discover_openapi("https://example.test"))
+    match = next(f for f in state.findings["findings"]
+                 if "API Documentation Exposed" in f["title"])
+    assert match["verified"] is True

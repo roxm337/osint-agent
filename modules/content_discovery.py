@@ -235,6 +235,9 @@ class ContentDiscovery(BaseModule):
                     "at all. If it should, remove it rather than relying on a "
                     "403."
                 ),
+                verified=True,
+                verification={"method": "ffuf_dominant_group_protected",
+                              "url": protected[0]["url"] if protected else ""},
             )
 
         if redirected:

@@ -190,6 +190,9 @@ class TLSAudit(BaseModule):
                                 "Domain not eligible for browser preload list.",
                     evidence=[f"Header: {hsts_header}"],
                     remediation="Add 'preload' to HSTS header and submit to hstspreload.org.",
+                    verified=True,
+                    verification={"method": "hsts_header_observed",
+                                  "url": f"{host}:{port}"},
                 )
             max_age_match = re.search(r"max-age=(\d+)", hsts_header.lower())
             if max_age_match:
@@ -204,6 +207,9 @@ class TLSAudit(BaseModule):
                                     f"recommended minimum of 15768000 (6 months).",
                         evidence=[f"Header: {hsts_header}"],
                         remediation="Increase HSTS max-age to at least 31536000 (1 year).",
+                        verified=True,
+                        verification={"method": "hsts_header_observed",
+                                      "url": f"{host}:{port}"},
                     )
 
         # 6. TLS 1.3 support check: hygiene note, not a LOW.
@@ -216,6 +222,9 @@ class TLSAudit(BaseModule):
                 description=f"{host} does not support TLS 1.3, the most secure TLS version.",
                 evidence=["TLS 1.3 handshake failed"],
                 remediation="Enable TLS 1.3 support for improved security and performance.",
+                verified=True,
+                verification={"method": "tls_handshake_offer",
+                              "url": f"{host}:{port}"},
             )
 
         # 7. Certificate SANs: in-scope names become subdomain leads, and

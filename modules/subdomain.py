@@ -211,4 +211,7 @@ class SubdomainEnum(BaseModule):
                             f"results may contain false positives.",
                 evidence=[f"*.{self.domain} → {result['answers']}"],
                 remediation="Review wildcard DNS configuration.",
+                verified=True,
+                verification={"method": "random_subdomain_resolves",
+                              "url": random_sub},
             )

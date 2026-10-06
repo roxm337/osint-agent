@@ -142,6 +142,9 @@ class OriginDiscovery(BaseModule):
                     "Restrict origin server to only accept connections from CDN IP ranges. "
                     "Implement firewall rules blocking direct access from non-CDN sources."
                 ),
+                verified=True,
+                verification={"method": "origin_content_or_cert",
+                              "url": self.base_url},
             )
         if likely:
             self.state.add_finding(

@@ -832,7 +832,10 @@ def test_cloud_unreadable_sensitive_names_step_down_to_high(monkeypatch):
                 if f["title"].startswith("Public Cloud Bucket: example ")]
     assert len(findings) == 1
     assert findings[0]["severity"] == "HIGH"
-    assert findings[0]["verified"] is False
+    # The listing itself is the proof: keys are visible unauthenticated.
+    # Readability of the objects decides CRITICAL vs HIGH, not
+    # verified vs unverified.
+    assert findings[0]["verified"] is True
 
 
 def test_cloud_body_only_mentions_never_critical(monkeypatch):

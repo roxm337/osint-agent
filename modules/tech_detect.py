@@ -296,6 +296,9 @@ class TechDetection(BaseModule):
                 remediation="Add HSTS, CSP, X-Frame-Options, X-Content-Type-Options, "
                             "Referrer-Policy, and Permissions-Policy headers.",
                 asset_keys=[f"webapp:{base_url}"],
+                verified=True,
+                verification={"method": "response_headers_observed",
+                              "url": base_url},
             )
 
         # Check for version disclosure
@@ -311,6 +314,9 @@ class TechDetection(BaseModule):
                 evidence=[f"Server: {tech['server']}"],
                 remediation="Remove version information from Server header.",
                 asset_keys=[f"webapp:{base_url}"],
+                verified=True,
+                verification={"method": "server_header_observed",
+                              "url": base_url},
             )
 
         self.state.complete_module(self.id)

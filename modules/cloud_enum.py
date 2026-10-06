@@ -166,11 +166,11 @@ class CloudEnum(BaseModule):
                         "Apply bucket ACL to block public access. Enable Block "
                         "Public Access settings."
                     ),
-                    verified=severity == "CRITICAL",
+                    verified=True,
                     verification={
                         "method": ("sensitive_object_readable_unauthenticated"
                                    if severity == "CRITICAL"
-                                   else "http_200_unauthenticated"),
+                                   else "public_bucket_listing_unauthenticated"),
                         "listing_detected": listing,
                         "keys_visible": len(keys),
                         "sensitive_markers": sensitive,

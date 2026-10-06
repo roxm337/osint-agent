@@ -216,6 +216,9 @@ class RestAPIAudit(BaseModule):
                                 description=f"Akismet API key accessible without auth at {full_url}",
                                 evidence=[f"Response: {body[:100]}"],
                                 remediation="Restrict /akismet/ endpoints to authenticated admins.",
+                                verified=True,
+                                verification={"method": "rest_json_key_returned",
+                                              "url": full_url},
                             )
                     except json.JSONDecodeError:
                         pass
@@ -228,6 +231,9 @@ class RestAPIAudit(BaseModule):
                         description=f"Form plugin REST endpoint accessible: {full_url}",
                         evidence=[f"Endpoint: {full_url}"],
                         remediation="Restrict plugin REST endpoints to authenticated users.",
+                        verified=True,
+                        verification={"method": "rest_endpoint_accessible",
+                                      "url": full_url},
                     )
 
     async def _check_file_size_ssrf(self, endpoint_url: str) -> None:
@@ -413,6 +419,9 @@ class RestAPIAudit(BaseModule):
                     "Restrict API documentation to authenticated users or internal networks. "
                     "Remove server URLs that reveal internal infrastructure."
                 ),
+                verified=True,
+                verification={"method": "openapi_docs_fetched",
+                              "url": final},
             )
 
             # Swagger UI shells embed the spec in swagger-ui-init.js next
