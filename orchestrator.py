@@ -225,6 +225,8 @@ class Orchestrator:
         for module_id in module_ids:
             # Skip if already completed
             if self.state.is_module_complete(module_id):
+                print(f"  ⏭ {module_id}: already complete, skipping "
+                      f"(delete state to force a re-run)")
                 continue
 
             entry = MODULE_REGISTRY.get(module_id)
