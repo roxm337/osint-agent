@@ -417,3 +417,69 @@ class VerificationOracle:
             Confidence.TENTATIVE: 30,
         }
         return mapping.get(verdict.confidence, 0)
+
+
+def looks_unsanitized(body: str, payload: str, marker: str) -> bool:
+    """Is the payload present in the response *as sent*?
+
+    The body is never unescaped before matching: unescaping makes the
+    encoding that defends against the payload look like proof of it (an
+    entity-encoded `&lt;svg...&gt;` unescapes straight back into the
+    payload). The dangerous pieces have to appear verbatim, or not at
+    all — either the whole payload, or every executable fragment of it.
+    """
+    if not body:
+        return False
+    if payload in body:
+        return True
+    dangerous_fragments = [
+        "<svg",
+        "onload=",
+        "document.body.append",
+        f"`{marker}`.repeat(2)",
+    ]
+    raw = body.lower()
+    return all(fragment.lower() in raw for fragment in dangerous_fragments)
+
+
+async def probe_reflected_xss(url: str, param: str, payloads: list,
+                              fetch) -> tuple:
+    """Marker gate + payload ladder for reflected XSS.
+
+    `fetch` is `async (url) -> body str` (the caller's own client).
+    Returns (payload, test_url, verdict): FIRM when a payload reflects
+    verbatim, TENTATIVE otherwise. A unique marker must reflect first —
+    a parameter that swallows input needs no payloads. Each payload
+    carries its own execution marker so one payload's reflection can
+    never confirm another's.
+    """
+    import secrets as _secrets
+    from core.validators import inject_param as _inject
+
+    try:
+        marker_body = await fetch(_inject(url, param,
+                                          f"osintxss{_secrets.token_hex(4)}"))
+    except Exception:
+        return "", "", Verdict(Confidence.TENTATIVE, 0.0,
+                               reason="marker probe failed")
+    if "osintxss" not in (marker_body or ""):
+        return "", "", Verdict(Confidence.TENTATIVE, 0.0,
+                               reason="parameter does not reflect input")
+
+    for make_payload in payloads:
+        exec_marker = _secrets.token_hex(4)
+        payload = make_payload(exec_marker) \
+            if callable(make_payload) else make_payload
+        test_url = _inject(url, param, payload)
+        try:
+            body = await fetch(test_url)
+        except Exception:
+            continue
+        if looks_unsanitized(body or "", payload, exec_marker):
+            return payload, test_url, Verdict(
+                Confidence.FIRM, 0.8,
+                evidence={"reflected": {"payload": payload,
+                                        "test_url": test_url}},
+                reason="payload reflected verbatim with executable metacharacters")
+    return "", "", Verdict(Confidence.TENTATIVE, 0.0,
+                           reason="no payload reflected verbatim")

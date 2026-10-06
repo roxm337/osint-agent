@@ -22,6 +22,14 @@ CLOUD_METADATA_URLS = {
     ],
 }
 
+# A 200 alone is not metadata: any echo service answers 200. Each
+# provider must name itself in the body before the finding is filed.
+CLOUD_METADATA_MARKERS = {
+    "aws": ("ami-id", "instance-id", "security-credentials", "ami-launch-index"),
+    "gcp": ("service-accounts", "project-id", "instance/", "zone"),
+    "azure": ("azEnvironment", "compute", "network", "subscriptionId"),
+}
+
 
 @action(
     id="web.ssrf.cloud_metadata",
@@ -42,17 +50,22 @@ async def ssrf_cloud_metadata(ctx: ActionContext) -> ActionResult:
     findings = []
 
     for provider, metadata_urls in CLOUD_METADATA_URLS.items():
+        markers = CLOUD_METADATA_MARKERS.get(provider, ())
         for metadata_url in metadata_urls:
             test_url = inject_param(url, param, metadata_url)
             result = await curl(test_url, method=method, output="full")
-            body = result.get("body", "")
+            body = result.get("body", "") or ""
             status = result.get("status", 0)
+            lowered = body.lower()
 
-            if status == 200 and body and len(body) > 10:
+            if status == 200 and body and len(body) > 10 and \
+                    any(marker in lowered for marker in markers):
+                hit = next(marker for marker in markers if marker in lowered)
                 findings.append({
                     "provider": provider,
                     "metadata_url": metadata_url,
                     "status": status,
+                    "marker": hit,
                     "body_preview": body[:300],
                 })
 

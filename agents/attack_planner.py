@@ -95,6 +95,9 @@ def fallback_plan(bundle: dict) -> dict:
 
     hypotheses = []
     for finding in top_findings[:5]:
+        category = str(finding.get("category", ""))
+        action_id, ceiling = _action_for_category(
+            f"{finding.get('title', '')} {category}")
         hypotheses.append({
             "rank": len(hypotheses) + 1,
             "title": f"Validate and deepen {finding.get('title', 'top finding')}",
@@ -102,9 +105,11 @@ def fallback_plan(bundle: dict) -> dict:
             "impact": str(finding.get("severity", "MEDIUM")).lower(),
             "why": (
                 f"Existing finding {finding.get('id', '')} has score "
-                f"{finding.get('risk_score', 0)} and category {finding.get('category', '')}."
+                f"{finding.get('risk_score', 0)} and category {category}."
             ),
-            "recommended_module": _module_for_category(str(finding.get("category", ""))),
+            "recommended_module": _module_for_category(category),
+            "suggested_action": action_id,
+            "needs_ceiling": ceiling,
             "validation": "Reproduce the observation with rate-limited checks and capture minimal proof.",
             "confirming_evidence": "Fresh evidence showing the same condition on a live asset.",
         })
@@ -178,13 +183,18 @@ def render_attack_plan(plan: dict, target: str) -> str:
         "",
     ]
     for item in plan.get("top_hypotheses", []):
+        action_line = ""
+        if item.get("suggested_action"):
+            action_line = (
+                f"\n- **Proving Action:** `{item['suggested_action']}` "
+                f"(needs ceiling {item.get('needs_ceiling', '?')})")
         lines.extend([
             f"### {item.get('rank', '-')}. {item.get('title', 'Untitled hypothesis')}",
             "",
             f"- **Likelihood:** {item.get('likelihood', '-')}",
             f"- **Impact:** {item.get('impact', '-')}",
             f"- **Why:** {item.get('why', '-')}",
-            f"- **Recommended Module:** `{item.get('recommended_module', 'manual_review')}`",
+            f"- **Recommended Module:** `{item.get('recommended_module', 'manual_review')}`{action_line}",
             f"- **Validation:** {item.get('validation', '-')}",
             f"- **Confirming Evidence:** {item.get('confirming_evidence', '-')}",
             "",
@@ -249,7 +259,64 @@ def _parse_plan(content: str) -> dict:
     parsed.setdefault("top_hypotheses", [])
     parsed.setdefault("module_sequence", [])
     parsed.setdefault("watch_items", [])
-    return parsed
+    return _attach_proving_actions(parsed)
+
+
+# Category keyword -> (proving action, minimum risk ceiling). Mirrors
+# core.chain_executor.CATEGORY_ACTIONS so the plan names actions the
+# executor can actually arm — a hypothesis without a proving action is a
+# reading suggestion, not a test plan.
+_ACTION_FOR_CATEGORY = (
+    ("sql", "web.sqli.detect", "MEDIUM"),
+    ("injection", "web.sqli.detect", "MEDIUM"),
+    ("xss", "web.xss.reflected", "MEDIUM"),
+    ("cross-site", "web.xss.reflected", "MEDIUM"),
+    ("redirect", "web.redirect.probe", "LOW"),
+    ("ssrf", "web.ssrf.oob_detect", "LOW"),
+    ("cloud", "web.ssrf.cloud_metadata", "MEDIUM"),
+    ("bucket", "web.ssrf.cloud_metadata", "MEDIUM"),
+    ("jwt", "auth.jwt.detect", "SAFE"),
+    ("token", "auth.jwt.detect", "SAFE"),
+    ("credential", "auth.jwt.detect", "SAFE"),
+)
+
+
+def _action_for_category(category: str) -> tuple:
+    """(action_id, ceiling) proving this category, or ("", "") when the
+    library has no safe proof for it."""
+    lowered = str(category or "").lower()
+    for token, action_id, ceiling in _ACTION_FOR_CATEGORY:
+        if token in lowered:
+            return action_id, ceiling
+    return "", ""
+
+
+def _attach_proving_actions(plan: dict) -> dict:
+    """Stamp every hypothesis with the action that would prove it.
+
+    LLM output is post-processed rather than trusted: model-invented
+    action ids never reach the executor. Matching runs over title, why,
+    and any category the model supplied.
+    """
+    known = {action_id for _, action_id, _ in _ACTION_FOR_CATEGORY}
+    for hypothesis in plan.get("top_hypotheses", []) or []:
+        if not isinstance(hypothesis, dict):
+            continue
+        if hypothesis.get("suggested_action") in known:
+            if not hypothesis.get("needs_ceiling"):
+                _, ceiling = _action_for_category(
+                    hypothesis["suggested_action"])
+                hypothesis["needs_ceiling"] = ceiling
+            continue
+        haystack = " ".join([
+            str(hypothesis.get("title", "")),
+            str(hypothesis.get("why", "")),
+            str(hypothesis.get("category", "")),
+        ])
+        action_id, ceiling = _action_for_category(haystack)
+        hypothesis["suggested_action"] = action_id
+        hypothesis["needs_ceiling"] = ceiling
+    return plan
 
 
 def _module_for_category(category: str) -> str:

@@ -110,18 +110,20 @@ def test_both_spellings_of_a_parameter_do_not_produce_two_probes():
 # ── it explains itself ─────────────────────────────────────────────────────
 
 def test_nothing_proposed_at_low_risk_is_explained_not_silent():
-    """The failure this exists to prevent: an empty list that means nothing.
+    """LOW-risk probes run at the LOW ceiling; MEDIUM+ stays parked with
+    the reason recorded. What must not happen is silence either way."""
 
-    Every injection action in the library is MEDIUM or above, so the default
-    LOW ceiling legitimately proposes nothing. What must not happen is that
-    being indistinguishable from having found nothing.
-    """
     g = _graph(_search_url())
     edges = g.propose_test_edges(risk_ceiling="LOW")
-    assert edges == []
+    assert edges, "the LOW redirect probe should run at a LOW ceiling"
+    from actions.registry import ActionRegistry
+    rank = {"SAFE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "DESTRUCTIVE": 4}
+    for edge in edges:
+        meta = ActionRegistry.get(edge.action_id)[0]
+        assert rank[meta.risk.value] <= rank["LOW"], edge.action_id
     plan = g.probe_plan
     assert plan["surfaces_considered"] == 1, "the surface was never even looked at"
-    assert plan["not_proposed"], "no reason recorded for proposing nothing"
+    assert plan["not_proposed"], "no reason recorded for the parked MEDIUM probes"
     joined = " ".join(plan["not_proposed"])
     assert "MEDIUM" in joined and "LOW" in joined
 
@@ -142,7 +144,8 @@ def test_the_plan_records_the_ceiling_it_used():
 def test_an_unknown_ceiling_falls_back_to_low_and_says_so():
     g = _graph(_search_url())
     edges = g.propose_test_edges(risk_ceiling="NONSENSE")
-    assert edges == []
+    assert all(e.action_id == "web.redirect.probe" for e in edges), \
+        "unknown ceiling behaves as LOW: only LOW probes"
     assert g.probe_plan["risk_ceiling"] == "NONSENSE"
     assert g.probe_plan["surfaces_considered"] == 1
 
@@ -157,10 +160,11 @@ def test_a_low_ceiling_never_proposes_a_medium_action():
     let every injection action through a LOW ceiling.
     """
     from actions.registry import ActionRegistry
+    rank = {"SAFE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "DESTRUCTIVE": 4}
     g = _graph(_search_url(), _param_node())
     for edge in g.propose_test_edges(risk_ceiling="LOW"):
         meta = ActionRegistry.get(edge.action_id)[0]
-        assert meta.risk.value == "SAFE", (
+        assert rank[meta.risk.value] <= rank["LOW"], (
             f"{edge.action_id} is {meta.risk.value} and got through a LOW ceiling"
         )
 

@@ -190,6 +190,8 @@ async def nuclei_scan(target_url: str,
         "-jsonl",
         "-silent",
         "-no-color",
+        "-duc",  # skip the template update check: on a cold run it burns
+        # minutes of wall clock before any template runs
         "-rate-limit", str(rate_limit),
         "-timeout", "8",
         "-retries", "2",
@@ -226,6 +228,7 @@ async def nuclei_multi(targets: list,
     args = [
         "nuclei",
         "-jsonl", "-silent", "-no-color",
+        "-duc",  # skip the template update check (see nuclei_scan)
         "-rate-limit", str(rate_limit),
         "-timeout", "8",
         "-retries", "2",
@@ -443,8 +446,14 @@ def parse_dalfox_jsonl(text: str) -> List[dict]:
     return findings
 
 
-async def dalfox_scan(urls: List[str], timeout: int = 600) -> dict:
-    """Run Dalfox in conservative pipe mode."""
+async def dalfox_scan(urls: List[str], timeout: int = 600,
+                     blind: Optional[str] = None) -> dict:
+    """Run Dalfox in conservative pipe mode.
+
+    `blind` is an out-of-band callback URL (interactsh): dalfox injects
+    blind payloads that phone home, and a callback is execution proof
+    for stored/blind contexts the response scan cannot see.
+    """
     if not tool_available("dalfox"):
         return {"available": False, "results": [], "error": "missing"}
 
@@ -455,6 +464,8 @@ async def dalfox_scan(urls: List[str], timeout: int = 600) -> dict:
         "--skip-bav",
         "--only-poc", "v",
     ]
+    if blind:
+        args.extend(["--blind", blind])
     result = await run_command(args, timeout=timeout, stdin_data="\n".join(urls))
     return {
         "available": True,
@@ -522,27 +533,43 @@ def _has_oast(text: str) -> bool:
 
 
 async def sqlmap_scan(url: str, timeout: int = 900,
-                      interactsh_url: str = "") -> dict:
-    """Run sqlmap with conservative risk/level defaults.
+                      interactsh_url: str = "",
+                      risk: int = 1, level: int = 1,
+                      cookie: str = "", headers: str = "") -> dict:
+    """Run sqlmap with caller-chosen risk/level and optional auth.
 
     `interactsh_url` turns on sqlmap's own out-of-band mode, which is the only
     way a blind injection gets proof: an in-band response looks identical
     whether or not the query executed. Left empty, nothing changes.
+    `cookie`/`headers` carry an authorized session so authenticated
+    endpoints are tested as the user, not as anonymous.
     """
     if not tool_available("sqlmap"):
         return {"available": False, "results": [], "error": "missing"}
+    try:
+        risk = max(1, min(3, int(risk)))
+    except (TypeError, ValueError):
+        risk = 1
+    try:
+        level = max(1, min(5, int(level)))
+    except (TypeError, ValueError):
+        level = 1
 
     args = [
         "sqlmap", "-u", url,
         "--batch",
-        "--risk", "1",
-        "--level", "1",
+        "--risk", str(risk),
+        "--level", str(level),
         "--threads", "1",
         "--smart",
         "--flush-session",
     ]
     if interactsh_url:
         args += ["--oast", "--interactsh-url", interactsh_url]
+    if cookie:
+        args += ["--cookie", cookie]
+    if headers:
+        args += ["--headers", headers]
     result = await run_command(args, timeout=timeout)
     oast = _has_oast(result["stdout"]) or _has_oast(result["stderr"])
     return {

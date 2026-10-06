@@ -223,6 +223,10 @@ class AttackGraph:
     PROBE_ACTIONS: list[str] = [
         "web.sqli.detect",
         "web.xss.reflected",
+        # LOW risk, so this is the probe that runs at the default LOW
+        # ceiling: every parameterized surface gets an open-redirect
+        # check even when injection testing stays parked.
+        "web.redirect.probe",
     ]
 
     def propose_test_edges(self, max_edges: int = 100,
@@ -233,13 +237,13 @@ class AttackGraph:
         a noisy attack, and the cost of a wasted probe is not the same as the
         cost of a wasted report.
 
-        The risk ceiling is honoured rather than worked around. Every injection
-        action in the library is MEDIUM or above, so at the default LOW ceiling
-        this proposes nothing — which is the correct answer, and the reason is
-        recorded in `self.probe_plan` so the caller can say so out loud. The
-        previous behaviour was to return an empty list indistinguishable from
-        "there was nothing to test", which is how a scan of a real application
-        reported zero chains and no explanation.
+        The risk ceiling is honoured rather than worked around. Injection
+        actions are MEDIUM or above, so at the default LOW ceiling only
+        the LOW redirect probe is proposed; anything hotter is parked and
+        the reason is recorded in `self.probe_plan` so the caller can say
+        so out loud. The previous behaviour was to return an empty list
+        indistinguishable from "there was nothing to test", which is how
+        a scan of a real application reported zero chains and no explanation.
 
         Returns only the edges it created.
         """

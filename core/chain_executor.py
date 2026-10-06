@@ -94,6 +94,7 @@ CATEGORY_ACTIONS: list[tuple[str, str]] = [
     ("sql", "web.sqli.detect"),
     ("injection", "web.sqli.detect"),
     ("xss", "web.xss.reflected"),
+    ("redirect", "web.redirect.probe"),
     ("ssrf", "web.ssrf.oob_detect"),
     ("cloud", "web.ssrf.cloud_metadata"),
     ("jwt", "auth.jwt.detect"),
@@ -151,13 +152,15 @@ class ChainExecutor:
     def __init__(self, state, config: Optional[dict] = None,
                  budget=None, audit=None,
                  max_risk: RiskLevel = RiskLevel.LOW,
-                 max_actions: int = 25):
+                 max_actions: int = 25,
+                 module_id: str = "chain_executor"):
         self.state = state
         self.config = config or {}
         self.budget = budget
         self.audit = audit
         self.max_risk = max_risk
         self.max_actions = max(0, int(max_actions))
+        self.module_id = module_id or "chain_executor"
         self._used = 0
         # Edges we recognised but could not arm, so the operator can see that
         # coverage was limited instead of assuming the run was exhaustive.
@@ -357,20 +360,30 @@ class ChainExecutor:
 
     async def execute(self, chains, max_chains: int = 10) -> ExecutionReport:
         report = ExecutionReport()
-        for chain in list(chains)[:max_chains]:
-            for planned in self.plan(chain):
-                if self._used >= self.max_actions:
-                    report.skipped.append(EdgeOutcome(
-                        edge=planned.edge, action_id=planned.action_id,
-                        status="skipped", detail="action budget exhausted"))
-                    continue
-                outcome = await self._run_one(planned)
-                if outcome.status == "ran":
-                    report.ran.append(outcome)
-                elif outcome.status == "blocked_risk":
-                    report.blocked.append(outcome)
-                else:
-                    report.skipped.append(outcome)
+        # Execution runs outside any module run, so without this the proven
+        # findings were tagged with an empty module id — orphaned from every
+        # module view — and every re-run stacked a fresh copy next to the
+        # stale ones. Prune our own previous claims, tag the new ones.
+        previous_current = self.state.module.get("current")
+        self.state.prune_module_findings(self.module_id)
+        self.state.module["current"] = self.module_id
+        try:
+            for chain in list(chains)[:max_chains]:
+                for planned in self.plan(chain):
+                    if self._used >= self.max_actions:
+                        report.skipped.append(EdgeOutcome(
+                            edge=planned.edge, action_id=planned.action_id,
+                            status="skipped", detail="action budget exhausted"))
+                        continue
+                    outcome = await self._run_one(planned)
+                    if outcome.status == "ran":
+                        report.ran.append(outcome)
+                    elif outcome.status == "blocked_risk":
+                        report.blocked.append(outcome)
+                    else:
+                        report.skipped.append(outcome)
+        finally:
+            self.state.module["current"] = previous_current
         report.unarmable = list(self.unarmable)
         return report
 
@@ -489,19 +502,15 @@ class ChainExecutor:
 
 
 def _severity_for(edge: AttackEdge, evidence: dict) -> str:
-    """Impact edge, boosted by anything the action said it actually got."""
-    base = "MEDIUM" if edge.impact >= 0.6 else "LOW"
-    hint = " ".join(
-        str(v).lower() for v in evidence.values() if isinstance(v, (str, int))
-    )
-    for token, severity in (
-        ("admin", "HIGH"), ("root", "HIGH"), ("token", "HIGH"),
-        ("credential", "HIGH"), ("secret", "HIGH"), ("executed", "HIGH"),
-        ("metadata", "HIGH"), ("rce", "CRITICAL"),
-    ):
-        if token in hint:
-            return severity
-    return base
+    """Impact edge, from the graph's own impact score — not from sniffing
+    the evidence text for words like "admin". Substring severity was
+    inflation by vocabulary: any finding mentioning a token became HIGH.
+    """
+    if edge.impact >= 0.85:
+        return "HIGH"
+    if edge.impact >= 0.6:
+        return "MEDIUM"
+    return "LOW"
 
 
 def _category_for(action_id: str) -> str:

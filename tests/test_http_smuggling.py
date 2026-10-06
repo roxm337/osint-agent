@@ -28,6 +28,16 @@ def _config(module_cfg=None):
     }
 
 
+async def _always_ambiguous(self, target):
+    """These tests pin fuzzer-output labelling; the network pre-filter
+    and the socket oracle have their own raw-socket tests elsewhere."""
+    return True, "test assumes ambiguity"
+
+
+async def _never_oracle(self, target):
+    return False
+
+
 def _run(tool_present=True, results=(), module_cfg=None):
     state = StateManager(tempfile.mkdtemp())
     module = HTTPSmuggling(state, _config(module_cfg))
@@ -37,7 +47,11 @@ def _run(tool_present=True, results=(), module_cfg=None):
     with patch("modules.http_smuggling.tool_available",
                return_value=tool_present), \
          patch("modules.http_smuggling.smuggler_scan",
-               return_value=available):
+               return_value=available), \
+         patch.object(HTTPSmuggling, "_ambiguous",
+                      lambda self, target: _always_ambiguous(self, target)), \
+         patch.object(HTTPSmuggling, "_desync_oracle",
+                      lambda self, target: _never_oracle(self, target)):
         import asyncio
         status = asyncio.run(module.run())
     return status, state
@@ -97,7 +111,11 @@ def test_each_target_gets_its_own_finding():
          patch("modules.http_smuggling.smuggler_scan",
                return_value={"available": True,
                              "results": ["[!] potential smuggling"],
-                             "exit_code": 0, "stdout": "", "stderr": ""}):
+                             "exit_code": 0, "stdout": "", "stderr": ""}), \
+         patch.object(HTTPSmuggling, "_ambiguous",
+                      lambda self, target: _always_ambiguous(self, target)), \
+         patch.object(HTTPSmuggling, "_desync_oracle",
+                      lambda self, target: _never_oracle(self, target)):
         module._targets = lambda: ["https://a.test", "https://b.test"]
         import asyncio
         asyncio.run(module.run())
@@ -158,7 +176,11 @@ def test_the_target_list_is_capped(configured, expected):
     with patch("modules.http_smuggling.tool_available", return_value=True), \
          patch("modules.http_smuggling.smuggler_scan",
                return_value={"available": True, "results": [],
-                             "exit_code": 0, "stdout": "", "stderr": ""}) as scan:
+                             "exit_code": 0, "stdout": "", "stderr": ""}) as scan, \
+         patch.object(HTTPSmuggling, "_ambiguous",
+                      lambda self, target: _always_ambiguous(self, target)), \
+         patch.object(HTTPSmuggling, "_desync_oracle",
+                      lambda self, target: _never_oracle(self, target)):
         module._targets = lambda: hosts
         import asyncio
         asyncio.run(module.run())

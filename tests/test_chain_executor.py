@@ -46,7 +46,7 @@ def _node(node_id, node_type="url", **attrs):
 
 
 def _chain(action_id=None, edge_type="exploit", url="https://example.test/s?q=1",
-           vuln_category=None):
+           vuln_category=None, impact=0.8):
     nodes = {"n1": _node("n1", "url", url=url)}
     if vuln_category:
         nodes["n2"] = _node("n2", "vuln", category=vuln_category)
@@ -55,7 +55,7 @@ def _chain(action_id=None, edge_type="exploit", url="https://example.test/s?q=1"
         nodes["n2"] = _node("n2", "goal")
         target = "n2"
     edge = AttackEdge(source_id="n1", target_id=target, edge_type=edge_type,
-                      likelihood=0.5, impact=0.8, action_id=action_id or "")
+                      likelihood=0.5, impact=impact, action_id=action_id or "")
     return FakeChain(nodes, [edge])
 
 
@@ -199,7 +199,7 @@ def test_severity_boosts_on_real_impact_words():
     _register("test.probe", "LOW", evidence={"impact": "root access obtained"})
     state = _state()
     ex = ChainExecutor(state, {})
-    asyncio_run(ex.execute([_chain(action_id="test.probe")]))
+    asyncio_run(ex.execute([_chain(action_id="test.probe", impact=0.9)]))
     assert _findings(state)[0]["severity"] == "HIGH"
 
 
@@ -209,6 +209,17 @@ def test_severity_stays_modest_without_impact_words():
     ex = ChainExecutor(state, {})
     asyncio_run(ex.execute([_chain(action_id="test.probe")]))
     assert _findings(state)[0]["severity"] == "MEDIUM"
+
+
+def test_severity_ignores_evidence_vocabulary():
+    """Severity comes from the graph's impact score, not from sniffing the
+    evidence text for words like "admin" — vocabulary inflation filed
+    HIGHs for findings that merely mentioned a token."""
+    _register("test.probe", "LOW", evidence={"impact": "root access obtained"})
+    state = _state()
+    ex = ChainExecutor(state, {})
+    asyncio_run(ex.execute([_chain(action_id="test.probe", impact=0.5)]))
+    assert _findings(state)[0]["severity"] == "LOW"
 
 
 # --- planning: which action proves which edge ---------------------------

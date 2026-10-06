@@ -40,8 +40,9 @@ def _stub_sqlmap(monkeypatch, results_by_url):
     """Replace the sqlmap call with canned output keyed by target URL."""
     seen = {}
 
-    async def fake_sqlmap_scan(url, timeout=900, interactsh_url=""):
-        seen[url] = interactsh_url
+    async def fake_sqlmap_scan(url, timeout=900, interactsh_url="",
+                               risk=1, level=1, cookie="", headers=""):
+        seen[url] = (interactsh_url, risk, level)
         payload = results_by_url.get(url, {})
         return {
             "available": True,
@@ -118,7 +119,10 @@ def test_only_the_finding_from_the_confirmed_url_is_promoted(monkeypatch):
     assert by_url["url:https://example.test/api/a?id=1"]["confidence"] == "CONFIRMED"
     assert by_url["url:https://example.test/api/b?id=1"]["confidence"] == "FIRM"
     # The server is passed to every scan, and OAST is per-request, not per-run.
-    assert set(seen.values()) == {"https://interactsh.example.test"}
+    assert {v[0] for v in seen.values()} == {"https://interactsh.example.test"}
+    # Level 1 found candidate evidence in-band on /b, so only /b escalates.
+    assert seen["https://example.test/api/a?id=1"][1:] == (1, 1)
+    assert seen["https://example.test/api/b?id=1"][1:] == (3, 3)
 
 
 def test_a_confirmed_finding_says_why(monkeypatch):

