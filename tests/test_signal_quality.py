@@ -2060,3 +2060,516 @@ def test_asn_shared_prefixes_are_scoped(monkeypatch):
     assert "104.16.0.0/13" not in cidrs, "transit /13 must not be target surface"
     assert cidrs["203.0.113.0/24"]["attrs"]["shared_hosting"] is True
     assert cidrs["203.0.113.0/24"]["confidence"] == "TENTATIVE"
+
+
+# ── Juice Shop wave: scope gates ─────────────────────────────────
+
+def test_is_public_target_grades_hosts():
+    from core.validators import is_public_target
+    assert is_public_target("example.com") is True
+    assert is_public_target("8.8.8.8") is True
+    assert is_public_target("localhost") is False
+    assert is_public_target("127.0.0.1") is False
+    assert is_public_target("app.local") is False
+    assert is_public_target("a.b") is False
+    assert is_public_target("") is False
+
+
+def test_non_public_targets_skip_dns_empire(monkeypatch):
+    import modules.subdomain as subdomain_module
+    import modules.email_security_module as email_module
+    import modules.threat_intel as threat_module
+    from modules.subdomain import SubdomainEnum
+    from modules.email_security_module import EmailSecurity
+    from modules.threat_intel import ThreatIntel
+
+    async def no_network(*args, **kwargs):
+        raise AssertionError("no network may be touched")
+
+    async def fake_crtsh(domain):
+        raise AssertionError("crt.sh must not be queried")
+
+    monkeypatch.setattr(subdomain_module, "crtsh", fake_crtsh)
+    state = _state()
+    config = {"target": {"domain": "localhost",
+                         "base_url": "http://localhost:3000"}}
+
+    assert asyncio.run(SubdomainEnum(state, config).run()) == "skipped"
+    assert asyncio.run(EmailSecurity(state, config).run()) == "skipped"
+    assert asyncio.run(ThreatIntel(state, config).run()) == "skipped"
+
+
+# ── Juice Shop wave: probe targets ──────────────────────────────
+
+def test_probe_targets_scope_and_dedupe():
+    from core.probe_targets import in_scope_url, iter_probe_points
+    base = "http://localhost:3000"
+    assert in_scope_url("http://localhost:3000/rest/products/search?q=1",
+                        base, "localhost") is True
+    assert in_scope_url("https://www.youtube.com/watch?v=1",
+                        base, "localhost") is False
+    assert in_scope_url("http://localhost:/8094/api/v1/status",
+                        base, "localhost") is False
+    assert in_scope_url("http://localhost:8094/api/v1/status",
+                        base, "localhost") is False
+    assert in_scope_url("https://example.com/?q=1",
+                        "https://example.com", "example.com") is True
+    assert in_scope_url("http://example.com:8080/?q=1",
+                        "https://example.com", "example.com") is True
+
+    state = _state()
+    state.add_asset("api_endpoint",
+                    "api:http://localhost:3000/api/Users/{id}",
+                    "http://localhost:3000/api/Users/{id}",
+                    confidence="FIRM", sources=["test"],
+                    attrs={"methods": ["GET", "PUT"]})
+    points = iter_probe_points(state, base, "localhost")
+    assert ("http://localhost:3000/api/Users/{id}", "id", "PUT") in [
+        (p["url"], p["param"], p["method"]) for p in points]
+
+
+# ── Juice Shop wave: auth audit ─────────────────────────────────
+
+def _auth_state(monkeypatch):
+    import modules.auth_audit as auth_module
+
+    async def fake_curl(url, **kwargs):
+        method = kwargs.get("method", "GET")
+        data = kwargs.get("data", "") or ""
+        if url.endswith("/rest/user/login") and method == "POST":
+            if "OR 1=1" in data or "OR '1'='1" in data or "admin'--" in data:
+                return {"status": 200,
+                        "body": '{"authentication": {"token": "'
+                                'eyJhbGciOiJIUzI1NiJ9.'
+                                'eyJlbWFpbCI6ImFkbWluQGV4YW1wbGUudGVzdCIsInJvbGUiOiJhZG1pbiJ9.'
+                                'SIG"}}',
+                        "headers": "", "time_ms": 5, "url": url}
+            return {"status": 401, "body": "Invalid email or password.",
+                    "headers": "", "time_ms": 5, "url": url}
+        if url.endswith("/rest/admin/application-configuration"):
+            auth = (kwargs.get("headers", {}) or {}).get("Authorization", "")
+            if not auth:
+                return {"status": 200,
+                        "body": '{"config": {"application": {"name": "Shop", "admin": true}}}',
+                        "headers": "", "time_ms": 5, "url": url}
+            if auth.startswith("Bearer eyJ"):
+                return {"status": 200,
+                        "body": '{"config": {"application": {"name": "Shop", "admin": true}}}',
+                        "headers": "", "time_ms": 5, "url": url}
+            return {"status": 401, "body": "Unauthorized",
+                    "headers": "", "time_ms": 5, "url": url}
+        return {"status": 404, "body": "<html>shell</html>",
+                "headers": "", "time_ms": 5, "url": url}
+
+    monkeypatch.setattr(auth_module, "curl", fake_curl)
+    state = _state()
+    return state
+
+
+def test_auth_audit_sqli_bypass_and_admin_surface(monkeypatch):
+    from modules.auth_audit import AuthAudit
+    state = _auth_state(monkeypatch)
+
+    result = asyncio.run(AuthAudit(
+        state, {"target": {"domain": "localhost",
+                           "base_url": "http://localhost:3000"}}).run())
+
+    assert result == "done"
+    titles = [f["title"] for f in state.findings["findings"]]
+    assert any("SQL Injection Authentication Bypass" in t for t in titles)
+    assert any("Admin Surface Exposed Without Authentication" in t
+               for t in titles)
+    creds = state.get_assets_by_type("identity_credential")
+    assert len(creds) == 1
+    assert creds[0]["attrs"]["technique"] == "sqli_auth_bypass"
+
+
+def test_auth_audit_none_alg_forgery_accepted(monkeypatch):
+    import modules.auth_audit as auth_module
+    from modules.auth_audit import AuthAudit, _none_alg_variant
+
+    async def fake_curl(url, **kwargs):
+        auth = (kwargs.get("headers", {}) or {}).get("Authorization", "")
+        if url.endswith("/rest/admin/application-configuration"):
+            if not auth:
+                return {"status": 401, "body": "Unauthorized",
+                        "headers": "", "time_ms": 5, "url": url}
+            return {"status": 200,
+                    "body": '{"config": {"admin": true}}',
+                    "headers": "", "time_ms": 5, "url": url}
+        return {"status": 404, "body": "<html>shell</html>",
+                "headers": "", "time_ms": 5, "url": url}
+
+    monkeypatch.setattr(auth_module, "curl", fake_curl)
+    state = _state()
+    forged = _none_alg_variant(
+        "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IngifQ.SIG")
+    assert forged.split(".")[0] != "eyJhbGciOiJIUzI1NiJ9"
+    assert forged.endswith(".")
+
+    module = AuthAudit(state, {"target": {"domain": "localhost",
+                                          "base_url": "http://localhost:3000"}})
+    asyncio.run(module._authenticated_follow_ups(
+        {"token": "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IngifQ.SIG",
+         "email": "x", "role": ""}))
+
+    assert any(f["title"].startswith("Unsigned JWT Accepted")
+               for f in state.findings["findings"])
+
+
+# ── Juice Shop wave: response keys ──────────────────────────────
+
+def test_response_audit_flags_password_hash(monkeypatch):
+    import modules.response_audit as response_module
+    from modules.response_audit import ResponseAudit
+
+    async def fake_curl(url, **kwargs):
+        if url.endswith("/api/Users/1"):
+            return {"status": 200,
+                    "body": '{"status": "success", "data": '
+                            '{"id": 1, "email": "a@b.c", '
+                            '"password": "5f4dcc3b5aa765d61d8327deb882cf99"}}',
+                    "time_ms": 5, "url": url}
+        return {"status": 401, "body": "Unauthorized",
+                "time_ms": 5, "url": url}
+
+    monkeypatch.setattr(response_module, "curl", fake_curl)
+    state = _state()
+    state.add_asset("api_endpoint", "api:http://localhost:3000/api/Users/1",
+                    "http://localhost:3000/api/Users/1", confidence="FIRM",
+                    sources=["test"], attrs={})
+
+    result = asyncio.run(ResponseAudit(
+        state, {"target": {"domain": "localhost",
+                           "base_url": "http://localhost:3000"}}).run())
+
+    assert result == "done"
+    assert len(state.findings["findings"]) == 1
+    finding = state.findings["findings"][0]
+    assert finding["severity"] == "HIGH"
+    assert finding["verified"] is True
+    assert "5f4dcc3b5aa765d61d8327deb882cf99" not in finding["evidence"][0]
+    assert finding["evidence"][0].startswith("password: 5f4d")
+
+
+# ── Juice Shop wave: NoSQL + SSTI oracles ───────────────────────
+
+def test_nosql_operator_differential_fires(monkeypatch):
+    import modules.nosql_scan as nosql_module
+    from modules.nosql_scan import NoSQLScan
+
+    async def fake_curl(url, **kwargs):
+        from urllib.parse import urlparse, parse_qs
+        query = parse_qs(urlparse(url).query)
+        flat = str(query)
+        if "zzz_no_such_value_9f8" in flat and "$" not in flat:
+            return {"status": 200,
+                    "body": '{"status": "success", "data": []}',
+                    "time_ms": 5, "url": url}
+        if "$gt" in flat or "$ne" in flat:
+            return {"status": 200,
+                    "body": '{"status": "success", "data": '
+                            '[{"orderId": "1"}, {"orderId": "2"}]}',
+                    "time_ms": 5, "url": url}
+        return {"status": 200,
+                "body": '{"status": "success", "data": []}',
+                "time_ms": 5, "url": url}
+
+    monkeypatch.setattr(nosql_module, "curl", fake_curl)
+    state = _state()
+    state.add_asset("parameter", "param:http://example.com/api/orders:orderId",
+                    "orderId", confidence="FIRM", sources=["test"],
+                    attrs={"url": "http://example.com/api/orders",
+                           "source": "test"})
+
+    result = asyncio.run(NoSQLScan(
+        state, {"target": {"domain": "example.com",
+                           "base_url": "http://example.com"}}).run())
+
+    assert result == "done"
+    assert len(state.findings["findings"]) == 1
+    assert state.findings["findings"][0]["severity"] == "HIGH"
+
+
+def test_ssti_arithmetic_differential(monkeypatch):
+    import modules.ssti_scan as ssti_module
+    from modules.ssti_scan import SSTIScan
+
+    async def fake_curl(url, **kwargs):
+        from urllib.parse import urlparse, parse_qs, unquote
+        query = parse_qs(urlparse(url).query)
+        value = query.get("q", [""])[0]
+        if value == "zz74x74zz":
+            return {"status": 200, "body": "<p>hello zz74x74zz, price 49</p>",
+                    "time_ms": 5, "url": url}
+        if "{{7*7}}" in value:
+            return {"status": 200, "body": "<p>hello 49, price 49</p>",
+                    "time_ms": 5, "url": url}
+        return {"status": 200, "body": f"<p>hello {value}</p>",
+                "time_ms": 5, "url": url}
+
+    monkeypatch.setattr(ssti_module, "curl", fake_curl)
+    state = _state()
+    state.add_asset("parameter", "param:http://example.com/search:q",
+                    "q", confidence="FIRM", sources=["test"],
+                    attrs={"url": "http://example.com/search",
+                           "source": "test"})
+
+    result = asyncio.run(SSTIScan(
+        state, {"target": {"domain": "example.com",
+                           "base_url": "http://example.com"}}).run())
+
+    assert result == "done"
+    assert len(state.findings["findings"]) == 1
+    assert "Jinja" in state.findings["findings"][0]["title"] or \
+        "jinja2" in state.findings["findings"][0]["title"].lower()
+
+
+def test_ssti_price_page_does_not_fire(monkeypatch):
+    import modules.ssti_scan as ssti_module
+    from modules.ssti_scan import SSTIScan
+
+    async def fake_curl(url, **kwargs):
+        # Every price on the page contains 49; payloads reflect literally.
+        return {"status": 200,
+                "body": "<p>$49.00 gala apple, 49 left</p>",
+                "time_ms": 5, "url": url}
+
+    monkeypatch.setattr(ssti_module, "curl", fake_curl)
+    state = _state()
+    state.add_asset("parameter", "param:http://example.com/search:q",
+                    "q", confidence="FIRM", sources=["test"],
+                    attrs={"url": "http://example.com/search",
+                           "source": "test"})
+
+    assert asyncio.run(SSTIScan(
+        state, {"target": {"domain": "example.com",
+                           "base_url": "http://example.com"}}).run()) == "done"
+    assert state.findings["findings"] == []
+
+
+# ── Juice Shop wave: upload + DOM + backup bypass ───────────────
+
+def test_upload_svg_served_intact_is_stored_xss(monkeypatch):
+    import re as _re
+    import modules.upload_audit as upload_module
+    from modules.upload_audit import UploadAudit
+
+    markers = {}
+
+    async def fake_curl(url, **kwargs):
+        if url.endswith("/file-upload") and kwargs.get("method") == "POST":
+            ctype = (kwargs.get("headers", {}) or {}).get("Content-Type", "")
+            if "multipart" in ctype:
+                data = kwargs.get("data", b"") or b""
+                raw = data if isinstance(data, bytes) else data.encode()
+                match = _re.search(rb"upl[0-9a-f]{8}", raw)
+                if match:
+                    markers["m"] = match.group(0).decode()
+                return {"status": 201,
+                        "body": '{"location": "/uploads/probe.svg"}',
+                        "time_ms": 5, "url": url}
+            data = kwargs.get("data", b"") or b""
+            if b"XXE_PROBE_CANARY" in (data if isinstance(data, bytes)
+                                       else data.encode()):
+                return {"status": 200,
+                        "body": "<r>plain text, no entities</r>",
+                        "time_ms": 5, "url": url}
+            return {"status": 415, "body": "unsupported",
+                    "time_ms": 5, "url": url}
+        if url.endswith("/uploads/probe.svg"):
+            marker = markers.get("m", "MARK")
+            return {"status": 200,
+                    "body": f"<svg onload=\"x\">{marker}</svg>",
+                    "time_ms": 5, "url": url}
+        return {"status": 404, "body": "nope", "time_ms": 5, "url": url}
+
+    monkeypatch.setattr(upload_module, "curl", fake_curl)
+    state = _state()
+
+    result = asyncio.run(UploadAudit(
+        state, {"target": {"domain": "example.com",
+                           "base_url": "http://example.com"}}).run())
+
+    assert result == "done"
+    stored = [f for f in state.findings["findings"]
+              if f["title"].startswith("Stored Script via SVG Upload")]
+    assert len(stored) >= 1
+    assert all(f["verified"] is True for f in stored)
+    assert any("http://example.com/file-upload" in f["title"]
+               for f in stored)
+
+
+def test_upload_xxe_canary_expansion(monkeypatch):
+    import modules.upload_audit as upload_module
+    from modules.upload_audit import UploadAudit
+
+    async def fake_curl(url, **kwargs):
+        if url.endswith("/file-upload") and kwargs.get("method") == "POST":
+            ctype = (kwargs.get("headers", {}) or {}).get("Content-Type", "")
+            if "multipart" in ctype:
+                return {"status": 200, "body": '{"ok": true}',
+                        "time_ms": 5, "url": url}
+            return {"status": 200,
+                    "body": "<r>XXE_PROBE_CANARY_7f3a expanded here</r>",
+                    "time_ms": 5, "url": url}
+        return {"status": 404, "body": "nope", "time_ms": 5, "url": url}
+
+    monkeypatch.setattr(upload_module, "curl", fake_curl)
+    state = _state()
+
+    result = asyncio.run(UploadAudit(
+        state, {"target": {"domain": "example.com",
+                           "base_url": "http://example.com"}}).run())
+
+    assert result == "done"
+    xxe = [f for f in state.findings["findings"]
+           if f["title"].startswith("XXE Entity Expansion")]
+    assert len(xxe) >= 1
+    assert all(f["severity"] == "HIGH" for f in xxe)
+    assert any("http://example.com/file-upload" in f["title"] for f in xxe)
+
+
+def test_dom_xss_candidate_building_preserves_fragments():
+    import asyncio as _asyncio
+    import modules.dom_xss_scan as dom_module
+    from modules.dom_xss_scan import DomXSSScan
+
+    state = _state()
+    state.add_asset("url", "url:http://example.com/#/search",
+                    "http://example.com/#/search", confidence="FIRM",
+                    sources=["test"], attrs={})
+    module = DomXSSScan(state, {"target": {"domain": "example.com",
+                                           "base_url": "http://example.com"}})
+    pages = module._target_pages()
+    assert "http://example.com/#/search" in pages
+
+    seen_urls = []
+
+    async def fake_browser(url, expected, config):
+        seen_urls.append(url)
+        return False
+
+    monkeypatch_browser = __import__("pytest").MonkeyPatch()
+    monkeypatch_browser.setattr(dom_module, "_browser_executes", fake_browser)
+    try:
+        assert _asyncio.run(module._test_page(
+            "http://example.com/#/search")) is False
+    finally:
+        monkeypatch_browser.undo()
+    assert any("/#/search?q=" in url for url in seen_urls), seen_urls
+
+
+def test_misconfig_backup_bypass_variant(monkeypatch):
+    import modules.misconfig as misconfig_module
+    from modules.misconfig import MisconfigProbes
+    from core.site_profile import clear_profiles
+
+    clear_profiles()
+
+    async def fake_curl(url, **kwargs):
+        if url == "http://example.com":
+            return {"status": 200, "body": "BASE SHELL"}
+        if url.endswith("package.json.bak"):
+            return {"status": 403, "body": "BASE SHELL"}
+        if url.endswith("package.json.bak%2500.md"):
+            return {"status": 200,
+                    "body": '{"name": "shop", "version": "1.0.0"}'}
+        return {"status": 404, "body": "BASE SHELL"}
+
+    async def fake_curl_status(url, timeout=5):
+        result = await fake_curl(url)
+        return {"status": result["status"], "body": result["body"],
+                "content_type": ""}
+
+    monkeypatch.setattr(misconfig_module, "curl_with_status",
+                        fake_curl_status)
+    state = _state()
+
+    result = asyncio.run(MisconfigProbes(
+        state, {"target": {"domain": "example.com",
+                           "base_url": "http://example.com"},
+                "misconfig": {"max_paths": 5}}).run())
+
+    assert result == "done"
+    backups = [f for f in state.findings["findings"]
+               if f["title"] == "Backup File Exposed"]
+    assert len(backups) == 1
+    assert backups[0]["severity"] == "HIGH"
+    assert "%2500" in backups[0]["evidence"][0]
+
+
+# ── Juice Shop wave: forgery sweep + identity merge ─────────────
+
+def test_forgery_sweep_accepts_none_on_guarded_endpoint(monkeypatch):
+    from modules.auth_audit import AuthAudit
+
+    async def fake_get(url, auth):
+        if not auth:
+            return {"status": 401, "body": "Unauthorized"}
+        if "none" in str(auth.get("Authorization", "")).lower() or \
+                auth.get("Authorization", "").endswith("."):
+            return {"status": 200,
+                    "body": '{"id": 1, "email": "victim@example.com"}'}
+        return {"status": 200,
+                "body": '{"id": 1, "email": "victim@example.com"}'}
+
+    monkeypatch.setattr("modules.auth_audit._get", fake_get)
+    state = _state()
+    state.add_asset("api_endpoint", "api:http://example.com/api/Users/1",
+                    "http://example.com/api/Users/1", confidence="FIRM",
+                    sources=["test"], attrs={})
+    module = AuthAudit(state, {"target": {"domain": "example.com",
+                                          "base_url": "http://example.com"}})
+
+    asyncio.run(module._forgery_sweep(
+        {"token": "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IngifQ.SIG",
+         "email": "x", "role": ""}))
+
+    assert len(state.findings["findings"]) == 1
+    finding = state.findings["findings"][0]
+    assert finding["severity"] == "CRITICAL"
+    assert finding["verified"] is True
+
+
+def test_forgery_sweep_ignores_open_endpoints(monkeypatch):
+    from modules.auth_audit import AuthAudit
+
+    async def fake_get(url, auth):
+        return {"status": 200, "body": '{"public": true}'}
+
+    monkeypatch.setattr("modules.auth_audit._get", fake_get)
+    state = _state()
+    state.add_asset("api_endpoint", "api:http://example.com/api/Products",
+                    "http://example.com/api/Products", confidence="FIRM",
+                    sources=["test"], attrs={})
+    module = AuthAudit(state, {"target": {"domain": "example.com",
+                                          "base_url": "http://example.com"}})
+
+    asyncio.run(module._forgery_sweep(
+        {"token": "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IngifQ.SIG",
+         "email": "x", "role": ""}))
+
+    assert state.findings["findings"] == []
+
+
+def test_idor_adopts_discovered_sessions():
+    from core.auth_harness import AuthHarness
+    from modules.idor_differ import IdorDiffer
+    state = _state()
+    state.add_asset(
+        "identity_credential", "identity:sqli_auth_bypass",
+        "sqli_auth_bypass", confidence="CONFIRMED", sources=["auth_audit"],
+        attrs={"endpoint": "http://example.com/rest/user/login",
+               "technique": "sqli_auth_bypass", "role": "admin",
+               "token": "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IngifQ.SIG"})
+
+    module = IdorDiffer(state, {"target": {"domain": "example.com"}})
+    harness = AuthHarness({"target": {"domain": "example.com"}})
+    assert not harness.identities
+    module._merge_discovered_identities(harness)
+
+    assert "sqli_auth_bypass" in harness.identities
+    identity = harness.identities["sqli_auth_bypass"]
+    assert identity.bearer_token.startswith("eyJ")
+    assert identity.privileged is True
