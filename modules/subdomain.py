@@ -17,6 +17,11 @@ class SubdomainEnum(BaseModule):
     depends_on = ["seed_discovery"]
 
     async def run(self) -> str:
+        from core.validators import is_public_target
+        if not is_public_target(self.domain):
+            self.log(f"Skipping passive subdomain sources for non-public target {self.domain}.")
+            self.state.skip_module(self.id, "non-public target has no DNS to enumerate")
+            return "skipped"
         self.log(f"Enumerating subdomains for {self.domain}")
 
         discovered = set()

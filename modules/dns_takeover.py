@@ -264,6 +264,11 @@ class DNSTakeover(BaseModule):
     depends_on = ["subdomain_enum"]
 
     async def run(self) -> str:
+        import time
+        from core.validators import is_public_target
+        if not is_public_target(self.domain):
+            self.state.skip_module(self.id, "no public DNS to take over")
+            return "skipped"
         self.log("Checking dangling CNAME takeover risk...")
 
         subdomains = self.state.get_assets_by_type("subdomain")
@@ -272,10 +277,20 @@ class DNSTakeover(BaseModule):
             self.state.skip_module(self.id, "no subdomains")
             return "skipped"
 
+        try:
+            deadline = float(self.config.get("module_timeout", 300) or 300)
+        except (TypeError, ValueError):
+            deadline = 300.0
+        stop_at = time.monotonic() + max(60.0, deadline - 30.0)
+
         checked = 0
         risky = []
 
-        for host in candidates:
+        for host in candidates[:100]:
+            if time.monotonic() >= stop_at:
+                self.log(f"  Time-box hit at {checked}/{len(candidates)} hosts — "
+                         "keeping the takeovers found so far")
+                break
             cname = await dig("CNAME", host)
             cname_answers = cname.get("answers", [])
             if not cname_answers:

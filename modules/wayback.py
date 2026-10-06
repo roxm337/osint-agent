@@ -52,6 +52,10 @@ class WaybackMachine(BaseModule):
     depends_on = ["seed_discovery"]
 
     async def run(self) -> str:
+        from core.validators import is_public_target
+        if not is_public_target(self.domain):
+            self.state.skip_module(self.id, "no web archives for non-public targets")
+            return "skipped"
         self.log(f"Fetching Wayback CDX for {self.domain}...")
 
         # 1. Wayback CDX — include mimetype for filtering

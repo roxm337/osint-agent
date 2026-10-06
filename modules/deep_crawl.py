@@ -74,14 +74,25 @@ class DeepCrawl(BaseModule):
         discovered = set()
         evidence_refs = []
         depth = int(self.config.get("crawl", {}).get("depth", 2))
+        import time
+        try:
+            _deadline = float(self.config.get("module_timeout", 300) or 300)
+        except (TypeError, ValueError):
+            _deadline = 300.0
+        _stop_at = time.monotonic() + max(60.0, _deadline - 30.0)
         for target in targets[:10]:
+            if time.monotonic() >= _stop_at:
+                self.log("  Time-box hit — keeping the URLs crawled so far")
+                break
             source_results = {}
+            remaining = max(30.0, _stop_at - time.monotonic())
+            call_timeout = min(180, int(remaining))
             if tool_available("katana"):
-                urls = await katana_crawl(target, depth=depth, timeout=180)
+                urls = await katana_crawl(target, depth=depth, timeout=call_timeout)
                 source_results["katana"] = urls
                 discovered.update(urls)
             if tool_available("hakrawler"):
-                urls = await hakrawler_crawl(target, depth=depth, timeout=180)
+                urls = await hakrawler_crawl(target, depth=depth, timeout=call_timeout)
                 source_results["hakrawler"] = urls
                 discovered.update(urls)
             evidence_refs.append(

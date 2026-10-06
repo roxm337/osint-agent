@@ -21,6 +21,34 @@ def is_routable_ip(ip: str) -> bool:
         return False
 
 
+# TLDs that are not the public internet: DNS-empire modules (passive
+# subdomain sources, takeover checks, ASN history, reputation feeds,
+# mail security) return junk or hang on these, and findings like
+# "No DMARC on localhost" are noise by construction.
+_NON_PUBLIC_TLDS = {
+    "localhost", "local", "invalid", "test", "example", "internal",
+    "home", "lan", "corp", "intranet", "localdomain", "docker",
+}
+
+
+def is_public_target(host: str) -> bool:
+    """Is this hostname on the public internet (FQDN, real TLD)?"""
+    name = str(host or "").strip().lower().rstrip(".")
+    if not name:
+        return False
+    try:
+        if ipaddress.ip_address(name.split(":")[0].split("/")[0]).is_global:
+            return True
+    except ValueError:
+        pass
+    if "." not in name:
+        return False
+    tld = name.rsplit(".", 1)[-1]
+    if not tld.isalpha() or len(tld) < 2 or tld in _NON_PUBLIC_TLDS:
+        return False
+    return True
+
+
 def inject_param(url: str, param: str, value: str) -> str:
     """Replace a parameter's value regardless of its current value.
 

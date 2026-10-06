@@ -305,27 +305,31 @@ class CloudEnum(BaseModule):
         return False, [f"GET {key_url} -> HTTP {response.get('status', 0)}"]
 
     def _generate_candidates(self) -> list:
+        from core.validators import is_public_target
         prefixes = self.config.get("wordlists", {}).get("bucket_prefixes", [""])
         suffixes = self.config.get("wordlists", {}).get("bucket_suffixes", [""])
 
-        domain_parts = self.domain.replace("-", ".").split(".")
-        base_names = []
-        for i in range(len(domain_parts) - 1):
-            part = domain_parts[i]
-            if len(part) > 2:
-                base_names.append(part)
-        base_names.append("-".join(domain_parts[:-1]))
-        base_names.append(self.domain.replace(".", "-"))
-        base_names = list(dict.fromkeys(b for b in base_names if b))
-
         candidates = set()
-        for base in base_names:
-            candidates.add(base)
-            for prefix in prefixes[:8]:
-                for suffix in suffixes[:8]:
-                    name = f"{prefix}{base}{suffix}".strip("-").strip(".")
-                    if name:
-                        candidates.add(name.lower())
+        # Domain permutations only make sense on the public internet:
+        # "localhost" permutations are probes of nothing.
+        if is_public_target(self.domain):
+            domain_parts = self.domain.replace("-", ".").split(".")
+            base_names = []
+            for i in range(len(domain_parts) - 1):
+                part = domain_parts[i]
+                if len(part) > 2:
+                    base_names.append(part)
+            base_names.append("-".join(domain_parts[:-1]))
+            base_names.append(self.domain.replace(".", "-"))
+            base_names = list(dict.fromkeys(b for b in base_names if b))
+
+            for base in base_names:
+                candidates.add(base)
+                for prefix in prefixes[:8]:
+                    for suffix in suffixes[:8]:
+                        name = f"{prefix}{base}{suffix}".strip("-").strip(".")
+                        if name:
+                            candidates.add(name.lower())
 
         # Bucket names the target itself advertises: storage hosts inside
         # discovered URLs, API endpoints and JS files. A bucket referenced

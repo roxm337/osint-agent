@@ -33,6 +33,10 @@ class ASNExpansion(BaseModule):
     depends_on = ["seed_discovery"]
 
     async def run(self) -> str:
+        from core.validators import is_public_target
+        if not is_public_target(self.domain):
+            self.state.skip_module(self.id, "no ASN for non-public targets")
+            return "skipped"
         self.log("Expanding ASN and network prefixes...")
 
         ip_assets = self.state.get_assets_by_type("ip")

@@ -88,10 +88,20 @@ class OriginDiscovery(BaseModule):
         candidates = await self._gather_candidates(cdn_detected)
         self.log(f"  {len(candidates)} origin candidate(s)")
 
-        # 3. Verify each candidate differentially.
+        # 3. Verify each candidate differentially, inside a time-box:
+        # each verify is an HTTP fetch plus an openssl TLS probe.
+        import time as _time
+        try:
+            _deadline = float(self.config.get("module_timeout", 300) or 300)
+        except (TypeError, ValueError):
+            _deadline = 300.0
+        _stop_at = _time.monotonic() + max(60.0, _deadline - 30.0)
         confirmed = []
         likely = []
         for candidate in candidates[:25]:
+            if _time.monotonic() >= _stop_at:
+                self.log("  Time-box hit — keeping the origins verified so far")
+                break
             ip = candidate["ip"]
             verdict, proof = await self._verify_origin(ip, base_hash)
             if verdict == "confirmed":
@@ -181,7 +191,10 @@ class OriginDiscovery(BaseModule):
 
     async def _gather_candidates(self, cdn_detected: str | None) -> list:
         """Historical + CT-derived IPs outside known CDN ranges."""
+        import time
+        from core.validators import is_public_target
         candidates: dict[str, dict] = {}
+        public = is_public_target(self.domain)
 
         def consider(ip: str, source: str):
             ip = str(ip or "").strip()
@@ -191,9 +204,10 @@ class OriginDiscovery(BaseModule):
                 return
             candidates.setdefault(ip, {"ip": ip, "source": source})
 
-        # Authenticated historical DNS.
+        # Authenticated historical DNS — public targets only: crt.sh and
+        # SecurityTrails know nothing about localhost but answer slowly.
         st_key = self.keys.get("securitytrails") or ""
-        if st_key:
+        if public and st_key:
             try:
                 history = await securitytrails_history_dns(self.domain, st_key)
             except Exception as exc:
@@ -207,10 +221,13 @@ class OriginDiscovery(BaseModule):
 
         # Certificate-transparency hostnames resolved now: names the
         # target pointed at the open internet, minus CDN ranges.
-        try:
-            entries = await crtsh(self.domain)
-        except Exception:
-            entries = []
+        # Public only — CT for localhost is noise served slowly.
+        entries = []
+        if public:
+            try:
+                entries = await crtsh(self.domain)
+            except Exception:
+                entries = []
         names = set()
         for entry in (entries or [])[:100]:
             if isinstance(entry, dict):

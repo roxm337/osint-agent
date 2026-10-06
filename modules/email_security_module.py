@@ -28,6 +28,10 @@ class EmailSecurity(BaseModule):
     depends_on = ["seed_discovery"]
 
     async def run(self) -> str:
+        from core.validators import is_public_target
+        if not is_public_target(self.domain):
+            self.state.skip_module(self.id, "no mail infrastructure off the public internet")
+            return "skipped"
         apex = self._registrable_domain(self.domain)
         if apex != self.domain:
             self.log(f"Email security audit for {apex} (target: {self.domain})")

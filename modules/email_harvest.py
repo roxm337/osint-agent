@@ -81,6 +81,13 @@ class EmailHarvest(BaseModule):
                 continue
             for email in _clean_emails(EMAIL_RE.findall(body)):
                 all_emails.setdefault(email, set()).add("page scrape")
+            # Names and phones only come from page-shaped URLs: version
+            # strings inside minified JS ("1.23.456") match both regexes
+            # and produced thirty phantom "people" on one SPA bundle.
+            lowered = url.lower().split("?")[0]
+            if lowered.endswith((".js", ".json", ".map", ".css", ".xml",
+                                  ".txt", ".ico", ".png", ".jpg")):
+                continue
             for name in NAME_RE.findall(body):
                 cleaned = " ".join(name.split())
                 if 4 <= len(cleaned) <= 40 and "@" not in cleaned:
