@@ -43,6 +43,12 @@ from .mass_assignment import MassAssignment
 from .prototype_pollution import PrototypePollution
 from .xss_scan import XSSScan
 from .sqli_scan import SQLiScan
+from .nosql_scan import NoSQLScan
+from .ssti_scan import SSTIScan
+from .dom_xss_scan import DomXSSScan
+from .upload_audit import UploadAudit
+from .auth_audit import AuthAudit
+from .response_audit import ResponseAudit
 from .cors_audit import CORSAudit
 from .open_redirect import OpenRedirectScan
 from .http_smuggling import HTTPSmuggling
@@ -329,6 +335,48 @@ MODULE_REGISTRY = {
         "class": SQLiScan,
         "stage": 5,
         "detectability": "high",
+        "depends_on": ["parameter_discovery"],
+        "active": True,
+    },
+    "nosql_scan": {
+        "class": NoSQLScan,
+        "stage": 5,
+        "detectability": "medium",
+        "depends_on": ["parameter_discovery"],
+        "active": True,
+    },
+    "ssti_scan": {
+        "class": SSTIScan,
+        "stage": 5,
+        "detectability": "medium",
+        "depends_on": ["parameter_discovery"],
+        "active": True,
+    },
+    "dom_xss_scan": {
+        "class": DomXSSScan,
+        "stage": 5,
+        "detectability": "medium",
+        "depends_on": ["parameter_discovery"],
+        "active": True,
+    },
+    "upload_audit": {
+        "class": UploadAudit,
+        "stage": 5,
+        "detectability": "medium",
+        "depends_on": ["parameter_discovery"],
+        "active": True,
+    },
+    "auth_audit": {
+        "class": AuthAudit,
+        "stage": 5,
+        "detectability": "high",
+        "depends_on": ["parameter_discovery"],
+        "active": True,
+    },
+    "response_audit": {
+        "class": ResponseAudit,
+        "stage": 5,
+        "detectability": "low",
         "depends_on": ["parameter_discovery"],
         "active": True,
     },

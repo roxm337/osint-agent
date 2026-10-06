@@ -25,6 +25,12 @@ FINDING_RULES = [
       "/wp-config.php~"],
      "CRITICAL", "Exposed WordPress Configuration",
      "wp-config.php accessible — contains database credentials and secret keys."),
+    # Backup files (including null-byte-bypass variants like .bak%2500.md,
+    # which servers decode past the extension filter).
+    (["package.json.bak", "composer.json.bak", ".env.bak", ".bak%25",
+      ".backup", "coupons_2013.md.bak", "config.php.bak"],
+     "HIGH", "Backup File Exposed",
+     "Backup file accessible — may contain source code, credentials, or customer data."),
     (["/wp-content/debug.log", "/wp-content/error_log"],
      "HIGH", "WordPress Debug Log Exposed",
      "WordPress debug log accessible — may contain error details and path disclosures."),
@@ -231,6 +237,13 @@ class MisconfigProbes(BaseModule):
                 )
                 break
 
+        # Backup-file combinations + filter-bypass variants. Servers
+        # that block ".bak" often decode past the filter: %2500.md and
+        # ";.md" suffixes served package.json.bak live on one target.
+        await self._probe_backup_combinations(
+            base_url, timeout, concurrency, profile,
+            findings_found, exposed_paths)
+
         # Record all findings
         for f in findings_found:
             evidence = [f"URL: {base_url}{f['path']}"]
@@ -250,6 +263,60 @@ class MisconfigProbes(BaseModule):
         self.state.complete_module(self.id)
         self.log(f"Misconfig: {len(findings_found)} findings across {len(exposed_paths)} exposed paths")
         return "done"
+
+    async def _probe_backup_combinations(self, base_url: str, timeout: int,
+                                              concurrency: int, profile,
+                                              findings_found: list,
+                                              exposed_paths: list) -> None:
+        """Backup names × suffixes at webroot and file-drop dirs, plus
+        filter-bypass variants of anything the server blocks with 403."""
+        bases = ("package.json", ".env", "composer.json", "wp-config.php",
+                 "config.php", "coupons_2013.md", "eastere.gg")
+        suffixes = ("", ".bak", ".old", "~", ".backup", ".save")
+        bypasses = ("%2500.md", ";.md")
+        dirs = [""]
+        try:
+            check = await curl_with_status(f"{base_url}/ftp/", timeout=timeout)
+            if check.get("status", 0) in (200, 301, 302, 403):
+                dirs.append("/ftp")
+        except Exception:
+            pass
+
+        candidates = []
+        for directory in dirs:
+            for base in bases:
+                for suffix in suffixes:
+                    path = f"{directory}/{base}{suffix}"
+                    if path not in candidates:
+                        candidates.append(path)
+        candidates = candidates[:60]
+        self.log(f"  Backup combinations: {len(candidates)} paths...")
+
+        blocked: list[str] = []
+        async for item in self._probe_paths(base_url, candidates,
+                                            concurrency, timeout):
+            self._analyze_result(base_url, item["path"], item["status"],
+                                 item["body"], findings_found,
+                                 exposed_paths, profile)
+            if item["status"] == 403 and any(
+                    item["path"].endswith(suffix) for suffix in
+                    (".bak", ".old", "~", ".backup", ".env", ".sql", ".log")):
+                blocked.append(item["path"])
+
+        # Bypass wave: only the blocked names, only the cheap variants.
+        variants = []
+        for path in blocked[:10]:
+            for bypass in bypasses:
+                variant = path + bypass
+                if variant not in variants:
+                    variants.append(variant)
+        if variants:
+            self.log(f"  Filter-bypass variants: {len(variants)} paths...")
+            async for item in self._probe_paths(base_url, variants,
+                                                concurrency, timeout):
+                self._analyze_result(base_url, item["path"], item["status"],
+                                     item["body"], findings_found,
+                                     exposed_paths, profile)
 
     async def _probe_paths(self, base_url: str, paths: list[str],
                            concurrency: int, timeout: int):
