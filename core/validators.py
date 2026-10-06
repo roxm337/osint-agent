@@ -49,6 +49,68 @@ def is_public_target(host: str) -> bool:
     return True
 
 
+# Response keys that must never leave the server, with the severity a
+# live observation earns. Shared by response audits and JWT claim
+# audits: a password hash in an API body and one in a token payload are
+# the same exposure class.
+RESPONSE_SENSITIVE_KEYS = {
+    "password": "HIGH",
+    "passwd": "HIGH",
+    "passwordhash": "HIGH",
+    "password_hash": "HIGH",
+    "passhash": "HIGH",
+    "secret": "HIGH",
+    "client_secret": "HIGH",
+    "private_key": "CRITICAL",
+    "ssn": "HIGH",
+    "social_security": "HIGH",
+    "credit_card": "HIGH",
+    "card_number": "HIGH",
+    "cvv": "HIGH",
+    "cvc": "HIGH",
+    "bank_account": "HIGH",
+    "api_key": "MEDIUM",
+    "apikey": "MEDIUM",
+    "auth_token": "MEDIUM",
+    "access_token": "MEDIUM",
+    "refresh_token": "MEDIUM",
+    "session_token": "MEDIUM",
+    "totp_secret": "HIGH",
+    "totpsecret": "HIGH",
+    "recovery_code": "MEDIUM",
+    "backup_code": "MEDIUM",
+}
+
+_RESPONSE_DOCS_MARKERS = ("example", "test", "demo", "sample", "xxx",
+                          "null", "undefined", "***", "redacted",
+                          "hidden", "xxx-")
+
+
+def looks_real_value(value) -> bool:
+    """A value shaped like a genuine secret, not a placeholder."""
+    text = str(value or "")
+    if len(text) < 8:
+        return False
+    lowered = text.lower()
+    if any(marker in lowered for marker in _RESPONSE_DOCS_MARKERS):
+        return False
+    if len(set(text)) < 5:
+        return False
+    return True
+
+
+def walk_json(obj, path=""):
+    """Yield (dotted.path, key, value) for every dict key in JSON."""
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            here = f"{path}.{key}" if path else str(key)
+            yield here, key, value
+            yield from walk_json(value, here)
+    elif isinstance(obj, list):
+        for index, value in enumerate(obj[:20]):
+            yield from walk_json(value, f"{path}[{index}]")
+
+
 def inject_param(url: str, param: str, value: str) -> str:
     """Replace a parameter's value regardless of its current value.
 

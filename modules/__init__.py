@@ -26,6 +26,7 @@ from .content_discovery import ContentDiscovery
 from .nuclei_scan import NucleiScan
 from .social_media import SocialMedia
 from .breach import BreachCheck
+from .error_audit import ErrorAudit
 from .js_analysis import JSAnalysis
 from .graphql_module import GraphQLAudit
 from .origin_discovery import OriginDiscovery
@@ -308,6 +309,13 @@ MODULE_REGISTRY = {
         "detectability": "low",
         "depends_on": ["email_harvest"],
         "active": False,
+    },
+    "error_audit": {
+        "class": ErrorAudit,
+        "stage": 4,
+        "detectability": "low",
+        "depends_on": ["tech_detection"],
+        "active": True,
     },
     # Stage 5: Active Vulnerability Testing
     "content_discovery": {

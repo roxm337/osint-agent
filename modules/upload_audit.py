@@ -45,6 +45,7 @@ class UploadAudit(BaseModule):
             return "skipped"
 
         cfg = self._cfg()
+        self._auth_headers = self._session_headers()
         reported = 0
         for endpoint in endpoints[:10]:
             if await self._audit_endpoint(endpoint, cfg):
@@ -53,6 +54,16 @@ class UploadAudit(BaseModule):
         self.state.complete_module(self.id)
         self.log(f"Upload audit: {reported} issue(s) across {len(endpoints[:10])} endpoint(s)")
         return "done"
+
+    def _session_headers(self) -> dict:
+        """Captured sessions, so authenticated upload paths (profile
+        images, complaints) are tested as the user, not as anonymous.
+        First confirmed identity wins."""
+        for asset in self.state.get_assets_by_type("identity_credential"):
+            token = str((asset.get("attrs", {}) or {}).get("token", "") or "")
+            if token and not token.startswith("cookie:"):
+                return {"Authorization": f"Bearer {token}"}
+        return {}
 
     def _cfg(self) -> dict:
         cfg = self.config.get("modules", {}).get(self.id, {})
@@ -113,7 +124,8 @@ class UploadAudit(BaseModule):
             try:
                 result = await curl(
                     url, method="POST",
-                    headers={"Content-Type": content_type},
+                    headers={"Content-Type": content_type,
+                             **self._auth_headers},
                     data=XXE_PROBE_BODY.encode(),
                     output="full", timeout=15)
             except Exception:
@@ -184,7 +196,8 @@ class UploadAudit(BaseModule):
         try:
             result = await curl(
                 url, method="POST",
-                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                         **self._auth_headers},
                 data=payload,
                 output="full", timeout=20)
         except Exception:

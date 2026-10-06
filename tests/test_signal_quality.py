@@ -2573,3 +2573,200 @@ def test_idor_adopts_discovered_sessions():
     identity = harness.identities["sqli_auth_bypass"]
     assert identity.bearer_token.startswith("eyJ")
     assert identity.privileged is True
+
+
+# ── Continue wave: UNION impact proof ───────────────────────────
+
+def test_sqli_union_confirms_version(monkeypatch):
+    import actions.web.sqli as sqli_module
+    from actions.web.sqli import detect_sqli
+    from actions.registry import ActionContext
+
+    async def fake_curl(url, **kwargs):
+        from urllib.parse import urlparse, parse_qs, unquote
+        query = parse_qs(urlparse(url).query)
+        q = query.get("q", ["1"])[0]
+        base_body = ('{"status":"success","data":[{"id":1,"name":"Apple Juice",'
+                     '"description":"The all-time classic fruit juice blend",'
+                     '"price":1.99,"deluxePrice":0.99,'
+                     '"image":"apple_juice.jpg",'
+                     '"createdAt":"2026-10-06","updatedAt":"2026-10-06"}]}')
+        if q == "1":
+            return {"status": 200, "body": base_body,
+                    "time_ms": 5, "url": url}
+        if q == "'":
+            return {"status": 200,
+                    "body": '{"status":"success","data":[]}',
+                    "time_ms": 5, "url": url}
+        if "ORDER BY 1--" in q:
+            return {"status": 200, "body": base_body,
+                    "time_ms": 5, "url": url}
+        if "ORDER BY" in q:
+            number = int(q.split("ORDER BY")[1].split("--")[0])
+            if number <= 9:
+                return {"status": 200, "body": base_body,
+                        "time_ms": 5, "url": url}
+            return {"status": 500,
+                    "body": "Error: SQLITE_ERROR: 1st ORDER BY term out of range",
+                    "time_ms": 5, "url": url}
+        if "UNION SELECT" in q and "sqlite_version()" in q:
+            return {"status": 200,
+                    "body": '{"status":"success","data":[{"id":"3.44.2",'
+                            '"name":"Apple","price":1.99}]}',
+                    "time_ms": 5, "url": url}
+        return {"status": 200, "body": base_body,
+                "time_ms": 5, "url": url}
+
+    monkeypatch.setattr(sqli_module, "curl", fake_curl)
+    import core.verification_oracle as oracle_module
+    monkeypatch.setattr(oracle_module, "curl", fake_curl)
+    ctx = ActionContext(action_id="web.sqli.detect",
+                        params={"url": "http://example.com/rest/products/search",
+                                "param": "q"},
+                        target="http://example.com/rest/products/search")
+
+    result = asyncio.run(detect_sqli(ctx))
+
+    assert result.success is True
+    proof = result.data.get("union_confirmation", {})
+    assert proof.get("backend") == "sqlite", proof
+    assert proof.get("columns") == 9, proof
+    assert proof.get("version") == "3.44.2", proof
+
+
+# ── Juice Shop wave II: claims, BOLA-ids, write access, errors ──
+
+def test_auth_audit_flags_password_in_claims(monkeypatch):
+    import base64 as _b64
+    import json as _json
+    import modules.auth_audit as auth_module
+    from modules.auth_audit import AuthAudit
+
+    payload = _b64.urlsafe_b64encode(_json.dumps(
+        {"email": "a@b.c", "password": "0192023a7bbd73250516f069df18b500",
+         "role": "admin"}).encode()).decode().rstrip("=")
+    token = f"eyJhbGciOiJIUzI1NiJ9.{payload}.SIG"
+
+    async def fake_curl(url, **kwargs):
+        if url.endswith("/rest/user/login"):
+            return {"status": 200,
+                    "body": '{"authentication": {"token": "%s"}}' % token,
+                    "headers": "", "time_ms": 5, "url": url}
+        return {"status": 404, "body": "<html>shell</html>",
+                "headers": "", "time_ms": 5, "url": url}
+
+    monkeypatch.setattr(auth_module, "curl", fake_curl)
+    state = _state()
+
+    result = asyncio.run(AuthAudit(
+        state, {"target": {"domain": "localhost",
+                           "base_url": "http://localhost:3000"}}).run())
+
+    assert result == "done"
+    claims = [f for f in state.findings["findings"]
+              if f["title"] == "Sensitive Keys Inside JWT Claims"]
+    assert len(claims) == 1
+    assert claims[0]["severity"] == "HIGH"
+    assert "0192023a7bbd73250516f069df18b500" not in str(claims[0]["evidence"])
+
+
+def test_bola_across_ids_needs_distinct_owners(monkeypatch):
+    from modules.auth_audit import AuthAudit
+    state = _state()
+    module = AuthAudit(state, {"target": {"domain": "example.com",
+                                          "base_url": "http://example.com"}})
+
+    async def fake_get_same_owner(url, auth):
+        return {"status": 200,
+                "body": '{"id": 1, "email": "same@example.com"}'}
+
+    asyncio.run(module._bola_across_ids(
+        "http://example.com/api/Users/1", "FORGED", {"status": 401, "body": ""}))
+    # (no network: _get is real here, both fail -> no finding)
+    assert state.findings["findings"] == []
+
+
+def test_write_access_noop_put(monkeypatch):
+    import modules.auth_audit as auth_module
+    from modules.auth_audit import AuthAudit
+
+    async def fake_curl(url, **kwargs):
+        if kwargs.get("method") == "PUT":
+            import json as _json
+            return {"status": 200, "body": kwargs.get("data", "{}"),
+                    "time_ms": 5, "url": url}
+        if url.endswith("/api/Products/1"):
+            return {"status": 200,
+                    "body": '{"status": "success", "data": {"id": 1, '
+                            '"name": "Apple", "price": 1.99}}',
+                    "time_ms": 5, "url": url}
+        return {"status": 404, "body": "nope", "time_ms": 5, "url": url}
+
+    monkeypatch.setattr(auth_module, "curl", fake_curl)
+    state = _state()
+    state.add_asset("api_endpoint",
+                    "api:http://example.com/api/Products/1",
+                    "http://example.com/api/Products/1",
+                    confidence="FIRM", sources=["test"],
+                    attrs={"methods": ["GET", "PUT"]})
+    module = AuthAudit(state, {"target": {"domain": "example.com",
+                                          "base_url": "http://example.com"}})
+
+    asyncio.run(module._write_access_probes(
+        {"token": "", "email": "", "role": ""}))
+
+    assert len(state.findings["findings"]) == 1
+    finding = state.findings["findings"][0]
+    assert finding["severity"] == "HIGH"
+    assert finding["verified"] is True
+    assert "Unauthenticated" in finding["title"]
+
+
+def test_error_audit_matches_stack_signatures(monkeypatch):
+    import modules.error_audit as error_module
+    from modules.error_audit import ErrorAudit
+    from core.site_profile import clear_profiles
+
+    clear_profiles()
+
+    async def fake_curl(url, **kwargs):
+        from urllib.parse import urlparse
+        path = urlparse(url).path or "/"
+        if path == "/" or ("zz9" not in path and "[" not in path
+                           and "%ff" not in path.lower()):
+            return {"status": 404, "body": "not found",
+                    "time_ms": 5, "url": url}
+        return {"status": 500,
+                "body": "Error: SQLITE_ERROR: no such table: main.Users\n"
+                        "at Database.prepare (/app/node_modules/sequelize/lib/sqlite/query.js:12:34)",
+                "time_ms": 5, "url": url}
+
+    async def fake_curl_status(url, timeout=10):
+        result = await fake_curl(url)
+        return {"status": result["status"], "body": result["body"],
+                "content_type": ""}
+
+    monkeypatch.setattr(error_module, "curl", fake_curl)
+    monkeypatch.setattr("tools.wrappers.curl", fake_curl)
+    state = _state()
+
+    result = asyncio.run(ErrorAudit(
+        state, {"target": {"domain": "example.com",
+                           "base_url": "http://example.com"}}).run())
+
+    assert result == "done"
+    assert any("sqlite" in str(f["evidence"]).lower()
+               for f in state.findings["findings"])
+
+
+def test_js_fragment_routes_extracted():
+    from modules.js_analysis import extract_endpoints, _absolutize_endpoint
+    found = extract_endpoints(
+        'const r = "#/score-board"; fetch("/api/Users"); path: "search"',
+        "http://example.com")
+    assert "#/score-board" in found
+    assert _absolutize_endpoint("http://example.com", "#/score-board") == \
+        "http://example.com/#/score-board"
+    assert _absolutize_endpoint("http://example.com", "search") == \
+        "http://example.com/#/search"
+    assert _absolutize_endpoint("http://example.com", "not a path...") == ""

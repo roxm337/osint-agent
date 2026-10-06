@@ -105,8 +105,8 @@ PUBLIC_BY_DESIGN = {
 def extract_endpoints(js_content: str, base_url: str) -> list:
     """Extract API endpoints and interesting paths from JS source."""
     patterns = [
-        r'["\'`](/(?:api|v[0-9]+|rest|graphql|auth|user|admin|manage)[^"\'`\s]{0,100})["\'\`]',
-        r'["\'`](https?://[^\s"\'`]+)["\'\`]',
+        r'["\'`](/(?:api|v[0-9]+|rest|graphql|auth|user|admin|manage)[^"\'`\s]{0,100})["\'`]',
+        r'["\'`](https?://[^\s"\'`]+)["\'`]+',
         r'fetch\(["\']([^"\']+)["\']',
         r'axios\.[a-z]+\(["\']([^"\']+)["\']',
         r'url:\s*["\']([^"\']+)["\']',
@@ -114,6 +114,11 @@ def extract_endpoints(js_content: str, base_url: str) -> list:
         r'baseURL:\s*["\']([^"\']+)["\']',
         r'baseUrl:\s*["\']([^"\']+)["\']',
         r'API_URL\s*=\s*["\']([^"\']+)["\']',
+        # SPA fragment routes: "#/score-board" in route tables and links
+        # is a page the crawlers never visit, because fragments never
+        # reach the server. Reconstruct them onto the base URL.
+        r'["\'`](#/[\w\-/]+)["\'`]',
+        r'path:\s*["\']([a-z][\w\-/]*)["\']',
     ]
     endpoints = set()
     for pattern in patterns:
@@ -121,6 +126,35 @@ def extract_endpoints(js_content: str, base_url: str) -> list:
             if match and len(match) > 2:
                 endpoints.add(match)
     return list(endpoints)[:100]
+
+
+def _absolutize_endpoint(base_url: str, endpoint: str) -> str:
+    """Join a JS-extracted reference onto the base URL.
+
+    Absolute URLs pass through; `#/fragment` routes and bare route
+    names (`search`, `admin`) resolve against the base; anything
+    unparseable is dropped rather than stored as a dead asset.
+    """
+    text = str(endpoint or "").strip()
+    if not text:
+        return ""
+    if text.startswith(("http://", "https://")):
+        return text
+    base = str(base_url or "").rstrip("/")
+    if not base:
+        return ""
+    if text.startswith("#"):
+        return base + "/" + text
+    if text.startswith("/"):
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(base)
+            return f"{parsed.scheme}://{parsed.netloc}{text}"
+        except ValueError:
+            return ""
+    if "/" not in text and " " not in text and "." not in text:
+        return f"{base}/#/{text}"
+    return ""
 
 
 DOM_SINK_PATTERNS = [
@@ -548,15 +582,20 @@ class JSAnalysis(BaseModule):
                 remediation="No action unless a listed value is a real credential.",
             )
 
-        # Store unique API endpoints
+        # Store unique API endpoints, absolutized: a bare "#/score-board"
+        # or "search" from a route table is useless to every consumer
+        # until it is joined onto the base URL it was found under.
         unique_endpoints = list({ep["endpoint"] for ep in all_endpoints})
         for endpoint in unique_endpoints[:30]:
             if endpoint.startswith("http") and self.domain not in endpoint:
                 continue
+            absolute = _absolutize_endpoint(self.base_url, endpoint)
+            if not absolute:
+                continue
             self.state.add_asset(
                 "api_endpoint",
-                f"api:{endpoint}",
-                endpoint,
+                f"api:{absolute}",
+                absolute,
                 confidence="TENTATIVE",
                 sources=["js_analysis"],
                 attrs={"discovered_in": "js_analysis"},
