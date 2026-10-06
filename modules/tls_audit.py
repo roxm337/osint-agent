@@ -149,6 +149,10 @@ class TLSAudit(BaseModule):
                 asset_keys=[f"domain:{host}"],
             )
 
+        # 4b. Nmap TLS script corroboration: named vulnerabilities beat
+        # cipher-name debates. Bounded single invocation per endpoint.
+        await self._nmap_tls_scripts(host, port)
+
         # 5. HSTS checks via the HTTP client (no shell). Preload absence
         # and missing TLS 1.3 are hygiene notes (INFO); a short max-age is
         # actionable (LOW).
@@ -239,6 +243,78 @@ class TLSAudit(BaseModule):
             f"TLS audit: {host}:{port} expiry={days_left}d | "
             f"protocols={protocols_supported} | "
             f"SANs={len(sans)}"
+        )
+
+    async def _nmap_tls_scripts(self, host: str, port: int) -> None:
+        """Corroborate with named-vulnerability NSE scripts.
+
+        openssl proves configuration; nmap names CVEs. A Heartbleed
+        VULNERABLE is worth more than any cipher debate, and a clean
+        script run corroborates the openssl side without filing.
+        """
+        from tools.external import tool_available
+        if not tool_available("nmap"):
+            return
+        try:
+            result = await run_command(
+                ["nmap", "-p", str(port), "--script",
+                 "ssl-enum-ciphers,ssl-heartbleed,ssl-ccs-injection,ssl-poodle",
+                 "--script-timeout", "60s", host],
+                timeout=150,
+            )
+        except Exception:
+            return
+        stdout = result.get("stdout", "") or ""
+        if "Heartbleed: " in stdout and "VULNERABLE" in stdout:
+            self._tls_vuln_finding(
+                host, "TLS Heartbleed (CVE-2014-0160)", "CRITICAL",
+                "nmap ssl-heartbleed reports VULNERABLE: heap memory readable.",
+                stdout)
+        if "CCS Injection: VULNERABLE" in stdout or (
+                "ssl-ccs-injection" in stdout and "VULNERABLE" in stdout):
+            self.state.add_finding(
+                title="TLS CCS Injection (CVE-2014-0224)",
+                severity="HIGH",
+                confidence="FIRM",
+                category="TLS Configuration",
+                description=f"{host} is VULNERABLE to CCS injection per nmap.",
+                evidence=["nmap ssl-ccs-injection: VULNERABLE"],
+                remediation="Update OpenSSL; disable session ticket CCS.",
+                asset_keys=[f"domain:{host}"],
+            )
+        grade = ""
+        for line in stdout.splitlines():
+            if "least strength:" in line.lower():
+                grade = line.split(":", 1)[1].strip().upper()[:1]
+        if grade in ("C", "D", "F"):
+            self.state.add_finding(
+                title=f"Weak TLS Configuration (Grade {grade})",
+                severity="MEDIUM" if grade == "C" else "HIGH",
+                confidence="FIRM",
+                category="TLS Configuration",
+                description=(f"nmap ssl-enum-ciphers grades {host} least "
+                             f"strength {grade}. Corroborates weak "
+                             f"protocol/cipher posture."),
+                evidence=[f"nmap least strength: {grade}"],
+                remediation="Disable legacy protocols and weak ciphers; "
+                            "prefer TLS 1.2+ with AEAD suites.",
+                asset_keys=[f"domain:{host}"],
+            )
+
+    def _tls_vuln_finding(self, host: str, title: str, severity: str,
+                          description: str, stdout: str) -> None:
+        lines = [line.strip() for line in stdout.splitlines()
+                 if "VULNERABLE" in line or "State:" in line][:6]
+        self.state.add_finding(
+            title=f"{title}: {host}",
+            severity=severity,
+            confidence="FIRM",
+            category="TLS Configuration",
+            description=description,
+            evidence=lines or ["nmap reported VULNERABLE"],
+            remediation="Patch immediately; this is remotely exploitable.",
+            asset_keys=[f"domain:{host}"],
+            verified=False,
         )
 
     async def _negotiated_weak_cipher(self, host: str, port: int) -> str:

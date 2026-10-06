@@ -159,6 +159,44 @@ class LoginEnum(BaseModule):
                 verification={"method": "xmlrpc_method_list"},
             )
 
+        # 4. wp-json users endpoint — differential, not status: a 200
+        # JSON user list is enumeration; a 401 object or an HTML shell
+        # is the control holding.
+        users_probe = await self._auth_probe(
+            f"{base_url}/wp-json/wp/v2/users", output="full")
+        users_body = users_probe.get("body", "") or ""
+        users_status = users_probe.get("status", 0)
+        if users_status == 200 and users_body.lstrip().startswith(("[", "{")):
+            try:
+                import json as _json
+                users_data = _json.loads(users_body)
+            except (ValueError, TypeError):
+                users_data = None
+            entries = users_data if isinstance(users_data, list) else []
+            slugs = sorted({
+                str(entry.get("slug", "") or "")
+                for entry in entries if isinstance(entry, dict)
+            } - {""})
+            if slugs:
+                self.state.add_finding(
+                    title="WordPress REST User Enumeration",
+                    severity="MEDIUM",
+                    confidence="CONFIRMED",
+                    category="Attack Surface",
+                    description=(
+                        f"Unauthenticated GET /wp-json/wp/v2/users returns "
+                        f"{len(entries)} user record(s): "
+                        f"{', '.join(slugs[:10])}. Usernames feed credential "
+                        f"attacks directly."),
+                    evidence=[f"Users: {', '.join(slugs[:10])}"],
+                    remediation="Require authentication for the users "
+                                "endpoint or strip it from the REST index.",
+                    asset_keys=[f"webapp:{base_url}"],
+                    verified=True,
+                    verification={"method": "rest_users_json",
+                                  "slugs": slugs[:10]},
+                )
+
         self.state.complete_module(self.id)
         return "done"
 

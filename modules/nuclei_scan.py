@@ -158,8 +158,8 @@ class NucleiScan(BaseModule):
             tags_used.extend(group)
             all_matches.extend(fresh)
             low_info_all.extend(
-                self._record_matches(fresh, finding_counts, target_url,
-                                     group, detected_tech))
+                await self._record_matches(fresh, finding_counts, target_url,
+                                           group, detected_tech, rate_limit))
 
         if self._allow_full_cve_pass(target_url, webapp_assets):
             remaining = stop_at - time.monotonic()
@@ -189,9 +189,9 @@ class NucleiScan(BaseModule):
                     tags_used.append("cve")
                     all_matches.extend(fresh)
                     low_info_all.extend(
-                        self._record_matches(fresh, finding_counts,
-                                             target_url, ["cve"],
-                                             detected_tech))
+                        await self._record_matches(fresh, finding_counts,
+                                                   target_url, ["cve"],
+                                                   detected_tech, rate_limit))
             else:
                 self.log(f"  Skipping CVE pass: only {remaining:.0f}s left in "
                          "the time-box")
@@ -242,8 +242,9 @@ class NucleiScan(BaseModule):
         )
         return "done"
 
-    def _record_matches(self, matches: list, finding_counts: dict,
-                        target_url: str, tags: list, detected_tech: set) -> list:
+    async def _record_matches(self, matches: list, finding_counts: dict,
+                                target_url: str, tags: list, detected_tech: set,
+                                rate_limit: int) -> list:
         """Persist one batch of matches as evidence + findings immediately.
 
         Findings land per batch rather than at the end of the run, so a
@@ -263,30 +264,43 @@ class NucleiScan(BaseModule):
             },
         )
 
+        validated = 0
         for match in matches:
             severity = SEVERITY_MAP.get(str(match.get("severity", "INFO")).upper(), "INFO")
             finding_counts[severity] = finding_counts.get(severity, 0) + 1
 
             # Create individual findings for HIGH/CRITICAL
             if severity in ("HIGH", "CRITICAL"):
+                confirmed, validation_note = (False, "")
+                if validated < 5:
+                    validated += 1
+                    confirmed, validation_note = await self._revalidate_match(
+                        match, rate_limit)
                 self.state.add_finding(
                     title=f"Nuclei [{severity}]: {match.get('name') or match.get('template_id')}",
                     severity=severity,
-                    confidence="FIRM",
+                    confidence="CONFIRMED" if confirmed else "FIRM",
                     category="Vulnerability Scan",
                     description=(
                         f"Nuclei template {match.get('template_id')} matched at "
-                        f"{match.get('matched_at')}."
+                        f"{match.get('matched_at')}"
+                        f"{' twice independently' if confirmed else ''}."
                     ),
                     evidence=[
                         f"Template: {match.get('template_id')}",
                         f"Matched: {match.get('matched_at')}",
                         f"Type: {match.get('type', 'http')}",
+                        f"Revalidation: {validation_note}",
                     ] + ([f"Curl: {match['curl_command'][:200]}"]
                          if match.get("curl_command") else []),
                     evidence_refs=[evidence_id],
                     remediation="Review matched template, validate exploitability, apply vendor fix.",
                     asset_keys=[f"webapp:{target_url}"],
+                    verified=confirmed,
+                    verification={"method": "nuclei_template_rerun",
+                                  "template": match.get("template_id", ""),
+                                  "url": match.get("matched_at", "")}
+                    if confirmed else {},
                 )
             elif severity == "MEDIUM":
                 self.state.add_finding(
@@ -308,6 +322,32 @@ class NucleiScan(BaseModule):
         return [m for m in matches
                 if SEVERITY_MAP.get(str(m.get("severity", "INFO")).upper())
                 in ("LOW", "INFO")]
+
+    async def _revalidate_match(self, match: dict, rate_limit: int
+                                ) -> tuple:
+        """Re-run one template against one URL: same template-id firing
+        twice independently is confirmation; anything else stays FIRM
+        with the reason recorded. Capped by the caller (5 per batch)."""
+        template_id = str(match.get("template_id", "") or "")
+        target = str(match.get("matched_at", "") or "")
+        if not template_id or not target:
+            return False, "missing template or target, skipped"
+        try:
+            result = await nuclei_scan(
+                target,
+                rate_limit=rate_limit,
+                timeout=120,
+                templates=template_id,
+                severity=[str(match.get("severity", "high")).lower()],
+            )
+        except Exception as exc:
+            return False, f"re-run raised: {exc}"
+        for rerun in result.get("results", []) or []:
+            if str(rerun.get("template_id", "")) == template_id:
+                return True, (f"template {template_id} matched again at "
+                               f"{rerun.get('matched_at', target)}")
+        return False, (f"template {template_id} did not re-fire "
+                       f"({result.get('error') or 'no match'})")
 
     def _allow_full_cve_pass(self, target_url: str, webapp_assets: list[dict]) -> bool:
         nuclei_cfg = self.config.get("nuclei", {})

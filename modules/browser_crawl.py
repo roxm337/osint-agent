@@ -90,6 +90,11 @@ class BrowserCrawl(BaseModule):
                 attrs={"rendered": True},
             )
 
+        # Confirm maps that parse as JSON with sourcesContent: a sourcemap
+        # reference is a hint, a fetched map with original sources is
+        # exposure. Bounded and cheap (first few only).
+        await self._confirm_source_maps(sorted(source_maps)[:5])
+
         # Sinks are inventory, not a finding — same rule as js_analysis:
         # a sink inventory (including postMessage/onmessage entry points)
         # carries no signal until a source-to-sink flow is traced. They
@@ -130,6 +135,52 @@ class BrowserCrawl(BaseModule):
             f"{len(source_maps)} source maps | {len(dom_sinks)} DOM sinks"
         )
         return "done"
+
+    async def _confirm_source_maps(self, map_urls: list) -> None:
+        """Fetch candidate maps: JSON with sources is exposure.
+
+        No status gate: a catch-all 200 with an HTML shell fails the JSON
+        parse below, which is the actual proof. A 200 literal here would
+        re-teach the bare-status shortcut the blind-trust test forbids.
+        """
+        from tools.wrappers import curl as _curl
+        import json as _json
+        for map_url in map_urls:
+            try:
+                result = await _curl(map_url, output="body", timeout=12)
+            except Exception:
+                continue
+            body = (result.get("body", "") or "").strip()
+            if not body.startswith("{"):
+                continue
+            try:
+                document = _json.loads(body)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(document, dict):
+                continue
+            sources = document.get("sources", []) or []
+            has_content = bool(document.get("sourcesContent"))
+            if sources:
+                files = [str(s).split("/")[-1] for s in sources[:8]]
+                self.state.add_finding(
+                    title=f"Source Map Exposes Original Source: {map_url}",
+                    severity="MEDIUM" if has_content else "LOW",
+                    confidence="CONFIRMED",
+                    category="Information Disclosure",
+                    description=(
+                        f"Source map at {map_url} serves "
+                        f"{len(sources)} original source file(s)"
+                        f"{' with embedded sourcesContent' if has_content else ''}."
+                    ),
+                    evidence=[f"Map: {map_url}",
+                              f"Sources: {', '.join(files)}"],
+                    remediation="Remove .map files from production deployments.",
+                    asset_keys=[f"url:{map_url}"],
+                    verified=True,
+                    verification={"method": "sourcemap_json_parse",
+                                  "url": map_url},
+                )
 
     def _targets(self) -> list[str]:
         targets = []

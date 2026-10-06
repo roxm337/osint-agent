@@ -35,6 +35,7 @@ from tools.external import (
     tool_available,
     wpscan,
 )
+from tools.wrappers import epss_score
 
 # The words parse_cms_text_findings keys on. "admin" is the one that misfires:
 # a discovered admin path is a route, not a vulnerability.
@@ -257,6 +258,7 @@ class CMSDeepScan(BaseModule):
         kev = await self._kev_index(signals)
         reported = 0
         for finding in self._grade(signals, kev, targets):
+            await self._attach_epss(finding)
             self.state.add_finding(**finding)
             reported += 1
 
@@ -442,6 +444,33 @@ class CMSDeepScan(BaseModule):
 
     def _host(self, targets: list) -> str:
         return targets[0][0] if targets else self.base_url
+
+    async def _attach_epss(self, finding: dict) -> None:
+        """Attach FIRST EPSS exploit-probability to a graded finding.
+
+        KEV says "exploited now"; EPSS says "likely next". A HIGH with
+        EPSS 0.9 outranks a HIGH with EPSS 0.01 at triage time. Network
+        failure degrades to nothing — the graded finding stands alone.
+        """
+        cves = _cves_in([finding.get("title", ""),
+                         finding.get("description", "")]
+                        + list(finding.get("evidence", []) or []))
+        if not cves:
+            return
+        try:
+            scores = await epss_score(cves[:10])
+        except Exception:
+            return
+        if not scores:
+            return
+        top_cve = max(scores, key=lambda c: scores[c].get("epss", 0.0))
+        top = scores[top_cve]
+        finding.setdefault("evidence", []).append(
+            f"EPSS {top_cve}: {top.get('epss', 0.0):.3f} "
+            f"(percentile {top.get('percentile', 0.0):.2f})")
+        verification = finding.setdefault("verification", {})
+        verification["epss"] = {cve: scores[cve].get("epss", 0.0)
+                               for cve in sorted(scores)}
 
     def _targets(self) -> list:
         targets = []

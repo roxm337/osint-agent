@@ -300,10 +300,16 @@ class CORSAudit(BaseModule):
 
     def _discovered(self) -> list:
         found = []
-        for asset_type in ("url", "webapp", "endpoint"):
+        for asset_type in ("url", "webapp", "endpoint", "api_endpoint"):
             for asset in self.state.get_assets_by_type(asset_type):
-                value = str(asset.get("value", "")).strip()
-                if value.startswith(("http://", "https://")):
+                value = str(asset.get("value", "") or "").strip()
+                if not value.startswith(("http://", "https://")):
+                    continue
+                # api_endpoint values may carry {id} templates: concretize
+                # with 1 so the probe hits a real route, not a literal
+                # brace string the router answers generically.
+                value = value.replace("{id}", "1").replace("{Id}", "1")
+                if value not in found:
                     found.append(value)
         return found
 

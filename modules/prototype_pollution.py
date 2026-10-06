@@ -218,6 +218,19 @@ class PrototypePollution(BaseModule):
             url = self._absolute(str(candidate))
             if url and url not in urls:
                 urls.append(url)
+        # Prefer discovered JSON-writing surface over hardcoded guesses:
+        # api_endpoint assets with write methods are endpoints the app
+        # actually exposes, not paths hoped to exist.
+        for asset in self.state.get_assets_by_type("api_endpoint"):
+            attrs = asset.get("attrs", {}) or {}
+            methods = [m.upper() for m in (attrs.get("methods") or [])]
+            if not any(m in ("POST", "PUT", "PATCH") for m in methods):
+                continue
+            value = str(asset.get("value", "") or "").replace(
+                "{id}", "1").replace("{Id}", "1")
+            if value.startswith(("http://", "https://")) \
+                    and value not in urls:
+                urls.insert(0, value)
         return urls
 
     def _methods(self, cfg: dict) -> list:

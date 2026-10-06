@@ -7,6 +7,7 @@ from .keyed_subdomains import KeyedSubdomains
 from .wayback import WaybackMachine
 from .email_harvest import EmailHarvest
 from .tech_detect import TechDetection
+from .headers_audit import HeadersAudit
 from .threat_intel import ThreatIntel
 from .vt_enrich import VirusTotalEnrich
 from .reputation_enrich import ReputationEnrich
@@ -111,6 +112,13 @@ MODULE_REGISTRY = {
         "stage": 3,
         "detectability": "low",
         "depends_on": ["seed_discovery"],
+        "active": False,
+    },
+    "headers_audit": {
+        "class": HeadersAudit,
+        "stage": 3,
+        "detectability": "low",
+        "depends_on": ["tech_detection"],
         "active": False,
     },
     "tls_audit": {
