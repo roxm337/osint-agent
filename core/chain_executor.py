@@ -60,6 +60,22 @@ def risk_allows(action_risk: str, ceiling: RiskLevel) -> bool:
     return RISK_ORDER.index(level) <= RISK_ORDER.index(ceiling)
 
 
+def _reason_rank(reason: str) -> int:
+    """Run vuln-driven edges before generic probes.
+
+    An edge carrying a declared action or a vuln-category match names a
+    specific suspected flaw; an "edge type" fallback is a surface with a
+    generic probe. When the budget only covers some of them, the
+    specific suspicion must spend first.
+    """
+    text = str(reason or "")
+    if text.startswith("declared on edge"):
+        return 0
+    if text.startswith("vuln category"):
+        return 1
+    return 2
+
+
 # Which action can prove which kind of edge. Ordered by preference: the first
 # registered action that exists, is under the ceiling, and whose required
 # params we can actually satisfy wins.
@@ -67,6 +83,12 @@ def risk_allows(action_risk: str, ceiling: RiskLevel) -> bool:
 # Note verify.differential is deliberately not first for `extract`: it needs
 # both baseline_url and test_url, which the graph does not supply, so listing
 # it first made every extract edge fail on a missing param.
+#
+# Note `extract` is deliberately EMPTY: re-fetching a reachable URL proves
+# reachability, not vulnerability (verify.reproducible's CONFIRMED-on-200
+# filed seventeen junk findings that way). Extract edges with a vuln
+# category still resolve through CATEGORY_ACTIONS below; the rest are
+# recorded as unarmable instead of spending budget on re-reads.
 EDGE_ACTIONS: dict[str, list[str]] = {
     "exploit": [
         "web.sqli.detect",
@@ -77,10 +99,7 @@ EDGE_ACTIONS: dict[str, list[str]] = {
         "web.ssrf.oob_detect",
         "web.ssrf.cloud_metadata",
     ],
-    "extract": [
-        "verify.reproducible",
-        "verify.composite_oracle",
-    ],
+    "extract": [],
     "authenticate": [
         "auth.jwt.none_alg",
         "auth.jwt.detect",
@@ -181,12 +200,19 @@ class ChainExecutor:
         for edge in chain.edges:
             candidates = self._select_action(edge, chain)
             if not candidates:
+                if edge.edge_type in EDGE_ACTIONS:
+                    # A known edge type with no proving action (extract):
+                    # say so out loud instead of dropping it silently or,
+                    # worse, spending budget re-proving reachability.
+                    self.unarmable.append(EdgeOutcome(
+                        edge=edge, action_id="", status="no_action",
+                        detail=f"no proving action registered for "
+                               f"'{edge.edge_type}' edges"))
                 continue
 
             # Pick the first candidate we can actually arm, not merely the first
             # one that exists. verify.differential needs two URLs, so on a plain
-            # URL it is unusable and we must fall through to verify.reproducible
-            # rather than give up on the edge.
+            # URL it is unusable and must not be chosen over a real probe.
             chosen = None
             first_failure = None
             for action_id, reason in candidates:
@@ -369,7 +395,14 @@ class ChainExecutor:
         self.state.module["current"] = self.module_id
         try:
             for chain in list(chains)[:max_chains]:
-                for planned in self.plan(chain):
+                # Vuln-driven edges (declared action, category match) run
+                # before generic probes: without this ordering one probe
+                # family (open redirects on every surface) spends the
+                # whole budget while the SQLi that matters never runs.
+                planned_edges = sorted(
+                    self.plan(chain),
+                    key=lambda item: _reason_rank(item.reason))
+                for planned in planned_edges:
                     if self._used >= self.max_actions:
                         report.skipped.append(EdgeOutcome(
                             edge=planned.edge, action_id=planned.action_id,

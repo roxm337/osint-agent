@@ -378,9 +378,10 @@ def test_two_url_oracle_gets_a_derived_baseline():
 
 
 def test_falls_back_to_an_armable_action_rather_than_giving_up():
-    """verify.differential needs two URLs. On a plain URL it cannot be armed, so
-    the executor must fall through to verify.reproducible, which only needs one.
-    Picking the first action that merely exists leaves the edge unproven."""
+    """Extract edges have no proving action: re-fetching a reachable URL
+    proves reachability, not vulnerability, so the edge is recorded as
+    unarmable instead of spending budget on a re-read that used to file
+    CONFIRMED findings for static files."""
     chain = FakeChain(
         nodes={"n1": _node("n1", "url", url="https://example.test/robots.txt"),
                "n2": _node("n2", "goal")},
@@ -389,9 +390,9 @@ def test_falls_back_to_an_armable_action_rather_than_giving_up():
     )
     ex = ChainExecutor(_state(), {})
     planned = ex.plan(chain)
-    assert len(planned) == 1, "should fall back to an action it can arm"
-    assert planned[0].action_id == "verify.reproducible"
-    assert ex.unarmable == []
+    assert planned == []
+    assert len(ex.unarmable) == 1
+    assert "extract" in ex.unarmable[0].detail
 
 
 def test_missing_url_is_named_in_the_unarmable_reason():
@@ -403,8 +404,18 @@ def test_missing_url_is_named_in_the_unarmable_reason():
     ex = ChainExecutor(_state(), {})
     assert ex.plan(chain) == []
     assert ex.unarmable
-    assert "url" in ex.unarmable[0].detail, \
-        "the operator must be told which input was missing"
+    assert "extract" in ex.unarmable[0].detail, \
+        "the operator must be told why the edge cannot be proven"
+
+
+def test_vuln_edges_run_before_generic_probes():
+    """With a one-action budget, the SQLi that matters must spend it —
+    not the redirect probe that happens to sort first."""
+    from core.chain_executor import _reason_rank
+    assert _reason_rank("declared on edge") == 0
+    assert _reason_rank("vuln category 'sql injection'") == 1
+    assert _reason_rank("edge type 'exploit'") == 2
+    assert _reason_rank("") == 2
 
 
 def test_token_action_falls_back_when_graph_has_no_token():
