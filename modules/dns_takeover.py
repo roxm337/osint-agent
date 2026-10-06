@@ -79,6 +79,7 @@ TAKEOVER_PROVIDERS = {
         "patterns": ["unbouncepages.com"],
         "fingerprint": "The requested URL was not found",
         "severity": "MEDIUM",
+        "weak_fingerprint": True,
     },
     "ghost": {
         "patterns": ["ghost.io"],
@@ -144,11 +145,13 @@ TAKEOVER_PROVIDERS = {
         "patterns": ["desk.com"],
         "fingerprint": "Please try again or try Desk.com free",
         "severity": "MEDIUM",
+        "weak_fingerprint": True,
     },
     "statuspage_io": {
         "patterns": ["statuspage.io"],
         "fingerprint": "You are being redirected",
         "severity": "MEDIUM",
+        "weak_fingerprint": True,
     },
     "intercom": {
         "patterns": ["custom.intercom.help"],
@@ -159,21 +162,25 @@ TAKEOVER_PROVIDERS = {
         "patterns": ["createsend.com"],
         "fingerprint": "Double check the URL",
         "severity": "MEDIUM",
+        "weak_fingerprint": True,
     },
     "acquia": {
         "patterns": ["acquia-sites.com"],
         "fingerprint": "The site you are looking for could not be found",
         "severity": "HIGH",
+        "weak_fingerprint": True,
     },
     "fly_io": {
         "patterns": ["fly.dev", "fly.io"],
         "fingerprint": "404 Not Found",
         "severity": "MEDIUM",
+        "weak_fingerprint": True,
     },
     "render": {
         "patterns": ["onrender.com"],
         "fingerprint": "Page not found",
         "severity": "MEDIUM",
+        "weak_fingerprint": True,
     },
 }
 
@@ -206,9 +213,22 @@ def classify_takeover_risk(cname_answers: list, a_answers: list,
     if not provider:
         return {"risk": False, "provider": "", "matched": "", "reason": ""}
 
-    severity = TAKEOVER_PROVIDERS.get(provider, {}).get("severity", "HIGH")
+    info = TAKEOVER_PROVIDERS.get(provider, {})
+    severity = info.get("severity", "HIGH")
+    weak = bool(info.get("weak_fingerprint"))
 
     if fingerprint_matched:
+        if weak and a_answers:
+            # A generic 404 string on a host that resolves is background
+            # radiation, not a takeover: every framework's default error
+            # page matches "404 Not Found". No claim without dangling DNS.
+            return {
+                "risk": False,
+                "provider": provider,
+                "matched": matched_cname,
+                "reason": "weak fingerprint on a resolving host — not evidence",
+                "confidence": "LOW",
+            }
         return {
             "risk": True,
             "severity": severity,
@@ -265,11 +285,19 @@ class DNSTakeover(BaseModule):
             a_answers = a_result.get("answers", [])
             checked += 1
 
-            # Fetch body for fingerprint-based detection
+            # Fetch body for fingerprint-based detection. Always fetch:
+            # provider-fronted names (S3, CloudFront, Azure) resolve even
+            # when unclaimed, so "no A records" gating misses them. HTTP
+            # first, HTTPS fallback for TLS-only fingerprints.
             body = ""
-            if not a_answers:
-                r = await curl_with_status(f"http://{host}")
-                body = r.get("body", "")
+            try:
+                r = await curl_with_status(f"http://{host}", timeout=12)
+                body = r.get("body", "") or ""
+                if not body:
+                    r = await curl_with_status(f"https://{host}", timeout=12)
+                    body = r.get("body", "") or ""
+            except Exception:
+                pass
 
             risk = classify_takeover_risk(cname_answers, a_answers, body)
 

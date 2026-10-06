@@ -1,20 +1,24 @@
 """Stage 3: Port Scan — naabu/nmap with service detection and risk scoring."""
 
 import re
+import time
 from modules.base import BaseModule
-from tools.wrappers import bash
 from tools.external import naabu_scan, tool_available
+from tools.external import run_command
+from tools.wrappers import curl
+from tools.external import run_command
+from tools.wrappers import curl
 
 
 HIGH_RISK_PORT_FINDINGS = {
     21:    ("FTP Server Exposed", "HIGH",
             "FTP transmits credentials in cleartext. Brute-force and sniffing risk."),
-    22:    ("SSH Server Exposed", "MEDIUM",
-            "SSH exposed. Verify key-only auth is enforced."),
+    22:    ("SSH Server Exposed", "LOW",
+            "SSH exposed with version banner. Expected service; verify key-only auth."),
     23:    ("Telnet Exposed", "CRITICAL",
             "Telnet transmits all data including credentials in cleartext."),
-    25:    ("SMTP Port Exposed", "MEDIUM",
-            "SMTP open. Test for open relay and user enumeration (VRFY/EXPN)."),
+    25:    ("SMTP Port Exposed", "LOW",
+            "SMTP open with banner. Expected service; test for open relay (VRFY/EXPN)."),
     445:   ("SMB Port Exposed", "HIGH",
             "SMB exposed. Risk of EternalBlue/MS17-010 if unpatched."),
     1433:  ("MSSQL Exposed", "HIGH",
@@ -51,10 +55,10 @@ HIGH_RISK_PORT_FINDINGS = {
             "WebLogic server exposed. Multiple critical deserialization CVEs (CVE-2019-2725, etc.)"),
     8009:  ("AJP Port Exposed (Ghostcat)", "CRITICAL",
             "Apache AJP port exposed. Vulnerable to CVE-2020-1938 (Ghostcat) file read."),
-    8080:  ("HTTP Alternative Port Open", "MEDIUM",
-            "HTTP service on 8080. Often runs dev/test apps without proper hardening."),
-    8443:  ("HTTPS Alternative Port Open", "MEDIUM",
-            "HTTPS service on 8443. Verify TLS configuration and exposed application."),
+    8080:  ("HTTP Alternative Port Open", "LOW",
+            "HTTP service on 8080. Expected web service; verify the app behind it is hardened."),
+    8443:  ("HTTPS Alternative Port Open", "LOW",
+            "HTTPS service on 8443. Expected web service; verify TLS configuration."),
     8888:  ("Jupyter Notebook Exposed", "CRITICAL",
             "Jupyter Notebook typically allows unauthenticated code execution."),
     9000:  ("PHP-FPM / MinIO Exposed", "HIGH",
@@ -81,6 +85,29 @@ HIGH_RISK_PORT_FINDINGS = {
             "Hadoop NameNode HTTP UI exposed. May disclose cluster topology and data paths."),
 }
 
+# Ports where "open" is never the whole story: prove unauthenticated
+# access, or report exposure honestly one step down. Telnet and FTP stay
+# CRITICAL/HIGH on exposure alone — the cleartext protocol IS the vuln.
+# AJP stays HIGH (not CRITICAL) until Ghostcat is proven by hand: no
+# script here can speak AJP, and claiming CVE-2020-1938 on an open port
+# is exactly the scanner-noise this file used to emit.
+VERIFY_NMAP_SCRIPTS = {
+    6379: ("redis-info", "redis_version"),
+    445: ("smb-vuln-ms17-010", "VULNERABLE"),
+    27017: ("mongodb-info", "databases"),
+}
+VERIFY_HTTP_PROBES = {
+    # port: (scheme, path, success markers, what success proves)
+    2375: ("http", "/version", ('"Version"', "ApiVersion"), "docker daemon API"),
+    2379: ("http", "/version", ("etcdserver", "etcdcluster"), "etcd API"),
+    9200: ("http", "/", ("cluster_name", "cluster_uuid"), "elasticsearch API"),
+    8888: ("http", "/api", ("Jupyter", " Notebook"), "jupyter API"),
+    5984: ("http", "/_all_dbs", ("[", "]"), "couchdb database list"),
+    15672: ("http", "/api/overview", ("rabbitmq_version",), "rabbitmq API"),
+    10250: ("https", "/pods", ("kind", "PodList", "apiVersion"), "kubelet pod list"),
+    6443: ("https", "/version", ("major", "minor", "gitVersion"), "kubernetes version API"),
+}
+
 
 class PortScan(BaseModule):
     id = "port_scan"
@@ -103,8 +130,16 @@ class PortScan(BaseModule):
         # Deduplicate and limit to reasonable count
         targets = list(dict.fromkeys(targets))[:30]
         self.log(f"Scanning {len(targets)} IPs...")
+        try:
+            deadline = float(self.config.get("module_timeout", 300) or 300)
+        except (TypeError, ValueError):
+            deadline = 300.0
+        stop_at = time.monotonic() + max(60.0, deadline - 30.0)
 
         for target_ip in targets:
+            if time.monotonic() >= stop_at:
+                self.log("  Time-box hit — keeping the hosts finished so far")
+                break
             self.log(f"  Scanning {target_ip}...")
             ports_found = await self._scan_ip(target_ip)
 
@@ -137,21 +172,80 @@ class PortScan(BaseModule):
                 )
 
                 if port in HIGH_RISK_PORT_FINDINGS:
-                    title, severity, desc = HIGH_RISK_PORT_FINDINGS[port]
-                    detail = f" ({service} {version})" if version else f" ({service})"
-                    self.state.add_finding(
-                        title=f"{title}: {target_ip}:{port}",
-                        severity=severity,
-                        confidence="CONFIRMED",
-                        category="Network Exposure",
-                        description=f"{desc}{detail}",
-                        evidence=[f"IP: {target_ip}:{port}", f"Service: {service} {version}"],
-                        remediation=self._remediation(port),
-                        asset_keys=[f"port:{target_ip}:{port}"],
-                    )
+                    await self._report_port(target_ip, port, service, version)
 
         self.state.complete_module(self.id)
         return "done"
+
+    async def _report_port(self, target_ip: str, port: int,
+                           service: str, version: str) -> None:
+        """File one honest finding for an open risky port.
+
+        CRITICAL-table ports must prove unauthenticated access (NSE script
+        or HTTP probe); unproven exposure steps down to HIGH, because an
+        auth-gated database is brute-force surface, not a breach. Only
+        protocols that are the vulnerability themselves (telnet) keep
+        CRITICAL on exposure alone.
+        """
+        title, severity, desc = HIGH_RISK_PORT_FINDINGS[port]
+        detail = f" ({service} {version})" if version else f" ({service})"
+        proven = False
+        proof_lines: list[str] = []
+        if severity == "CRITICAL" and port not in (23,):
+            proven, proof_lines = await self._prove_unauth_access(
+                target_ip, port)
+            if not proven:
+                severity = "HIGH"
+                desc += (" Unauthenticated access was not demonstrated — "
+                         "treat as exposed attack surface, not a breach.")
+        evidence = [f"IP: {target_ip}:{port}", f"Service: {service} {version}"]
+        evidence.extend(proof_lines[:6])
+        self.state.add_finding(
+            title=f"{title}: {target_ip}:{port}",
+            severity=severity,
+            confidence="CONFIRMED" if proven else "FIRM",
+            category="Network Exposure",
+            description=f"{desc}{detail}",
+            evidence=evidence,
+            remediation=self._remediation(port),
+            asset_keys=[f"port:{target_ip}:{port}"],
+            verified=proven,
+            verification={"method": f"unauthenticated {proof_lines[0]}",
+                          "url": f"{target_ip}:{port}"} if proven else {},
+        )
+
+    async def _prove_unauth_access(self, ip: str, port: int
+                                   ) -> tuple[bool, list[str]]:
+        """Prove anonymous access to a service, read-only, bounded."""
+        if port in VERIFY_NMAP_SCRIPTS:
+            script, marker = VERIFY_NMAP_SCRIPTS[port]
+            try:
+                result = await run_command(
+                    ["nmap", "-p", str(port), "--script", script,
+                     "--script-timeout", "30s", ip],
+                    timeout=90,
+                )
+            except Exception:
+                return False, []
+            if marker in (result.get("stdout") or ""):
+                return True, [f"nmap --script {script}: marker '{marker}'"]
+            return False, []
+        if port in VERIFY_HTTP_PROBES:
+            scheme, path, markers, what = VERIFY_HTTP_PROBES[port]
+            url = f"{scheme}://{ip}:{port}{path}"
+            try:
+                response = await curl(url, output="body", timeout=12,
+                                      follow_redirects=False)
+            except Exception:
+                return False, []
+            body = response.get("body", "") or ""
+            status = response.get("status", 0)
+            if status == 200 and all(m in body for m in markers):
+                return True, [f"unauthenticated GET {path}: {what} (HTTP 200)"]
+            if status in (401, 403):
+                return False, [f"GET {path}: HTTP {status} (auth-gated)"]
+            return False, []
+        return False, []
 
     async def _scan_ip(self, target_ip: str) -> list:
         """Scan a single IP — naabu first, then nmap with -sV."""
@@ -162,9 +256,9 @@ class PortScan(BaseModule):
             if ports_open:
                 # Run nmap -sV on discovered ports only for version detection
                 port_list = ",".join(str(p) for p in ports_open)
-                result = await bash(
-                    f"nmap -sV -p {port_list} {target_ip} 2>/dev/null",
-                    timeout=180
+                result = await run_command(
+                    ["nmap", "-sV", "-p", port_list, target_ip],
+                    timeout=180,
                 )
                 parsed = self._parse_nmap(result["stdout"])
                 if parsed:
@@ -173,8 +267,8 @@ class PortScan(BaseModule):
                     for r in naabu_results]
 
         # Fallback to full nmap -sV top-1000
-        result = await bash(
-            f"nmap -sV --top-ports 1000 {target_ip} 2>/dev/null",
+        result = await run_command(
+            ["nmap", "-sV", "--top-ports", "1000", target_ip],
             timeout=300,
         )
         return self._parse_nmap(result["stdout"])

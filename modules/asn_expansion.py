@@ -1,7 +1,28 @@
 """Stage 2: ASN expansion from discovered IP addresses."""
 
+import ipaddress
+
 from modules.base import BaseModule
 from tools.wrappers import asn_lookup, bgpview_asn, ip_api
+
+# Hypergiant / shared-cloud ASNs: their prefixes are someone else's
+# infrastructure. Recording a /8 as target-owned floods the graph with
+# netblocks the engagement has no claim on.
+SHARED_ASNS = {
+    "AS13335",  # Cloudflare
+    "AS15169",  # Google
+    "AS16509",  # Amazon
+    "AS14618",  # Amazon
+    "AS8075",  # Microsoft
+    "AS35995",  # Akamai (Prolexic)
+    "AS20940",  # Akamai
+    "AS54113",  # Fastly
+    "AS32934",  # Facebook
+}
+
+# Prefixes larger than this are transit, not target surface.
+MAX_PREFIX_LEN_V4 = 22
+MAX_PREFIX_LEN_V6 = 48
 
 
 class ASNExpansion(BaseModule):
@@ -54,7 +75,12 @@ class ASNExpansion(BaseModule):
             return "skipped"
 
         prefix_count = 0
+        skipped_shared = 0
         for asn in sorted(asns)[:10]:
+            shared = asn.upper() in SHARED_ASNS
+            if shared:
+                skipped_shared += 1
+                self.log(f"  {asn}: shared-cloud ASN, prefixes recorded as shared")
             prefixes = await bgpview_asn(asn)
             evidence_id = self.state.add_evidence(
                 self.id, "bgpview_prefixes", asn, prefixes
@@ -64,14 +90,23 @@ class ASNExpansion(BaseModule):
                 cidr = prefix.get("prefix") if isinstance(prefix, dict) else ""
                 if not cidr:
                     continue
+                try:
+                    network = ipaddress.ip_network(cidr, strict=False)
+                except ValueError:
+                    continue
+                if network.prefixlen < MAX_PREFIX_LEN_V4:
+                    skipped_shared += 1
+                    continue
                 self.state.add_asset(
                     "cidr",
                     f"cidr:{cidr}",
                     cidr,
-                    confidence="FIRM",
+                    confidence="TENTATIVE" if shared else "FIRM",
                     sources=[self.id, "bgpview"],
                     attrs={
                         "asn": asn,
+                        "prefix_len": network.prefixlen,
+                        "shared_hosting": shared,
                         "name": prefix.get("name", "") if isinstance(prefix, dict) else "",
                         "description": (
                             prefix.get("description", "")
@@ -92,6 +127,7 @@ class ASNExpansion(BaseModule):
             attrs={
                 "asn_count": len(asns),
                 "prefix_count": prefix_count,
+                "skipped_shared_or_transit": skipped_shared,
                 "asns": sorted(asns),
                 "evidence_refs": evidence_refs,
             },

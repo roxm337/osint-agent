@@ -158,7 +158,10 @@ class GraphQLAudit(BaseModule):
                 remediation="Disable introspection in production. Use query depth limits and complexity analysis.",
             )
 
-            # Look for sensitive types in schema
+            # Look for sensitive types in schema. A type NAME is not a
+            # vulnerability — every schema has a User — so names alone are
+            # LOW inventory, and the module earns anything hotter by
+            # reading a field without authentication (see below).
             sensitive_type_keywords = [
                 "user", "password", "token", "secret", "admin", "credential",
                 "auth", "payment", "card", "ssn", "private", "internal"
@@ -169,15 +172,20 @@ class GraphQLAudit(BaseModule):
             ]
             if sensitive_types:
                 self.state.add_finding(
-                    title=f"GraphQL Schema Contains Sensitive Types",
-                    severity="HIGH",
-                    confidence="CONFIRMED",
+                    title="GraphQL Sensitive Type Names in Schema (Review Queue)",
+                    severity="LOW",
+                    confidence="FIRM",
                     category="API Security",
-                    description=f"Schema reveals sensitive types: {sensitive_types}. "
-                                f"Test these types for excessive data exposure and IDOR.",
+                    description=(f"Schema at {endpoint} names sensitive types: "
+                                 f"{sensitive_types[:10]}. Names alone prove "
+                                 f"nothing — the unauthenticated field-read "
+                                 f"probes below decide whether data leaks."),
                     evidence=[f"Sensitive types: {sensitive_types[:10]}"],
+                    evidence_refs=[evidence_id],
                     remediation="Audit sensitive types for proper authorization and field-level restrictions.",
                 )
+                await self._probe_sensitive_reads(endpoint, sensitive_types[:5],
+                                                  evidence_id)
         else:
             # 2. Field suggestion attack (introspection disabled)
             r2 = await curl(
@@ -251,3 +259,70 @@ class GraphQLAudit(BaseModule):
                 remediation="Only accept POST requests for GraphQL mutations; "
                             "disable query execution via GET.",
             )
+
+    async def _probe_sensitive_reads(self, endpoint: str,
+                                     type_names: list, evidence_id: str) -> None:
+        """Try reading one scalar field off sensitive types, unauthenticated.
+
+        Read-only and bounded: a handful of conventional shapes
+        ({user{id}}, {users{id}}, {me{id}}) with scalar fallbacks. A
+        non-null data payload without errors is an exposure finding with
+        the exact query as evidence; errors and nulls mean the inventory
+        stays LOW.
+        """
+        shapes = []
+        for name in type_names:
+            lowered = str(name).lower()
+            shapes.append(lowered)
+            if not lowered.endswith("s"):
+                shapes.append(lowered + "s")
+            if "user" in lowered or "account" in lowered:
+                shapes.append("me")
+        seen_shapes = list(dict.fromkeys(shapes))[:6]
+        tried = 0
+        for shape in seen_shapes:
+            for field in ("id", "email", "name"):
+                if tried >= 12:
+                    return
+                tried += 1
+                query = "{ %s { %s } }" % (shape, field)
+                try:
+                    response = await curl(
+                        endpoint, method="POST",
+                        headers={"Content-Type": "application/json"},
+                        data=json.dumps({"query": query}),
+                        output="body", timeout=15,
+                    )
+                except Exception:
+                    continue
+                body = response.get("body", "") or ""
+                try:
+                    data = json.loads(body).get("data", {}) if body else {}
+                except (json.JSONDecodeError, AttributeError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                value = data.get(shape)
+                if value is None or "errors" in str(body).lower()[:200]:
+                    continue
+                if isinstance(value, list) and not value:
+                    continue
+                self.state.add_finding(
+                    title=f"GraphQL Unauthenticated Field Read: {shape}.{field}",
+                    severity="MEDIUM",
+                    confidence="CONFIRMED",
+                    category="API Security",
+                    description=(
+                        f"GraphQL endpoint at {endpoint} returns `{shape}.{field}` "
+                        f"without authentication. Query: {query}"),
+                    evidence=[f"Endpoint: {endpoint}", f"Query: {query}",
+                              f"Response: {str(value)[:200]}"],
+                    evidence_refs=[evidence_id],
+                    remediation="Enforce field-level authorization on sensitive "
+                                "types; require authentication for non-public fields.",
+                    asset_keys=[f"url:{endpoint}"],
+                    verified=True,
+                    verification={"method": "unauthenticated_graphql_read",
+                                  "url": endpoint},
+                )
+                return

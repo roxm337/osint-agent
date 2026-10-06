@@ -146,16 +146,7 @@ class RestAPIAudit(BaseModule):
                 )
 
                 if "file_size" in path:
-                    self.state.add_finding(
-                        title="Yoast file_size SSRF Vector",
-                        severity="MEDIUM",
-                        confidence="CONFIRMED",
-                        category="SSRF",
-                        description=f"Yoast SEO file_size endpoint at {full_url} "
-                                    f"may allow server-side request forgery.",
-                        evidence=[f"Endpoint: {full_url}"],
-                        remediation="Update Yoast SEO; restrict endpoint to admins.",
-                    )
+                    await self._check_file_size_ssrf(full_url)
                 elif "akismet/v1/key" in path:
                     # API key may be in response
                     try:
@@ -182,6 +173,87 @@ class RestAPIAudit(BaseModule):
                         evidence=[f"Endpoint: {full_url}"],
                         remediation="Restrict plugin REST endpoints to authenticated users.",
                     )
+
+    async def _check_file_size_ssrf(self, endpoint_url: str) -> None:
+        """Prove or downgrade the Yoast file_size SSRF vector with OOB.
+
+        "May allow SSRF" is not a finding. With an OOB channel configured,
+        the endpoint fetches a callback URL and a received interaction is
+        CONFIRMED SSRF. Without a channel — or without a callback — the
+        endpoint is recorded present-but-untested at LOW.
+        """
+        from tools.wrappers import curl
+        client = self.oob()
+        if client is None:
+            self.state.add_finding(
+                title="Yoast file_size SSRF Vector (Untested)",
+                severity="LOW",
+                confidence="TENTATIVE",
+                category="SSRF",
+                description=(f"Yoast SEO file_size endpoint at {endpoint_url} "
+                             "accepts a URL parameter. No OOB channel is "
+                             "configured, so server-side fetching is unproven."),
+                evidence=[f"Endpoint: {endpoint_url}"],
+                remediation="Update Yoast SEO; restrict endpoint to admins.",
+            )
+            return
+        try:
+            corr_id = await client.register_callback(f"yoast-file-size:{endpoint_url}")
+            callback = client.callback_url(corr_id, "/yoast")
+        except Exception as exc:
+            self.log(f"  OOB registration failed: {exc}")
+            return
+        import asyncio as _asyncio
+        from urllib.parse import urlencode
+        proven = False
+        for param in ("url", "file", "src"):
+            probe = f"{endpoint_url}?{urlencode({param: callback})}"
+            try:
+                await curl(probe, output="status", timeout=15)
+            except Exception:
+                pass
+            for _ in range(3):
+                try:
+                    interactions = await client.poll(corr_id)
+                except Exception:
+                    interactions = []
+                if interactions:
+                    proven = True
+                    break
+                await _asyncio.sleep(client.poll_interval)
+            if proven:
+                break
+        if proven:
+            self.state.add_finding(
+                title="Yoast file_size SSRF Confirmed via OOB Callback",
+                severity="HIGH",
+                confidence="CONFIRMED",
+                category="SSRF",
+                description=(f"Yoast SEO file_size endpoint at {endpoint_url} "
+                             "fetched an out-of-band callback URL: the server "
+                             "issues requests to attacker-supplied destinations."),
+                evidence=[f"Endpoint: {endpoint_url}",
+                          f"OOB callback received (corr {corr_id[:8]})"],
+                remediation="Update Yoast SEO; restrict endpoint to admins; "
+                            "validate any fetched URL against an allowlist.",
+                verified=True,
+                verification={"method": "oob_callback",
+                              "url": endpoint_url,
+                              "param": param},
+            )
+        else:
+            self.state.add_finding(
+                title="Yoast file_size SSRF Vector (Unproven)",
+                severity="LOW",
+                confidence="TENTATIVE",
+                category="SSRF",
+                description=(f"Yoast SEO file_size endpoint at {endpoint_url} "
+                             "accepts a URL parameter but fetched no OOB "
+                             "callback during testing."),
+                evidence=[f"Endpoint: {endpoint_url}",
+                          "OOB probes sent, no callback observed"],
+                remediation="Update Yoast SEO; restrict endpoint to admins.",
+            )
 
     async def _discover_openapi(self, base_url: str):
         """Discover Swagger/OpenAPI documentation."""
@@ -299,18 +371,38 @@ class RestAPIAudit(BaseModule):
             if status not in (200, 401) or not body:
                 continue
 
-            # Check for JWT in response
+            # Check for JWT in response. A live-shaped token is HIGH;
+            # docs/sample tokens and expired ones are context, not takeover.
             jwt_pattern = r'eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+'
             jwts = re.findall(jwt_pattern, body)
             if jwts:
+                from core.validators import analyze_jwt, redact_secret
+                verdict = analyze_jwt(jwts[0])
+                tier = verdict["tier"]
+                if tier == "live_shaped":
+                    severity, confidence = "HIGH", "CONFIRMED"
+                    description = (
+                        f"Live-shaped JWT in API response at {base_url}{path}. "
+                        f"May allow account takeover if secret is weak.")
+                elif tier == "expired":
+                    severity, confidence = "LOW", "FIRM"
+                    description = (
+                        f"Expired JWT in API response at {base_url}{path}. "
+                        "Token hygiene issue, not live takeover material.")
+                else:
+                    severity, confidence = "INFO", "FIRM"
+                    description = (
+                        f"Docs/sample JWT in API response at {base_url}{path} "
+                        f"({verdict['reason']}).")
                 self.state.add_finding(
                     title=f"JWT Token Exposed in API Response: {path}",
-                    severity="HIGH",
-                    confidence="CONFIRMED",
+                    severity=severity,
+                    confidence=confidence,
                     category="Credential Exposure",
-                    description=f"JWT token found in API response at {base_url}{path}. "
-                                f"May allow account takeover if secret is weak.",
-                    evidence=[f"JWT: {jwts[0][:50]}...", f"URL: {base_url}{path}"],
+                    description=description,
+                    evidence=[f"JWT: {redact_secret(jwts[0])}...",
+                              f"tier: {tier} ({verdict['reason']})",
+                              f"URL: {base_url}{path}"],
                     remediation="Never include authentication tokens in publicly accessible "
                                 "API documentation or sample responses.",
                 )

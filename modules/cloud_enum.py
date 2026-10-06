@@ -1,6 +1,8 @@
 """Stage 4: Cloud Bucket Enumeration — S3, GCS, Azure, DigitalOcean Spaces."""
 
 import asyncio
+import time
+
 from modules.base import BaseModule
 from tools.wrappers import curl
 
@@ -71,7 +73,22 @@ class CloudEnum(BaseModule):
 
         batch_size = 200
         task_results = []
+        # Dead names cost the full 5s curl timeout each, so a few hundred
+        # candidates across seven providers can outlast the module deadline
+        # and die with zero buckets recorded. Findings already land per
+        # bucket above, so stopping early keeps the partial coverage.
+        try:
+            deadline = float(self.config.get("module_timeout", 300) or 300)
+        except (TypeError, ValueError):
+            deadline = 300.0
+        stop_at = time.monotonic() + max(60.0, deadline - 45.0)
+        time_boxed = False
         for i in range(0, len(tasks), batch_size):
+            if time.monotonic() >= stop_at:
+                time_boxed = True
+                self.log(f"  Time-box hit at {completed}/{total_tasks} probes — "
+                         "keeping the buckets found so far")
+                break
             batch = tasks[i:i + batch_size]
             batch_out = await asyncio.gather(*batch, return_exceptions=True)
             task_results.extend(batch_out)
@@ -89,12 +106,26 @@ class CloudEnum(BaseModule):
             if status == 200:
                 listing = self._classify_listing(provider, body)
                 keys = self._extract_keys(provider, body)
-                sensitive = self._find_sensitive_markers(keys, body)
+                # Markers count in object KEYS, not in the raw body: SDK
+                # bundles and docs pages contain words like "config.json"
+                # and "password" without exposing anything. Body-only
+                # mentions are context, never a severity bump.
+                sensitive = self._find_sensitive_markers(keys)
+                body_mentions = self._find_sensitive_markers(
+                    [body[:5000]]) if not sensitive else []
+                proven, proof = False, []
 
                 if sensitive:
-                    severity = "CRITICAL"
-                    critical_count += 1
-                    classification = "Sensitive data exposed"
+                    proven, proof = await self._prove_key_readable(
+                        provider, url, keys, sensitive)
+                    if proven:
+                        severity = "CRITICAL"
+                        critical_count += 1
+                        classification = "Sensitive data exposed and readable"
+                    else:
+                        severity = "HIGH"
+                        classification = ("Sensitive object names listed "
+                                          "(objects not directly readable)")
                 elif listing:
                     severity = "MEDIUM"
                     classification = "Public directory listing"
@@ -124,8 +155,10 @@ class CloudEnum(BaseModule):
                         f"Objects visible: {len(keys)}",
                         f"Sample keys: {keys[:15]}",
                         f"Sensitive markers: {sensitive[:10]}" if sensitive else "",
+                        f"Body-only mentions (not object names): "
+                        f"{body_mentions[:5]}" if body_mentions else "",
                         f"Preview: {body[:200]}",
-                    ],
+                    ] + [f"Key readability proof: {line}" for line in proof[:3]],
                     remediation=(
                         "Apply bucket ACL to block public access. Enable Block "
                         "Public Access settings. Rotate any credentials present "
@@ -133,9 +166,11 @@ class CloudEnum(BaseModule):
                         "Apply bucket ACL to block public access. Enable Block "
                         "Public Access settings."
                     ),
-                    verified=True,
+                    verified=severity == "CRITICAL",
                     verification={
-                        "method": "http_200_unauthenticated",
+                        "method": ("sensitive_object_readable_unauthenticated"
+                                   if severity == "CRITICAL"
+                                   else "http_200_unauthenticated"),
                         "listing_detected": listing,
                         "keys_visible": len(keys),
                         "sensitive_markers": sensitive,
@@ -190,6 +225,8 @@ class CloudEnum(BaseModule):
                 "private": exists_count - public_count,
                 "providers_checked": list(PROVIDER_TEMPLATES.keys()),
                 "candidates_tested": len(candidates),
+                "probes_completed": completed,
+                "time_boxed": time_boxed,
             },
         )
 
@@ -225,13 +262,47 @@ class CloudEnum(BaseModule):
             keys = re.findall(r'"name"\s*:\s*"([^"]+)"', body)
         return keys[:200]
 
-    def _find_sensitive_markers(self, keys: list, body: str) -> list:
+    def _find_sensitive_markers(self, texts: list) -> list:
+        """Marker substrings in object names (never the raw body alone)."""
         found = []
-        haystack = (" ".join(keys) + " " + body[:5000]).lower()
+        haystack = " ".join(texts).lower()
         for marker in _SENSITIVE_MARKERS:
             if marker in haystack:
                 found.append(marker)
         return found
+
+    async def _prove_key_readable(self, provider: str, bucket_url: str,
+                                  keys: list, sensitive: list
+                                  ) -> tuple[bool, list[str]]:
+        """GET one sensitive-named key to prove readability, read-only.
+
+        A listed name is a claim; a fetched body is proof. Only object
+        stores with unambiguous key URLs are attempted (S3/GCS/Spaces);
+        Azure needs a container segment and Firebase is JSON-shaped, so
+        those keep the HIGH "names listed" verdict.
+        """
+        if provider.startswith("azure") or provider.startswith("firebase"):
+            return False, ["provider needs container context — not attempted"]
+        target_key = ""
+        for key in keys:
+            lowered = str(key).lower()
+            if any(marker in lowered for marker in sensitive):
+                target_key = str(key).strip()
+                break
+        if not target_key:
+            return False, []
+        key_url = bucket_url.rstrip("/") + "/" + target_key.lstrip("/")
+        try:
+            response = await curl(key_url, output="body",
+                                  follow_redirects=False, timeout=8)
+        except Exception as exc:
+            return False, [f"key fetch failed: {exc}"]
+        body = response.get("body", "") or ""
+        if response.get("status") == 200 and len(body) > 0:
+            preview = body[:160].replace("\n", " ")
+            return True, [f"GET {key_url} -> HTTP 200, {len(body)} bytes",
+                          f"preview: {preview}"]
+        return False, [f"GET {key_url} -> HTTP {response.get('status', 0)}"]
 
     def _generate_candidates(self) -> list:
         prefixes = self.config.get("wordlists", {}).get("bucket_prefixes", [""])
@@ -256,4 +327,30 @@ class CloudEnum(BaseModule):
                     if name:
                         candidates.add(name.lower())
 
-        return sorted(candidates)[:200]
+        # Bucket names the target itself advertises: storage hosts inside
+        # discovered URLs, API endpoints and JS files. A bucket referenced
+        # by the app outranks the thousandth domain permutation.
+        candidates.update(self._candidates_from_assets())
+
+        return sorted(candidates)[:300]
+
+    def _candidates_from_assets(self) -> set:
+        """Derive bucket names from storage URLs already in state."""
+        import re
+        found = set()
+        patterns = (
+            (re.compile(r"https?://([a-z0-9.-]+?)\.s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com", re.I), 1),
+            (re.compile(r"https?://storage\.googleapis\.com/([a-z0-9._-]+)", re.I), 1),
+            (re.compile(r"https?://([a-z0-9-]+)\.blob\.core\.windows\.net", re.I), 1),
+            (re.compile(r"https?://([a-z0-9.-]+)\.digitaloceanspaces\.com", re.I), 1),
+            (re.compile(r"https?://([a-z0-9-]+)\.firebaseio\.com", re.I), 1),
+        )
+        for asset_type in ("url", "api_endpoint", "js_file", "web_path"):
+            for asset in self.state.get_assets_by_type(asset_type):
+                value = str(asset.get("value", "") or "")
+                for pattern, _group in patterns:
+                    for match in pattern.finditer(value):
+                        name = match.group(1).strip(".").lower()
+                        if name and len(name) >= 3:
+                            found.add(name)
+        return found

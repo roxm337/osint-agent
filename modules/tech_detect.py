@@ -24,6 +24,25 @@ def pattern_in(pattern: str, text: str) -> bool:
     return low_pattern in text.lower()
 
 
+def _looks_like_api_path(path: str) -> bool:
+    """Is this path API-shaped (versioned, .json, or a known API root)?"""
+    lowered = str(path or "").lower()
+    return bool(re.search(r"/v\d+(/|$)|/api/|/graphql|/rest/|\.json$|/actuator", lowered))
+
+
+def _extract_version(body: str, product_name: str) -> str:
+    """Best-effort version string near the product name for CVE matching."""
+    text = str(body or "")
+    for pattern in (
+        rf"{re.escape(product_name)}[\s/_-]*v?(\d+(?:\.\d+){{1,3}})",
+        r"[Vv]ersion[\s:]*(\d+(?:\.\d+){1,3})",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    return ""
+
+
 VENDOR_FINGERPRINTS = {
     "citrix_netscaler": {
         "paths": ["/vpn/index.html", "/logon/LogonPoint/index.html"],
@@ -115,21 +134,6 @@ VENDOR_FINGERPRINTS = {
         "body_patterns": ["SolarWinds", "Orion"],
         "severity": "HIGH",
     },
-}
-
-MISSING_HEADER_FINDINGS = {
-    "strict-transport-security": ("HSTS Missing", "MEDIUM",
-        "HSTS header missing. Browsers may downgrade to HTTP."),
-    "content-security-policy": ("CSP Missing", "MEDIUM",
-        "Content-Security-Policy missing. XSS and injection risks elevated."),
-    "x-frame-options": ("Clickjacking Protection Missing", "MEDIUM",
-        "X-Frame-Options missing. Site can be embedded in iframes for clickjacking."),
-    "x-content-type-options": ("MIME Sniffing Protection Missing", "LOW",
-        "X-Content-Type-Options: nosniff missing. Browser MIME-sniffing attacks possible."),
-    "referrer-policy": ("Referrer-Policy Missing", "LOW",
-        "No Referrer-Policy set. Sensitive URL parameters may leak in Referer headers."),
-    "permissions-policy": ("Permissions-Policy Missing", "LOW",
-        "Permissions-Policy missing. Browser features (camera, geolocation) unconstrained."),
 }
 
 
@@ -277,12 +281,13 @@ class TechDetection(BaseModule):
             attrs=tech,
         )
 
-        # Findings: missing security headers
+        # Findings: missing security headers. Hardening hygiene, not a
+        # vulnerability: LOW so it never outranks observable exposure.
         missing = [h for h, v in security.items() if v is False]
         if missing:
             self.state.add_finding(
                 title="Missing Security Headers",
-                severity="MEDIUM",
+                severity="LOW",
                 confidence="CONFIRMED",
                 category="Hardening Deficiency",
                 description=f"The webapp is missing {len(missing)} security headers: "
@@ -318,6 +323,7 @@ class TechDetection(BaseModule):
         """Check for vendor-specific products on common paths."""
         for product_name, fp in VENDOR_FINGERPRINTS.items():
             detected = False
+            path_confirmed = False
             evidence = []
 
             # Check body patterns on main page first (cheap)
@@ -328,19 +334,41 @@ class TechDetection(BaseModule):
                     break
 
             # Check specific paths if not already detected
-            if not detected:
-                for path in fp["paths"][:2]:
+            for path in fp["paths"][:2]:
+                try:
                     r = await curl_with_status(f"{base_url}{path}")
-                    status = r.get("status", 0)
-                    body = r.get("body", "")
-                    if status in (200, 302, 301):
-                        for pattern in fp["body_patterns"]:
-                            if pattern_in(pattern, body):
-                                detected = True
-                                evidence.append(f"Path: {base_url}{path} ({status})")
-                                break
-                    if detected:
+                except Exception:
+                    continue
+                status = r.get("status", 0)
+                body = r.get("body", "") or ""
+                if status in (401, 403) and _looks_like_api_path(path):
+                    # An auth challenge on an API-shaped path confirms the
+                    # product's surface more than any keyword does: a docs
+                    # page can mention "Kubernetes", but only a real API
+                    # server answers 403 on /api/v1/namespaces.
+                    detected = True
+                    path_confirmed = True
+                    evidence.append(f"Auth-gated API surface: {base_url}{path} ({status})")
+                    version = _extract_version(body, product_name)
+                    if version:
+                        evidence.append(f"Version hint: {version}")
+                        tech.setdefault("product_versions", {})[product_name] = version
+                    break
+                if status in (200, 302, 301):
+                    matched = [pattern for pattern in fp["body_patterns"]
+                               if pattern_in(pattern, body)]
+                    if matched:
+                        detected = True
+                        path_confirmed = True
+                        evidence.append(f"Path: {base_url}{path} ({status}): "
+                                        f"{', '.join(matched)}")
+                        version = _extract_version(body, product_name)
+                        if version:
+                            evidence.append(f"Version hint: {version}")
+                            tech.setdefault("product_versions", {})[product_name] = version
                         break
+                if detected and path_confirmed:
+                    break
 
             if detected:
                 tech["vendor_products"].append(product_name)
@@ -359,13 +387,23 @@ class TechDetection(BaseModule):
                     attrs={"product": product_name},
                 )
                 if fp["severity"] in ("HIGH", "CRITICAL", "MEDIUM"):
+                    if path_confirmed:
+                        severity, confidence = fp["severity"], "FIRM"
+                    else:
+                        # Main-page keyword only: a docs page mentioning the
+                        # product is not the product. INFO context, not even
+                        # a LOW — it never reaches a submission.
+                        severity, confidence = "INFO", "TENTATIVE"
                     self.state.add_finding(
                         title=f"Vendor Product Detected: {product_name.replace('_', ' ').title()}",
-                        severity=fp["severity"],
-                        confidence="FIRM",
+                        severity=severity,
+                        confidence=confidence,
                         category="Attack Surface",
                         description=f"Detected {product_name.replace('_', ' ').title()} at "
-                                    f"{base_url}. Verify version and check for known CVEs.",
+                                    f"{base_url}. Verify version and check for known CVEs."
+                                    + ("" if path_confirmed else
+                                       " So far this is a body-text mention only, "
+                                       "not a confirmed installation."),
                         evidence=evidence,
                         remediation="Ensure latest version is deployed and access is restricted.",
                         asset_keys=[f"webapp:{base_url}"],
