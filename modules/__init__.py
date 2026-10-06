@@ -237,7 +237,8 @@ MODULE_REGISTRY = {
         "class": JSAnalysis,
         "stage": 4,
         "detectability": "low",
-        "depends_on": ["wayback_machine", "tech_detection"],
+        "depends_on": ["wayback_machine", "tech_detection",
+                       "browser_crawl", "deep_crawl"],
         "active": False,
     },
     "origin_discovery": {

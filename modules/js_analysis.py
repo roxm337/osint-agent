@@ -107,6 +107,14 @@ def extract_endpoints(js_content: str, base_url: str) -> list:
     patterns = [
         r'["\'`](/(?:api|v[0-9]+|rest|graphql|auth|user|admin|manage)[^"\'`\s]{0,100})["\'`]',
         r'["\'`](https?://[^\s"\'`]+)["\'`]+',
+        # Angular route tables and routerLinks (backtick-quoted in prod
+        # bundles, comma-separated in compiled templates).
+        r'path:\s*[\"\'`]([a-z][\w\-/]*)[\"\'`]',
+        r'routerLink`,\s*[\"\'`](/[\w\-/]+)[\"\'`]',
+        r'routerLink\s*=\s*["\']([^"\']+)["\']',
+        # Template-literal API calls: `${host}/rest/x?q=${e}` carries
+        # both the endpoint and its parameter names.
+        r'`\$\{[^}]*\}((?:/[\w\-.~!$&\'()*+,;=:@%]+)+)(\?[^`$]*)?`',
         r'fetch\(["\']([^"\']+)["\']',
         r'axios\.[a-z]+\(["\']([^"\']+)["\']',
         r'url:\s*["\']([^"\']+)["\']',
@@ -123,9 +131,39 @@ def extract_endpoints(js_content: str, base_url: str) -> list:
     endpoints = set()
     for pattern in patterns:
         for match in re.findall(pattern, js_content):
+            if isinstance(match, tuple):
+                # Template literal (path, query): keep the path here;
+                # parameter names come from extract_template_params.
+                if match[0] and len(match[0]) > 2:
+                    endpoints.add(match[0])
+                continue
             if match and len(match) > 2:
                 endpoints.add(match)
     return list(endpoints)[:100]
+
+
+def extract_template_params(js_content: str) -> dict:
+    """Map API paths to the parameters bound into template literals.
+
+    `${host}/rest/products/search?q=${e}` means the app sends `q`: a
+    parameter name no crawler, archive, or swagger file will ever list.
+    The name before `=` is the parameter; `${…}` is just the JS
+    variable being sent. Returns {path: [param, ...]}.
+    """
+    found: dict[str, list] = {}
+    pattern = (r"`\$\{[^}]*\}((?:/[\w\-.~!$&'()*+,;=:@%]+)+)"
+               r"(\?[^`]*)?`")
+    for match in re.findall(pattern, js_content):
+        path = match[0] if isinstance(match, tuple) else match
+        query = match[1] if isinstance(match, tuple) and len(match) > 1 else ""
+        if not path or len(path) <= 2:
+            continue
+        names = re.findall(r"([A-Za-z_][\w]*)=\$\{", query or "")
+        for name in names:
+            current = found.setdefault(path, [])
+            if name not in current:
+                current.append(name)
+    return found
 
 
 def _absolutize_endpoint(base_url: str, endpoint: str) -> str:
@@ -485,6 +523,25 @@ class JSAnalysis(BaseModule):
             endpoints = extract_endpoints(content, base_url)
             for ep in endpoints:
                 all_endpoints.append({"endpoint": ep, "source": js_url})
+
+            # Template-bound parameters: the app's own calls name the
+            # parameters crawlers never see (?q=, ?orderId=, ...).
+            for path, names in extract_template_params(content).items():
+                endpoint_url = _absolutize_endpoint(
+                    base_url, path.split("?")[0])
+                if not endpoint_url:
+                    continue
+                for name in names:
+                    self.state.add_asset(
+                        "parameter",
+                        f"param:{endpoint_url}:{name}",
+                        name,
+                        confidence="FIRM",
+                        sources=["js template literal"],
+                        attrs={"url": endpoint_url,
+                               "parameter": name,
+                               "template": path},
+                    )
 
             # DOM-XSS sink discovery
             all_dom_sinks.extend(extract_dom_sinks(content, js_url))

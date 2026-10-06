@@ -2869,3 +2869,54 @@ def test_adopt_discovered_shared_helper():
     assert "sqli_auth_bypass" in harness.identities
     # Idempotent: second merge adopts nothing new.
     assert harness.adopt_discovered(state) == 0
+
+
+# ── Continue wave: template params + fragment routes ────────────
+
+def test_template_literal_params_extracted():
+    from modules.js_analysis import extract_template_params
+    found = extract_template_params(
+        "search(e){return this.http.get(`${this.hostServer}/rest/products/search?q=${e}`)}"
+        "track(o){return this.http.post(`${this.hostServer}/rest/track-order`,"
+        " {orderId:o})}")
+    assert found == {"/rest/products/search": ["q"]}
+
+
+def test_fragment_routes_absolutized():
+    from modules.js_analysis import extract_endpoints, _absolutize_endpoint
+    found = extract_endpoints(
+        "{path:`search`,component:Vs},{path:`basket`,component:Bk}",
+        "http://example.com")
+    assert "search" in found and "basket" in found
+    assert _absolutize_endpoint("http://example.com", "search") == \
+        "http://example.com/#/search"
+
+
+def test_js_template_params_become_assets(monkeypatch):
+    import modules.js_analysis as js_module
+    from modules.js_analysis import JSAnalysis
+
+    async def fake_curl(url, **kwargs):
+        if url.endswith("/app.js"):
+            return {"status": 200,
+                    "body": "s(e){return this.http.get(`${h}/rest/products/search?q=${e}`)}",
+                    "time_ms": 5, "url": url}
+        return {"status": 200, "body": "<html></html>", "time_ms": 5,
+                "url": url}
+
+    async def fake_status(url, timeout=10):
+        result = await fake_curl(url)
+        return {"status": result["status"], "body": result["body"]}
+
+    monkeypatch.setattr(js_module, "curl_with_status", fake_status)
+    state = _state()
+    state.add_asset("js_file", "js:http://example.com/app.js",
+                    "http://example.com/app.js", confidence="FIRM",
+                    sources=["test"], attrs={})
+
+    assert asyncio.run(JSAnalysis(
+        state, {"target": {"domain": "example.com",
+                           "base_url": "http://example.com"}}).run()) == "done"
+    params = {(p["value"], (p.get("attrs") or {}).get("url"))
+              for p in state.get_assets_by_type("parameter")}
+    assert ("q", "http://example.com/rest/products/search") in params
