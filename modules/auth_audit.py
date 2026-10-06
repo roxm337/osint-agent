@@ -376,12 +376,14 @@ class AuthAudit(BaseModule):
         if not token:
             return
         auth = {"Authorization": f"Bearer {token}"}
+        from core.probe_targets import in_scope_url
         admin_urls = []
         for asset in self.state.get_assets_by_type("api_endpoint"):
             value = str(asset.get("value", "") or "")
             if any(hint in value.lower() for hint in
                    ("/admin", "administration", "config")):
-                admin_urls.append(value)
+                if in_scope_url(value, self.base_url, self.domain):
+                    admin_urls.append(value)
         for path in ADMIN_PATH_SEEDS:
             url = f"{self.base_url}{path}"
             if url not in admin_urls:
@@ -457,13 +459,15 @@ class AuthAudit(BaseModule):
         except Exception:
             claims = {}
         id_mutations = _id_mutations(claims)
+        from core.probe_targets import in_scope_url
         targets = []
         for asset in self.state.get_assets_by_type("api_endpoint"):
             value = str(asset.get("value", "") or "")
             if "{id}" in value or "{Id}" in value:
                 value = value.replace("{id}", "1").replace("{Id}", "1")
             if value.startswith(("http://", "https://")) \
-                    and value not in targets:
+                    and value not in targets \
+                    and in_scope_url(value, self.base_url, self.domain):
                 targets.append(value)
 
         import time as _time_guard
@@ -645,6 +649,7 @@ class AuthAudit(BaseModule):
         _stop_at = _time_guard.monotonic() + max(60.0, _guard_deadline - 30.0)
         token = identity.get("token", "")
         auth = {"Authorization": f"Bearer {token}"} if token else None
+        from core.probe_targets import in_scope_url
         candidates = []
         for asset in self.state.get_assets_by_type("api_endpoint"):
             attrs = asset.get("attrs", {}) or {}
@@ -654,7 +659,8 @@ class AuthAudit(BaseModule):
             value = str(asset.get("value", "") or "")
             if "{id}" in value or "{Id}" in value:
                 value = value.replace("{id}", "1").replace("{Id}", "1")
-            if value not in candidates:
+            if value not in candidates and in_scope_url(
+                    value, self.base_url, self.domain):
                 candidates.append(value)
 
         for url in candidates[:5]:
