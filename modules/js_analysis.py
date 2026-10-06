@@ -547,22 +547,42 @@ class JSAnalysis(BaseModule):
             all_dom_sinks.extend(extract_dom_sinks(content, js_url))
             all_dom_flows.extend(extract_dom_flows(content, js_url))
 
-        # Check source maps (may expose original source)
+        # Check source maps: a reference is a hint, fetched JSON with
+        # sources is exposure. The bare-status version of this check filed
+        # HIGH on any 200, which is the shortcut the blind-trust test
+        # forbids — a catch-all HTML shell answers 200 to everything.
         for map_url in source_maps[:5]:
             r = await curl_with_status(map_url)
-            if r.get("status") == 200:
-                source_maps_found = True
-                self.state.add_finding(
-                    title=f"JavaScript Source Map Exposed: {map_url}",
-                    severity="HIGH",
-                    confidence="CONFIRMED",
-                    category="Information Disclosure",
-                    description=f"JavaScript source map at {map_url} exposes original "
-                                f"pre-compiled source code, potentially including "
-                                f"secrets, comments, and internal logic.",
-                    evidence=[f"Source map URL: {map_url}", f"Status: 200"],
-                    remediation="Remove .map files from production deployments.",
-                )
+            body = (r.get("body", "") or "").strip()
+            if not body.startswith("{"):
+                continue
+            try:
+                import json as _json
+                document = _json.loads(body)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(document, dict):
+                continue
+            sources = document.get("sources", []) or []
+            if not sources:
+                continue
+            has_content = bool(document.get("sourcesContent"))
+            source_maps_found = True
+            self.state.add_finding(
+                title=f"JavaScript Source Map Exposed: {map_url}",
+                severity="MEDIUM" if has_content else "LOW",
+                confidence="CONFIRMED",
+                category="Information Disclosure",
+                description=f"JavaScript source map at {map_url} serves "
+                            f"{len(sources)} original source file(s)"
+                            f"{' with embedded sourcesContent' if has_content else ''}.",
+                evidence=[f"Source map URL: {map_url}",
+                          f"Sources: {len(sources)} file(s)"],
+                remediation="Remove .map files from production deployments.",
+                verified=True,
+                verification={"method": "sourcemap_json_parse",
+                              "url": map_url},
+            )
 
         # Deduplicate secrets
         seen_secrets = set()

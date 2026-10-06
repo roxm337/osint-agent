@@ -148,6 +148,9 @@ class GitExposure(BaseModule):
             evidence_refs=evidence_refs,
             asset_keys=[f"webapp:{base_url}"],
             remediation="Remove .git from the web root and deny all dot-directory access at the web server.",
+            verified=True,
+            verification={"method": "git_metadata_content",
+                          "url": f"{base_url}{exposed[0]['path']}" if exposed else base_url},
         )
 
         if secrets:

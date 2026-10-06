@@ -179,6 +179,9 @@ class RestAPIAudit(BaseModule):
                 ],
                 remediation="Restrict REST API to authenticated users. Add: "
                             "add_filter('rest_endpoints', ...) to block /users.",
+                verified=True,
+                verification={"method": "rest_users_json",
+                              "url": f"{base_url}/wp-json/wp/v2/users"},
             )
 
         # Check plugin endpoints

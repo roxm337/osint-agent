@@ -126,6 +126,8 @@ class HeadersAudit(BaseModule):
                 remediation="Remove unsafe-inline/unsafe-eval, drop wildcards "
                             "from script-src, add object-src 'none'.",
                 asset_keys=[f"url:{url}"],
+                verified=True,
+                verification={"method": "csp_policy_parsed", "url": url},
             )
 
     def _audit_cookie(self, name: str, attrs: dict) -> None:
@@ -155,6 +157,9 @@ class HeadersAudit(BaseModule):
             remediation="Set HttpOnly and SameSite=Lax (Strict for "
                         "high-value sessions); Secure on HTTPS.",
             asset_keys=[],
+            verified=True,
+            verification={"method": "cookie_flags_observed",
+                          "url": self.base_url},
         )
 
     async def _audit_methods(self) -> None:
@@ -198,6 +203,9 @@ class HeadersAudit(BaseModule):
                     remediation="Disable TRACE and TRACK; they exist for "
                                 "debugging, not production.",
                     asset_keys=[],
+                    verified=True,
+                    verification={"method": "trace_echo_probe" if echo else "trace_allowed_header",
+                                  "url": origin},
                 )
             write_verbs = sorted({"PUT", "DELETE", "PATCH"} & allowed)
             if write_verbs:
@@ -214,6 +222,9 @@ class HeadersAudit(BaseModule):
                     remediation="No action unless a verb proves reachable "
                                 "without authorization.",
                     asset_keys=[],
+                    verified=True,
+                    verification={"method": "options_allow_header",
+                                  "url": origin},
                 )
 
     async def _trace_echo(self, origin: str) -> bool:

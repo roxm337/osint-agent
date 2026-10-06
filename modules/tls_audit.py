@@ -98,6 +98,9 @@ class TLSAudit(BaseModule):
                 evidence=[f"Not After: {not_after}"],
                 remediation="Renew TLS certificate immediately.",
                 asset_keys=[f"domain:{host}"],
+                verified=True,
+                verification={"method": "cert_notafter_parse",
+                              "url": f"{host}:{port}"},
             )
         elif days_left is not None and days_left <= 30:
             self.state.add_finding(
@@ -109,6 +112,9 @@ class TLSAudit(BaseModule):
                 evidence=[f"Not After: {not_after}", f"Days remaining: {days_left}"],
                 remediation="Renew TLS certificate before expiration.",
                 asset_keys=[f"domain:{host}"],
+                verified=True,
+                verification={"method": "cert_notafter_parse",
+                              "url": f"{host}:{port}"},
             )
 
         # 3. Weak protocol check
@@ -129,6 +135,9 @@ class TLSAudit(BaseModule):
                     remediation=f"Disable {proto_display} in server configuration. "
                                 f"Require TLS 1.2 minimum; TLS 1.3 preferred.",
                     asset_keys=[f"domain:{host}"],
+                    verified=True,
+                    verification={"method": "tls_handshake_offer",
+                                  "url": f"{host}:{port}"},
                 )
 
         # 4. Weak cipher check: constrain the offered ciphers to weak-only
@@ -147,6 +156,9 @@ class TLSAudit(BaseModule):
                 evidence=[f"Negotiated weak cipher: {weak_cipher}"],
                 remediation="Configure server to only accept strong cipher suites.",
                 asset_keys=[f"domain:{host}"],
+                verified=True,
+                verification={"method": "weak_cipher_negotiation",
+                              "url": f"{host}:{port}"},
             )
 
         # 4b. Nmap TLS script corroboration: named vulnerabilities beat

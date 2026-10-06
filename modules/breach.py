@@ -176,6 +176,9 @@ class BreachCheck(BaseModule):
                     for email, breaches in list(breached_emails.items())[:10]
                 ],
                 remediation="Force password reset; enable MFA; check for credential reuse.",
+                verified=True,
+                verification={"method": "hibp_breach_match",
+                              "url": f"https://haveibeenpwned.com/api/v3/breachedaccount/{next(iter(breached_emails))}"},
             )
         elif hibp_api_key:
             # A clean HIBP result is a log line, not a finding: negative
