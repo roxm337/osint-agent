@@ -28,7 +28,7 @@ FINDING_RULES = [
     # Backup files (including null-byte-bypass variants like .bak%2500.md,
     # which servers decode past the extension filter).
     (["package.json.bak", "composer.json.bak", ".env.bak", ".bak%25",
-      ".backup", "coupons_2013.md.bak", "config.php.bak"],
+      ".backup"],
      "HIGH", "Backup File Exposed",
      "Backup file accessible — may contain source code, credentials, or customer data."),
     (["/wp-content/debug.log", "/wp-content/error_log"],
@@ -191,6 +191,13 @@ class MisconfigProbes(BaseModule):
             all_paths.update(self.config.get("wordlists", {}).get(key, []))
 
         probe_cfg = self.config.get("misconfig", {})
+        if not isinstance(probe_cfg, dict):
+            probe_cfg = {}
+        # Knowledge packs merge under modules:{id:}; honor both so pack
+        # extras (extra_backup_bases) work without config surgery.
+        pack_cfg = (self.config.get("modules", {}) or {}).get("misconfig", {})
+        if isinstance(pack_cfg, dict):
+            probe_cfg = {**pack_cfg, **probe_cfg}
         timeout = int(probe_cfg.get("timeout", 5) or 5)
         concurrency = max(1, int(probe_cfg.get("concurrency", 12) or 12))
         max_paths = int(probe_cfg.get("max_paths", 160) or 160)
@@ -242,7 +249,7 @@ class MisconfigProbes(BaseModule):
         # ";.md" suffixes served package.json.bak live on one target.
         await self._probe_backup_combinations(
             base_url, timeout, concurrency, profile,
-            findings_found, exposed_paths)
+            findings_found, exposed_paths, probe_cfg)
 
         # Record all findings
         for f in findings_found:
@@ -267,13 +274,18 @@ class MisconfigProbes(BaseModule):
     async def _probe_backup_combinations(self, base_url: str, timeout: int,
                                               concurrency: int, profile,
                                               findings_found: list,
-                                              exposed_paths: list) -> None:
+                                              exposed_paths: list,
+                                              probe_cfg: dict) -> None:
         """Backup names × suffixes at webroot and file-drop dirs, plus
         filter-bypass variants of anything the server blocks with 403."""
         bases = ("package.json", ".env", "composer.json", "wp-config.php",
-                 "config.php", "coupons_2013.md", "eastere.gg")
+                 "config.php")
         suffixes = ("", ".bak", ".old", "~", ".backup", ".save")
         bypasses = ("%2500.md", ";.md")
+        # Lab packs and operators extend the base list without touching
+        # code: target-specific backup names live in config, not here.
+        bases = tuple(bases) + tuple(
+            str(b) for b in probe_cfg.get("extra_backup_bases", []) or [])
         dirs = [""]
         try:
             check = await curl_with_status(f"{base_url}/ftp/", timeout=timeout)

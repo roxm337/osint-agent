@@ -323,12 +323,25 @@ modules:
     # for the exact URL that produced a callback.
     oast: true
 
+  auth_audit:
+    # Lab packs (knowledge/*.yaml) inject extra paths and credentials here
+    # for known targets. Module defaults stay generic; target knowledge
+    # lives in config, not code.
+    # extra_login_paths: ["/rest/user/login"]
+    # extra_admin_paths: ["/rest/admin/application-configuration"]
+    # extra_credentials: [["admin@juice-sh.op", "admin123"]]
+    # Set true only to prove missing-current-password flaws by writing.
+    test_password_change: false
+
 misconfig:
   concurrency: 12
   timeout: 5
   max_paths: 160
   max_consecutive_empty: 60
   progress_every: 25
+  # Target-specific backup basenames (lab packs merge theirs here).
+  # Module defaults stay generic; knowledge lives in config, not code.
+  extra_backup_bases: []
 
 fast_scan:
   # Lightweight replacement for heavyweight consolidated scanners.

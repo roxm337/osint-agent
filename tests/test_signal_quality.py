@@ -2170,9 +2170,16 @@ def test_auth_audit_sqli_bypass_and_admin_surface(monkeypatch):
     from modules.auth_audit import AuthAudit
     state = _auth_state(monkeypatch)
 
+    # Pack-style config: target-specific paths arrive via config,
+    # never hardcoded (see knowledge/juice_shop_lab.yaml).
     result = asyncio.run(AuthAudit(
         state, {"target": {"domain": "localhost",
-                           "base_url": "http://localhost:3000"}}).run())
+                           "base_url": "http://localhost:3000"},
+                "modules": {"auth_audit": {
+                    "extra_login_paths": ["/rest/user/login"],
+                    "extra_admin_paths": [
+                        "/rest/admin/application-configuration"],
+                }}}).run())
 
     assert result == "done"
     titles = [f["title"] for f in state.findings["findings"]]
@@ -2202,6 +2209,11 @@ def test_auth_audit_none_alg_forgery_accepted(monkeypatch):
 
     monkeypatch.setattr(auth_module, "curl", fake_curl)
     state = _state()
+    # Discovered admin endpoint (generic path: discovery, not hardcode).
+    state.add_asset("api_endpoint",
+                    "api:http://localhost:3000/rest/admin/application-configuration",
+                    "http://localhost:3000/rest/admin/application-configuration",
+                    confidence="FIRM", sources=["test"], attrs={})
     forged = _none_alg_variant(
         "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IngifQ.SIG")
     assert forged.split(".")[0] != "eyJhbGciOiJIUzI1NiJ9"
@@ -2660,7 +2672,10 @@ def test_auth_audit_flags_password_in_claims(monkeypatch):
 
     result = asyncio.run(AuthAudit(
         state, {"target": {"domain": "localhost",
-                           "base_url": "http://localhost:3000"}}).run())
+                           "base_url": "http://localhost:3000"},
+                "modules": {"auth_audit": {
+                    "extra_login_paths": ["/rest/user/login"],
+                }}}).run())
 
     assert result == "done"
     claims = [f for f in state.findings["findings"]
@@ -2920,3 +2935,47 @@ def test_js_template_params_become_assets(monkeypatch):
     params = {(p["value"], (p.get("attrs") or {}).get("url"))
               for p in state.get_assets_by_type("parameter")}
     assert ("q", "http://example.com/rest/products/search") in params
+
+
+# ── Generality wave: API gate + pack merge ───────────────────────
+
+def test_api_gate_rejects_spa_shells():
+    from modules.auth_audit import _looks_like_api
+    assert _looks_like_api('{"status": "error"}') is True
+    assert _looks_like_api("Invalid email or password.") is True
+    assert _looks_like_api(
+        "<html><body><button>login</button><div id=token></div></body></html>"
+    ) is False
+    assert _looks_like_api("") is False
+
+
+def test_pack_merge_and_unknown_pack():
+    from knowledge import apply_pack, list_packs, load_pack
+    assert "juice_shop_lab" in list_packs()
+    pack = load_pack("juice_shop_lab")
+    config = {"target": {"domain": "x"}, "modules": {}}
+    apply_pack(config, pack)
+    assert "/rest/user/login" in config["modules"]["auth_audit"]["extra_login_paths"]
+    assert ["admin@juice-sh.op", "admin123"] in \
+        config["modules"]["auth_audit"]["extra_credentials"]
+    assert "coupons_2013.md" in config["modules"]["misconfig"]["extra_backup_bases"]
+    assert "ftp" in config["wordlists"]["content_discovery"]
+    # Operator values win; pack appends without duplicating.
+    config2 = {"modules": {"auth_audit": {
+        "extra_login_paths": ["/rest/user/login"]}}}
+    apply_pack(config2, pack)
+    assert config2["modules"]["auth_audit"]["extra_login_paths"].count(
+        "/rest/user/login") == 1
+    try:
+        load_pack("no_such_pack_xyz")
+        raise SystemExit("should have raised")
+    except FileNotFoundError:
+        pass
+
+
+def test_generic_seeds_have_no_lab_paths():
+    from modules.auth_audit import ADMIN_PATH_SEEDS, LOGIN_PATH_SEEDS
+    joined = " ".join(LOGIN_PATH_SEEDS) + " " + " ".join(ADMIN_PATH_SEEDS)
+    assert "application-configuration" not in joined
+    import modules.misconfig as misconfig_module
+    assert "coupons_2013" not in str(misconfig_module.FINDING_RULES)

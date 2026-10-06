@@ -12,6 +12,7 @@ baseline lacks counts as authenticated.
 
 import re
 import secrets
+import asyncio
 
 from core.validators import analyze_jwt, redact_secret
 from modules.base import BaseModule
@@ -21,8 +22,7 @@ from tools.wrappers import curl
 LOGIN_PATH_SEEDS = (
     "/login", "/signin", "/sign-in", "/api/login", "/api/auth/login",
     "/api/users/login", "/api/session", "/session",
-    "/rest/login", "/rest/user/login", "/rest/api/login",
-    "/auth/login", "/oauth/token",
+    "/rest/login", "/auth/login", "/oauth/token",
 )
 
 SQLI_IDENTITY_PAYLOADS = (
@@ -32,8 +32,10 @@ SQLI_IDENTITY_PAYLOADS = (
     "' OR 1=1#",
 )
 
-# Tiny and standard: six pairs, stop on first success. This is a
-# liveness check for default deployments, not a brute-force campaign.
+# Tiny and standard: stop on first success. This is a liveness check
+# for default deployments, not a brute-force campaign. Target-specific
+# accounts (lab defaults, harvested emails) arrive via config
+# `extra_credentials`, never hardcoded here.
 DEFAULT_CREDS = (
     ("admin", "admin"),
     ("admin", "password"),
@@ -45,7 +47,6 @@ DEFAULT_CREDS = (
 
 ADMIN_PATH_SEEDS = (
     "/admin", "/administration", "/api/admin", "/rest/admin",
-    "/rest/admin/application-configuration",
 )
 
 _JWT_RE = re.compile(r"eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+")
@@ -68,7 +69,16 @@ class AuthAudit(BaseModule):
         self.profile = await self._profile()
         identities = []
         for endpoint in endpoints[:12]:
-            identity = await self._try_login(endpoint)
+            # One endpoint must never eat the module: some paths accept
+            # the baseline fast and then stall payload requests
+            # server-side (four hanging probes measured at 60s on one
+            # target). Forty-five seconds per endpoint, then move on.
+            try:
+                identity = await asyncio.wait_for(
+                    self._try_login(endpoint), timeout=45)
+            except asyncio.TimeoutError:
+                self.log(f"  {endpoint}: login probing timed out, skipping")
+                continue
             if identity:
                 identities.append(identity)
                 self._store_identity(endpoint, identity)
@@ -194,7 +204,10 @@ class AuthAudit(BaseModule):
                     ("login", "signin", "sign-in", "auth", "session", "token")):
                 if value not in found:
                     found.append(value)
-        for path in LOGIN_PATH_SEEDS:
+        seeds = list(LOGIN_PATH_SEEDS)
+        seeds.extend(str(p) for p in self._cfg().get("extra_login_paths", [])
+                     if p)
+        for path in seeds:
             url = f"{self.base_url}{path}"
             if url not in found:
                 found.append(url)
@@ -254,8 +267,15 @@ class AuthAudit(BaseModule):
                         "claims": claims.get("claims", {}),
                         "email": email, "role": role}
 
-        # 2. Default credentials, stop on first success.
-        for username, password in DEFAULT_CREDS:
+        # 2. Default credentials, stop on first success. Pack- or
+        # operator-supplied pairs go first: a known lab account beats
+        # guessing defaults.
+        creds = []
+        for pair in self._cfg().get("extra_credentials", []) or []:
+            if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                creds.append((str(pair[0]), str(pair[1])))
+        creds.extend(DEFAULT_CREDS)
+        for username, password in creds:
             for identity in {username, f"{username}@{self.domain}"}:
                 outcome = await self._post_login(endpoint, identity, password)
                 token = _extract_token(outcome)
@@ -386,6 +406,10 @@ class AuthAudit(BaseModule):
                     admin_urls.append(value)
         for path in ADMIN_PATH_SEEDS:
             url = f"{self.base_url}{path}"
+            if url not in admin_urls:
+                admin_urls.append(url)
+        for path in self._cfg().get("extra_admin_paths", []) or []:
+            url = f"{self.base_url}{path}" if str(path).startswith("/") else str(path)
             if url not in admin_urls:
                 admin_urls.append(url)
 
@@ -776,12 +800,15 @@ def _identity_from_claims(claims: dict) -> tuple:
 
 
 def _looks_like_api(body: str) -> bool:
-    """JSON/session-shaped responses, or explicit auth rejections.
+    """JSON shape or an explicit auth rejection.
 
-    An explicit "Invalid email or password" is even stronger evidence
-    than JSON shape: it proves this endpoint authenticates. What gets
-    skipped is HTML shells and empty answers — endpoints that answer
-    200 to every payload without ever authenticating.
+    An explicit "Invalid email or password" proves the endpoint
+    authenticates — stronger evidence than any shape heuristic. What
+    gets skipped is HTML shells and empty answers: endpoints that
+    answer 200 to every payload without ever authenticating. Bare
+    "login"/"token" substrings do NOT qualify — every SPA shell
+    contains a login button, and probing those shells is what burned
+    four minutes on dead paths (slow server-side fallthroughs).
     """
     text = str(body or "").strip()
     if not text:
@@ -790,9 +817,9 @@ def _looks_like_api(body: str) -> bool:
         return True
     lowered = text.lower()
     if any(marker in lowered for marker in
-           ("token", "session", "jwt", "authenticated", "login",
-            "invalid", "unauthorized", "unauthorised", "incorrect",
-            "wrong", "unknown user", "bad credentials")):
+           ("invalid", "unauthorized", "unauthorised", "incorrect",
+            "wrong password", "unknown user", "bad credentials",
+            '"status"', '"error"')):
         return True
     if text.lstrip().startswith("<"):
         return False

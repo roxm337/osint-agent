@@ -109,9 +109,9 @@ class ContentDiscovery(BaseModule):
         if not words:
             self.state.skip_module(self.id, "no content discovery wordlist")
             return "skipped"
-        # High-value paths no generic wordlist carries: file drops, well
-        # known disclosures, and framework consoles. Merged under the same
-        # cap discipline as configured words.
+        # High-value paths no generic wordlist carries, plus operator and
+        # lab-pack additions (packs merge into the configured wordlist).
+        # Merged under the same cap discipline as configured words.
         words = list(words) + [w for w in HIGH_VALUE_SEEDS if w not in words]
 
         run_dir = self.state.state_dir / "tool-output"

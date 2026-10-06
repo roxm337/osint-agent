@@ -1,0 +1,56 @@
+# Juice Shop lab pack — LAB VALIDATION ONLY, never loaded by default scans.
+#
+# This file holds everything known about one specific intentionally
+# vulnerable application (OWASP Juice Shop, typically at
+# http://localhost:3000). It exists so the framework itself stays
+# target-agnostic: generic engines in modules/, lab facts in here.
+#
+# Used by: benchmarks/juice_shop.py (regression gate proving the
+# framework finds real vulns) and operators running a lab session with
+# `--pack juice_shop_lab` semantics (config merge below).
+#
+# DO NOT merge these paths into module defaults. A scanner that knows
+# "/rest/user/login" by heart is a Juice Shop script wearing a
+# framework costume.
+
+name: juice_shop_lab
+description: >-
+  OWASP Juice Shop lab knowledge: REST login/admin paths, backup names,
+  and default credentials for the local lab instance. The benchmark
+  harness injects this into module config; production scans never see it.
+
+modules:
+  auth_audit:
+    extra_login_paths:
+      - "/rest/user/login"
+    extra_admin_paths:
+      - "/rest/admin/application-configuration"
+    extra_credentials:
+      - ["admin@juice-sh.op", "admin123"]
+  misconfig:
+    extra_backup_bases:
+      - "coupons_2013.md"
+      - "eastere.gg"
+
+wordlists:
+  content_discovery:
+    - "ftp"
+
+# Findings the benchmark expects on an unmodified lab instance.
+# Titles matched by substring; severities must match exactly.
+expected_findings:
+  - title: "SQL Injection Authentication Bypass"
+    severity: "CRITICAL"
+    modules: ["auth_audit"]
+  - title: "Admin Surface Exposed Without Authentication"
+    severity: "HIGH"
+    modules: ["auth_audit"]
+  - title: "Backup File Exposed"
+    severity: "HIGH"
+    modules: ["misconfig_probes"]
+  - title: "Verbose Error Disclosure"
+    severity: "LOW"
+    modules: ["error_audit"]
+  - title: "Sensitive Keys Inside JWT Claims"
+    severity: "HIGH"
+    modules: ["auth_audit"]
