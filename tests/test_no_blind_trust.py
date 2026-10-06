@@ -63,6 +63,11 @@ ALLOWLIST = {
     # answering, and a per-origin catch-all baseline does not apply.
     "cloud_enum.py": "probes provider-owned hosts (S3/GCS/Azure); a 200 is "
                      "the bucket responding, body is then checked for provider XML",
+    # Direct-IP origin probes: the verdict is body-hash equality with the CDN
+    # baseline or a certificate covering the domain. A bare status only
+    # routes to the proof branches; it never files on its own.
+    "origin_discovery.py": "proves origin by byte-identical body or domain "
+                           "certificate; status literals only select the branch",
 }
 
 # A finding being filed is the thing that must be gated.

@@ -108,14 +108,18 @@ def test_vt_enrich_does_not_ask_about_a_loopback_address(monkeypatch):
 
 
 def test_reputation_enrich_with_abuseipdb(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    recent = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+
     async def fake_abuseipdb(ip, api_key):
-        return {"data": {"abuseConfidenceScore": 42, "totalReports": 3}}
+        return {"data": {"abuseConfidenceScore": 75, "totalReports": 8,
+                         "lastReportedAt": recent}}
 
     monkeypatch.setattr(reputation_module, "abuseipdb_check", fake_abuseipdb)
 
     tmpdir = Path(tempfile.mkdtemp())
     state = StateManager(str(tmpdir / "run" / "example.com"))
-    state.add_asset("ip", "ip:203.0.113.10", "203.0.113.10")
+    state.add_asset("ip", "ip:8.8.8.8", "8.8.8.8")
     config = {
         "target": {"domain": "example.com"},
         "api_keys": {"abuseipdb": "test-key"},
@@ -125,6 +129,25 @@ def test_reputation_enrich_with_abuseipdb(monkeypatch):
 
     assert result == "done"
     assert state.findings["findings"][0]["title"] == "AbuseIPDB Reputation Signals: 1 IP(s)"
+
+
+def test_reputation_enrich_ignores_stale_single_reports(monkeypatch):
+    async def fake_abuseipdb(ip, api_key):
+        return {"data": {"abuseConfidenceScore": 42, "totalReports": 3}}
+
+    monkeypatch.setattr(reputation_module, "abuseipdb_check", fake_abuseipdb)
+
+    tmpdir = Path(tempfile.mkdtemp())
+    state = StateManager(str(tmpdir / "run" / "example.com"))
+    state.add_asset("ip", "ip:8.8.8.8", "8.8.8.8")
+    config = {
+        "target": {"domain": "example.com"},
+        "api_keys": {"abuseipdb": "test-key"},
+    }
+
+    assert asyncio.run(ReputationEnrich(state, config).run()) == "done"
+    assert state.findings["findings"] == [], \
+        "one stale user report is not a HIGH finding"
 
 
 def test_keyed_subdomains_adds_sources(monkeypatch):

@@ -443,6 +443,7 @@ class JSAnalysis(BaseModule):
                         "type": pattern_name,
                         "severity": severity,
                         "match": matched_text[:80],
+                        "value": matched_text,
                         "source": js_url,
                     })
 
@@ -489,27 +490,63 @@ class JSAnalysis(BaseModule):
         unique_secrets = [s for s in unique_secrets
                           if s["type"] not in PUBLIC_BY_DESIGN]
 
-        # Create secret findings by severity
-        for severity in ["CRITICAL", "HIGH", "MEDIUM"]:
-            sev_secrets = [s for s in unique_secrets if s["severity"] == severity]
+        # Grade what is left through the shared tier logic: pattern shape
+        # alone is not proof a credential works. Plausible keeps (capped)
+        # severity; docs/test shapes collapse into one LOW triage note.
+        from core.validators import grade_secret_candidate, redact_secret
+        for secret in unique_secrets:
+            tier, reason = grade_secret_candidate(
+                secret["type"], secret.get("value", secret["match"]))
+            secret["tier"] = tier
+            secret["tier_reason"] = reason
+        plausible = [s for s in unique_secrets if s["tier"] == "plausible"]
+        weak = [s for s in unique_secrets if s["tier"] != "plausible"]
+
+        # Create secret findings by severity, capped at HIGH: nothing here
+        # was used, so nothing is a proven-working CRITICAL.
+        for severity in ["HIGH", "MEDIUM"]:
+            sev_secrets = [s for s in plausible
+                           if s["severity"] in (severity,) or
+                           (severity == "HIGH" and s["severity"] == "CRITICAL")]
             if sev_secrets:
                 self.state.add_finding(
-                    title=f"Secrets Detected in JavaScript [{severity}]: {len(sev_secrets)} found",
+                    title=f"Plausible Secrets in JavaScript [{severity}]: {len(sev_secrets)} found",
                     severity=severity,
                     confidence="FIRM",
                     category="Credential Exposure",
                     description=(
-                        f"Pattern-matched {len(sev_secrets)} potential secrets of type "
-                        f"{severity} in JavaScript files. Types: "
-                        f"{list({s['type'] for s in sev_secrets})}. "
-                        f"Manual validation required."
+                        f"{len(sev_secrets)} real-shaped secret candidates in "
+                        f"JavaScript files (types: "
+                        f"{sorted({s['type'] for s in sev_secrets})}). "
+                        f"Shape-checked, not live-used: rotate on suspicion."
                     ),
                     evidence=[
-                        f"{s['type']}: {s['match'][:60]}... (in {s['source'].split('/')[-1]})"
+                        f"{s['type']}: {redact_secret(s.get('value', s['match']))} "
+                        f"(in {s['source'].split('/')[-1]})"
                         for s in sev_secrets[:10]
                     ],
                     remediation="Remove secrets from client-side code; use server-side API proxying.",
                 )
+        if weak:
+            weak_types = sorted({s["type"] for s in weak})
+            self.state.add_finding(
+                title=f"Weak Secret-Shaped Strings in JavaScript: {len(weak)}",
+                severity="LOW",
+                confidence="FIRM",
+                category="Credential Exposure",
+                description=(
+                    f"{len(weak)} pattern matches shaped like docs, test "
+                    f"fixtures, or expired tokens (types: {weak_types}). "
+                    f"Triage tail, not rotation material — unless a value "
+                    f"below looks live to a human reader."
+                ),
+                evidence=[
+                    f"{s['type']}: {s['match'][:60]}... [{s['tier_reason']}] "
+                    f"(in {s['source'].split('/')[-1]})"
+                    for s in weak[:10]
+                ],
+                remediation="No action unless a listed value is a real credential.",
+            )
 
         # Store unique API endpoints
         unique_endpoints = list({ep["endpoint"] for ep in all_endpoints})

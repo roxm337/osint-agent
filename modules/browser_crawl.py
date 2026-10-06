@@ -90,22 +90,24 @@ class BrowserCrawl(BaseModule):
                 attrs={"rendered": True},
             )
 
-        if dom_sinks:
-            self.state.add_finding(
-                title=f"DOM XSS Sinks Observed in Rendered JavaScript: {len(dom_sinks)}",
-                severity="MEDIUM",
+        # Sinks are inventory, not a finding — same rule as js_analysis:
+        # a sink inventory (including postMessage/onmessage entry points)
+        # carries no signal until a source-to-sink flow is traced. They
+        # stay as dom_sink assets for anyone who wants the list.
+        seen_sinks = set()
+        for item in dom_sinks[:200]:
+            key = (item.get("sink"), item.get("source"), item.get("snippet", "")[:80])
+            if key in seen_sinks:
+                continue
+            seen_sinks.add(key)
+            self.state.add_asset(
+                "dom_sink",
+                f"dom_sink:{item.get('source', 'inline')}:{len(seen_sinks)}",
+                str(item.get("sink", "")),
                 confidence="TENTATIVE",
-                category="Client-Side Attack Surface",
-                description=(
-                    "Browser-rendered crawl observed JavaScript DOM sinks or message "
-                    "handlers that should be reviewed with controllable input sources."
-                ),
-                evidence=[
-                    f"{item['sink']} in {item.get('source', 'inline')} near: {item.get('snippet', '')[:120]}"
-                    for item in dom_sinks[:12]
-                ],
-                evidence_refs=evidence_refs,
-                remediation="Review sink reachability, sanitize untrusted data, and enforce a strict CSP.",
+                sources=[self.id],
+                attrs={"source": item.get("source", "inline"),
+                       "snippet": str(item.get("snippet", ""))[:200]},
             )
 
         self.state.add_asset(

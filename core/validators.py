@@ -1,8 +1,24 @@
 """Read-only secret classification and structural validation."""
 
 import base64
+import ipaddress
+import json
 import re
 from urllib.parse import urlparse, parse_qs, quote, urlencode
+
+
+def is_routable_ip(ip: str) -> bool:
+    """Is this an address whose reputation means anything about the target?
+
+    A reputation vote on 127.0.0.1 is a fact about loopback and nothing
+    else. Private, loopback and link-local addresses are not reachable
+    from the internet, so nothing about them says how the target looks
+    from outside.
+    """
+    try:
+        return ipaddress.ip_address(str(ip or "").strip()).is_global
+    except ValueError:
+        return False
 
 
 def inject_param(url: str, param: str, value: str) -> str:
@@ -69,6 +85,10 @@ def extract_secrets(text: str) -> list[dict]:
                 "redacted": redact_secret(value),
                 "length": len(value),
                 "validation": validation,
+                # Full value for in-memory grading only (example-marker
+                # checks, JWT expiry). Callers must never persist it:
+                # reports and evidence files carry redacted form.
+                "value": value,
             })
     return results
 
@@ -97,6 +117,44 @@ def redact_secret(value: str) -> str:
     return f"{value[:4]}...{value[-4:]}"
 
 
+# Substrings that mark a match as documentation, test fixture, or SDK
+# bundle rather than a live credential. Shared by secret mining (JS,
+# evidence files) and API audits so "example" is weak everywhere.
+SECRET_EXAMPLE_MARKERS = (
+    "example", "test", "demo", "sample", "xxx", "changeme", "placeholder",
+    "your_", "fake", "dummy", "abcdef", "12345", "password123", "testkey",
+    "public_key", "publickey",
+)
+
+
+def grade_secret_candidate(secret_type: str, value: str,
+                           validation: Optional[dict] = None) -> tuple:
+    """Plausible (real-shaped, worth rotating) vs weak (docs/test/expired).
+
+    Read-only: shape, markers, and expiry only. Nothing here proves a
+    credential works — that would require using it, which is out of
+    scope — so callers must never file above MEDIUM on this alone.
+    Returns (tier, reason).
+    """
+    text = str(value or "")
+    lowered = text.lower()
+    if any(marker in lowered for marker in SECRET_EXAMPLE_MARKERS):
+        return "weak", "example/test marker in value"
+    if validation and validation.get("verdict") not in (
+            None, "structurally_valid"):
+        return "weak", f"structural verdict: {validation.get('verdict')}"
+    if secret_type == "jwt_token":
+        verdict = analyze_jwt(text)
+        if verdict["tier"] != "live_shaped":
+            return "weak", verdict["reason"]
+        return "plausible", "JWT decodes, unexpired, non-example"
+    if "private_key" in secret_type:
+        return "plausible", "private key block present (body not assessed)"
+    if len(text) >= 12 and len(set(text)) >= 8:
+        return "plausible", "real-shaped with no example markers"
+    return "weak", "short/low-entropy match"
+
+
 def _valid_jwt_header(value: str) -> bool:
     try:
         header = value.split(".", 1)[0]
@@ -105,6 +163,56 @@ def _valid_jwt_header(value: str) -> bool:
     except Exception:
         return False
     return decoded.strip().startswith("{") and '"alg"' in decoded
+
+
+def analyze_jwt(value: str) -> dict:
+    """Read-only JWT triage shared by secret mining and API audits.
+
+    Returns {"tier", "reason", "claims", "expired"}. Tiers: "example"
+    (docs/sample token), "expired", "live_shaped" (decodes, unexpired,
+    non-example), "malformed". Nothing here proves the key behind the
+    signature — that takes a replay, not a read.
+    """
+    text = str(value or "").strip()
+    claims: dict = {}
+    try:
+        parts = text.split(".")
+        if len(parts) != 3:
+            return {"tier": "malformed", "reason": "not three segments",
+                    "claims": {}, "expired": False}
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        decoded = base64.urlsafe_b64decode(payload_b64.encode()).decode()
+        parsed = json.loads(decoded)
+        claims = parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {"tier": "malformed", "reason": "payload does not decode",
+                "claims": {}, "expired": False}
+    lowered = text.lower()
+    try:
+        claims_text = json.dumps(claims).lower()
+    except Exception:
+        claims_text = ""
+    if any(marker in lowered or marker in claims_text for marker in (
+            "example", "sample", "test", "demo", "xxx", "abcdef",
+            "john doe", "1234567890")):
+        return {"tier": "example", "reason": "docs/sample marker in token",
+                "claims": claims, "expired": False}
+    header_b64 = parts[0] + "=" * (-len(parts[0]) % 4)
+    try:
+        header = json.loads(base64.urlsafe_b64decode(header_b64.encode()).decode())
+    except Exception:
+        header = {}
+    if isinstance(header, dict) and header.get("alg") == "none":
+        return {"tier": "example", "reason": "unsigned (alg=none) token",
+                "claims": claims, "expired": False}
+    exp = claims.get("exp")
+    if isinstance(exp, (int, float)):
+        import time as _time
+        if exp < _time.time():
+            return {"tier": "expired", "reason": "exp is in the past",
+                    "claims": claims, "expired": True}
+    return {"tier": "live_shaped", "reason": "decodes, unexpired, non-example",
+            "claims": claims, "expired": False}
 
 
 def _rough_entropy(value: str) -> float:

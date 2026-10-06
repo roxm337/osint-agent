@@ -110,12 +110,19 @@ class GitExposure(BaseModule):
             self.state.skip_module(self.id, "no exposed git metadata")
             return "skipped"
 
+        # Never persist full secret values: evidence files are shared with
+        # reports, and a live credential in a JSON artifact is a second
+        # exposure. Redacted form only.
+        redacted_secrets = [
+            {k: v for k, v in secret.items() if k != "value"}
+            for secret in secrets
+        ]
         evidence_refs.append(
             self.state.add_evidence(
                 self.id,
                 "git_exposure",
                 base_url,
-                {"paths": exposed, "secrets": secrets, "rejected": rejected},
+                {"paths": exposed, "secrets": redacted_secrets, "rejected": rejected},
             )
         )
 
@@ -144,9 +151,18 @@ class GitExposure(BaseModule):
         )
 
         if secrets:
+            from modules.secret_validation import _grade
+            plausible = any(
+                _grade(secret.get("type", ""), secret.get("value", ""),
+                       secret.get("validation", {}))[0] == "plausible"
+                for secret in secrets
+            )
+            # Real-shaped strings inside public git history are HIGH triage,
+            # not CRITICAL: nothing here proves a credential works. Docs and
+            # example keys are MEDIUM.
             self.state.add_finding(
                 title=f"Potential Secrets in Git Metadata: {len(secrets)}",
-                severity="CRITICAL",
+                severity="HIGH" if plausible else "MEDIUM",
                 confidence="FIRM",
                 category="Credential Exposure",
                 description="Secret patterns were found in publicly accessible Git metadata.",
