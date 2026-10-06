@@ -89,6 +89,7 @@ class OpenRedirectScan(BaseModule):
             return "skipped"
 
         harness = AuthHarness(self.config)
+        harness.adopt_discovered(self.state, log=self.log)
         identities = await harness.establish_all(base)
         identity = identities[0].name if identities else None
 

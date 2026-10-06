@@ -27,20 +27,27 @@ class XSSScan(BaseModule):
 
     async def run(self) -> str:
         points = self._candidate_injection_points()
-        if not points:
-            self.state.skip_module(self.id, "no parameterized URLs")
-            return "skipped"
-
         cfg = self.config.get("xss", {})
         max_points = int(cfg.get("max_points", 80))
         browser_enabled = bool(cfg.get("browser_confirm", True))
         browser_available = browser_enabled and await _playwright_available()
+
+        # Header reflection needs pages, not parameters: a site with zero
+        # query strings can still echo True-Client-IP into markup.
+        header_pages = self._header_pages(points)
+        if not points and not header_pages:
+            self.state.skip_module(self.id, "no parameterized URLs")
+            return "skipped"
 
         internal_findings = []
         for point in points[:max_points]:
             finding = await self._test_reflected_xss(point, browser_available)
             if finding:
                 internal_findings.append(finding)
+
+        header_findings = await self._test_header_reflection(
+            header_pages, browser_available)
+        internal_findings.extend(header_findings)
 
         dalfox_findings = []
         blind_callback = None
@@ -190,6 +197,7 @@ class XSSScan(BaseModule):
         if marker not in marker_body:
             return None
 
+
         # Payload ladder: element injection first, then attribute breakout,
         # then JS-string breakout. Each carries its own execution marker so
         # a reflection of one payload can never confirm another.
@@ -228,6 +236,85 @@ class XSSScan(BaseModule):
                 }
 
         return None
+
+    def _header_pages(self, points: list) -> list:
+        """Base pages for header probing: point URLs plus crawled pages
+        plus the base URL itself, deduplicated and capped."""
+        pages = []
+        for point in points:
+            url = point["url"].split("?")[0].split("#")[0]
+            if url not in pages:
+                pages.append(url)
+        for asset in self.state.get_assets_by_type("url"):
+            value = str(asset.get("value", "") or "")
+            if value.startswith(("http://", "https://")) \
+                    and value not in pages:
+                pages.append(value)
+        if self.base_url not in pages:
+            pages.append(self.base_url)
+        return pages[:20]
+
+    async def _test_header_reflection(self, pages: list,
+                                      browser_available: bool) -> list:
+        """Reflect benign markers off request headers, then escalate.
+
+        Headers like X-Forwarded-For and True-Client-IP land in logs,
+        tracking pixels, and admin views. A verbatim reflection with
+        executable metacharacters is reflected XSS through a header;
+        anything less is not filed — header echoes of plain text are
+        normal.
+        """
+        headers_to_try = ("X-Forwarded-For", "True-Client-IP", "X-Real-IP",
+                          "Referer", "User-Agent")
+        seen_urls = set()
+        findings = []
+        for url in pages:
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            if len(seen_urls) > 20:
+                break
+            for header_name in headers_to_try:
+                marker = f"hxprobe{secrets.token_hex(4)}"
+                try:
+                    result = await curl(url, headers={header_name: marker},
+                                        output="full", timeout=15)
+                except Exception:
+                    continue
+                body = result.get("body", "") or ""
+                if marker not in body:
+                    continue
+                payload = (f"<sVg/onLOad=document.body.append(`{marker}`"
+                           f".repeat(2))>")
+                try:
+                    probe = await curl(url, headers={header_name: payload},
+                                       output="full", timeout=15)
+                except Exception:
+                    continue
+                probe_body = probe.get("body", "") or ""
+                if not _looks_unsanitized(probe_body, payload, marker):
+                    continue
+                confidence = "FIRM"
+                evidence = (f"Header {header_name} reflected with executable "
+                            f"HTML/JS metacharacters unsanitized")
+                if browser_available:
+                    from urllib.parse import quote
+                    witness = await _browser_confirms_execution(
+                        url, marker * 2, self.config)
+                    if witness:
+                        confidence = "CONFIRMED"
+                        evidence = (f"Browser DOM contained execution marker "
+                                    f"{marker * 2} after header injection")
+                findings.append({
+                    "url": url,
+                    "param": f"header:{header_name}",
+                    "payload": payload,
+                    "test_url": url,
+                    "confidence": confidence,
+                    "evidence": evidence,
+                })
+                break
+        return findings
 
     def _candidate_injection_points(self) -> list[dict]:
         # One shared builder for every testing module: parameter assets,

@@ -501,7 +501,39 @@ class AuthHarness:
             for i in self.identities.values()
         )
 
-    # ── Lifecycle ────────────────────────────────────────────────
+    # ── Lifecycle ────────────────────────────────────────────
+
+    def adopt_discovered(self, state, log=None) -> int:
+        """Adopt sessions auth_audit captured earlier in the run.
+
+        Config identities are static; a SQLi-bypassed admin session or a
+        default credential discovered ten minutes ago is a live identity
+        too. Without this merge, differential testing stays parked behind
+        a config file nobody filled in. Returns the adopted count.
+        """
+        adopted = 0
+        for asset in state.get_assets_by_type("identity_credential"):
+            attrs = asset.get("attrs", {}) or {}
+            token = str(attrs.get("token", "") or "")
+            if not token or token.startswith("cookie:"):
+                continue
+            name = str(asset.get("value", "")
+                       or attrs.get("technique", "discovered"))
+            if name in self.identities:
+                continue
+            self.identities[name] = Identity(
+                name=name,
+                bearer_token=token,
+                email=str(attrs.get("endpoint", "")),
+                role=str(attrs.get("role", "") or ""),
+            )
+            adopted += 1
+            if log is not None:
+                try:
+                    log(f"  Adopted discovered session: {name}")
+                except Exception:
+                    pass
+        return adopted
 
     async def establish_all(self, base_url: str = "") -> list[Identity]:
         for identity in self.identities.values():

@@ -2770,3 +2770,102 @@ def test_js_fragment_routes_extracted():
     assert _absolutize_endpoint("http://example.com", "search") == \
         "http://example.com/#/search"
     assert _absolutize_endpoint("http://example.com", "not a path...") == ""
+
+
+# ── Continue wave: header XSS, password change, sessions ────────
+
+def test_header_reflection_unsanitized_is_filed(monkeypatch):
+    import modules.xss_scan as xss_module
+    from modules.xss_scan import XSSScan
+
+    async def fake_curl(url, **kwargs):
+        from urllib.parse import urlparse
+        headers = kwargs.get("headers", {}) or {}
+        marker = headers.get("True-Client-IP", "")
+        # Only the tracking pixel endpoint echoes the header.
+        if "/track" not in urlparse(url).path:
+            return {"status": 200, "body": "<html>home</html>",
+                    "time_ms": 5, "url": url}
+        if marker.startswith("hxprobe"):
+            return {"status": 200,
+                    "body": f"<html>ip logged: {marker}</html>",
+                    "time_ms": 5, "url": url}
+        if marker.startswith("<sVg"):
+            return {"status": 200,
+                    "body": f"<html>ip logged: {marker}</html>",
+                    "time_ms": 5, "url": url}
+        return {"status": 200, "body": "<html>home</html>",
+                "time_ms": 5, "url": url}
+
+    async def fake_browser(url, expected, config):
+        return False
+
+    monkeypatch.setattr(xss_module, "curl", fake_curl)
+    monkeypatch.setattr(xss_module, "_browser_confirms_execution",
+                        fake_browser)
+    monkeypatch.setattr(xss_module, "tool_available", lambda name: False)
+    state = _state()
+    state.add_asset("url", "url:http://example.com/track",
+                    "http://example.com/track", confidence="FIRM",
+                    sources=["test"], attrs={})
+    module = XSSScan(state, {"target": {"domain": "example.com",
+                                        "base_url": "http://example.com"},
+                             "xss": {"browser_confirm": False}})
+
+    result = asyncio.run(module.run())
+
+    assert result == "done"
+    header_hits = [f for f in state.findings["findings"]
+                   if "header:True-Client-IP" in str(f.get("evidence", ""))]
+    assert len(header_hits) == 1
+    assert header_hits[0]["confidence"] == "FIRM"
+
+
+def test_password_change_opt_in_default_off(monkeypatch):
+    from modules.auth_audit import AuthAudit
+    state = _state()
+    module = AuthAudit(state, {"target": {"domain": "example.com",
+                                          "base_url": "http://example.com"}})
+    assert module._cfg().get("test_password_change", False) is not True
+
+
+def test_password_change_without_current_is_high(monkeypatch):
+    import modules.auth_audit as auth_module
+    from modules.auth_audit import AuthAudit
+
+    async def fake_curl(url, **kwargs):
+        if url.endswith("/rest/user/change-password"):
+            return {"status": 200,
+                    "body": '{"status": "success", "message": "password updated"}',
+                    "time_ms": 5, "url": url}
+        return {"status": 404, "body": "nope", "time_ms": 5, "url": url}
+
+    monkeypatch.setattr(auth_module, "curl", fake_curl)
+    state = _state()
+    module = AuthAudit(state, {"target": {"domain": "example.com",
+                                          "base_url": "http://example.com"},
+                               "modules": {"auth_audit":
+                                           {"test_password_change": True}}})
+
+    asyncio.run(module._password_change_probe(
+        {"token": "T", "email": "a@b.c", "role": ""}))
+
+    assert len(state.findings["findings"]) == 1
+    assert state.findings["findings"][0]["severity"] == "HIGH"
+
+
+def test_adopt_discovered_shared_helper():
+    from core.auth_harness import AuthHarness
+    state = _state()
+    state.add_asset(
+        "identity_credential", "identity:sqli_auth_bypass",
+        "sqli_auth_bypass", confidence="CONFIRMED", sources=["auth_audit"],
+        attrs={"endpoint": "http://example.com/rest/user/login",
+               "technique": "sqli_auth_bypass", "role": "",
+               "token": "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IngifQ.SIG"})
+    harness = AuthHarness({"target": {"domain": "example.com"}})
+
+    assert harness.adopt_discovered(state) == 1
+    assert "sqli_auth_bypass" in harness.identities
+    # Idempotent: second merge adopts nothing new.
+    assert harness.adopt_discovered(state) == 0

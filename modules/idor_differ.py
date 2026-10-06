@@ -581,29 +581,8 @@ class IdorDiffer(BaseModule):
         return "done"
 
     def _merge_discovered_identities(self, harness) -> None:
-        """Adopt sessions auth_audit captured earlier in the run.
-
-        Config identities are static; a SQLi-bypassed admin session or a
-        default credential discovered ten minutes ago is a live identity
-        too. Without this merge, IDOR testing stays parked behind a config
-        file nobody filled in.
-        """
-        from core.auth_harness import Identity
-        for asset in self.state.get_assets_by_type("identity_credential"):
-            attrs = asset.get("attrs", {}) or {}
-            token = str(attrs.get("token", "") or "")
-            if not token or token.startswith("cookie:"):
-                continue
-            name = str(asset.get("value", "") or attrs.get("technique", "discovered"))
-            if name in harness.identities:
-                continue
-            harness.identities[name] = Identity(
-                name=name,
-                bearer_token=token,
-                email=str(attrs.get("endpoint", "")),
-                role=str(attrs.get("role", "") or ""),
-            )
-            self.log(f"  Adopted discovered session: {name}")
+        """Adopt sessions auth_audit captured earlier in the run (shared)."""
+        harness.adopt_discovered(self.state, log=self.log)
 
     # ── Phase 1: endpoint discovery ──────────────────────────────
 

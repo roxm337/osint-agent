@@ -79,6 +79,7 @@ class MassAssignment(BaseModule):
             return "skipped"
 
         harness = AuthHarness(self.config)
+        harness.adopt_discovered(self.state, log=self.log)
         identities = await harness.establish_all(self._base_url())
         if not identities:
             self.state.skip_module(self.id, "no verified identity to test with")

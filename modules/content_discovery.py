@@ -51,6 +51,16 @@ SENSITIVE_TOKENS = (
 # Redirects point at a login in almost every case, which is the intended shape.
 REDIRECT_STATUSES = {301, 302, 307, 308}
 
+# High-value paths no generic wordlist carries. Merged with configured
+# words in run(): file drops, well-known disclosures, consoles.
+HIGH_VALUE_SEEDS = (
+    "ftp",
+    ".well-known/security.txt",
+    ".well-known/change-password",
+    "server-status",
+    "metrics",
+)
+
 
 def classify_content_hit(hit: dict) -> str:
     """What a single hit actually establishes.
@@ -99,6 +109,10 @@ class ContentDiscovery(BaseModule):
         if not words:
             self.state.skip_module(self.id, "no content discovery wordlist")
             return "skipped"
+        # High-value paths no generic wordlist carries: file drops, well
+        # known disclosures, and framework consoles. Merged under the same
+        # cap discipline as configured words.
+        words = list(words) + [w for w in HIGH_VALUE_SEEDS if w not in words]
 
         run_dir = self.state.state_dir / "tool-output"
         run_dir.mkdir(exist_ok=True)

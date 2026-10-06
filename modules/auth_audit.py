@@ -11,6 +11,7 @@ baseline lacks counts as authenticated.
 """
 
 import re
+import secrets
 
 from core.validators import analyze_jwt, redact_secret
 from modules.base import BaseModule
@@ -79,6 +80,8 @@ class AuthAudit(BaseModule):
             await self._authenticated_follow_ups(identities[0])
             await self._forgery_sweep(identities[0])
             await self._write_access_probes(identities[0])
+            if self._cfg().get("test_password_change") is True:
+                await self._password_change_probe(identities[0])
 
         self.state.complete_module(self.id)
         self.log(f"Auth audit: {len(identities)} session(s) established")
@@ -106,6 +109,77 @@ class AuthAudit(BaseModule):
             return await get_profile(base_url, fetch)
         except Exception:
             return None
+
+    def _cfg(self) -> dict:
+        cfg = self.config.get("modules", {}).get(self.id, {})
+        return cfg if isinstance(cfg, dict) else {}
+
+    async def _password_change_probe(self, identity: dict) -> None:
+        """Change the session's password without the current one.
+
+        OPT-IN ONLY (modules.auth_audit.test_password_change: true):
+        this writes for real — it sets a new password on the test
+        account. Off by default; the finding it produces (account
+        takeover via stolen session alone, no current-password check)
+        justifies the write when the operator asks for it.
+        """
+        import json as _json
+        token = identity.get("token", "")
+        if not token or token.startswith("cookie:"):
+            return
+        auth = {"Authorization": f"Bearer {token}"}
+        candidates = []
+        for asset in self.state.get_assets_by_type("api_endpoint"):
+            value = str(asset.get("value", "") or "")
+            if "change-password" in value.lower() or "password" in value.lower():
+                candidates.append(value)
+        for path in ("/rest/user/change-password", "/api/change-password",
+                     "/change-password", "/account/password"):
+            url = f"{self.base_url}{path}"
+            if url not in candidates:
+                candidates.append(url)
+        new_password = f"Rotated-By-Audit-{secrets.token_hex(4)}"
+        for url in candidates[:5]:
+            for method in ("PUT", "POST"):
+                for body in ({"password": new_password,
+                              "repeatPassword": new_password},
+                             {"newPassword": new_password,
+                              "repeatNewPassword": new_password}):
+                    try:
+                        result = await curl(
+                            url, method=method,
+                            headers={"Content-Type": "application/json",
+                                     **auth},
+                            data=_json.dumps(body),
+                            output="full", timeout=15)
+                    except Exception:
+                        continue
+                    text = result.get("body", "") or ""
+                    if result.get("status", 0) in (200, 201) and any(
+                            marker in text.lower() for marker in
+                            ("success", "updated", "changed")):
+                        self.state.add_finding(
+                            title=f"Password Change Without Current Verification: {url}",
+                            severity="HIGH",
+                            confidence="CONFIRMED",
+                            category="Broken Authentication",
+                            description=(
+                                f"{url} accepted a password change with no "
+                                f"current-password proof. A stolen session "
+                                f"alone takes the account permanently — test "
+                                f"password set to a rotated value."),
+                            evidence=[f"URL: {url}", f"Method: {method}",
+                                      f"Response: {text[:200]}"],
+                            remediation="Require the current password (or "
+                                        "re-authentication) for every "
+                                        "credential change.",
+                            asset_keys=[f"url:{url}"],
+                            verified=True,
+                            verification={
+                                "method": "password_change_no_current",
+                                "url": url},
+                        )
+                        return
 
     def _login_endpoints(self) -> list:
         """Discovered POST endpoints plus login-shaped seeds."""
