@@ -2447,7 +2447,8 @@ class MainWindow(QMainWindow):
             f"Module: {finding.get('module_id', '-')}   "
             f"Category: {finding.get('category', '-')}   "
             f"Verified: {'yes' if finding.get('verified') else 'no'}",
-            f"Triage: {VERDICT_LABELS.get(verdict, verdict) or 'untriaged'}"
+            f"CWE: {', '.join(finding.get('cwe') or []) or '-'}   "
+            f"OWASP: {finding.get('owasp') or '-'}",            f"Triage: {VERDICT_LABELS.get(verdict, verdict) or 'untriaged'}"
             + (f"   Note: {note}" if note else ""),
             "",
             str(finding.get("description") or "").strip(),
@@ -3152,6 +3153,7 @@ class MainWindow(QMainWindow):
             assets,
             aggregate=self.graph_aggregate_check.isChecked(),
             aggregate_threshold=10,
+            findings=self.current_findings,
         )
         nodes = graph["nodes"]
         edges = graph["edges"]

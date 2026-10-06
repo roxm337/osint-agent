@@ -9,6 +9,7 @@ enum and open redirect timed out with zero findings to show for it.
 
 import asyncio
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 from actions.registry import ActionContext
@@ -2979,3 +2980,139 @@ def test_generic_seeds_have_no_lab_paths():
     assert "application-configuration" not in joined
     import modules.misconfig as misconfig_module
     assert "coupons_2013" not in str(misconfig_module.FINDING_RULES)
+
+
+# ── Relations/findings/graph wave ───────────────────────────────
+
+def test_taxonomy_maps_categories():
+    from core.taxonomy import classify
+    assert classify("SQL Injection") == {
+        "cwe": ["CWE-89"], "owasp": "A03:2021 – Injection"}
+    assert classify("Stored XSS")["cwe"] == ["CWE-79"]
+    assert classify("Broken Access Control")["owasp"].startswith("A01")
+    assert classify("Threat Intelligence") == {"cwe": [], "owasp": ""}
+    assert classify("Something Entirely New") == {"cwe": [], "owasp": ""}
+
+
+def test_add_finding_carries_taxonomy_and_clean_evidence():
+    state = _state()
+    state.add_asset("url", "url:http://example.com/x",
+                    "http://example.com/x")
+    fid = state.add_finding(
+        title="SQLi here", severity="HIGH", confidence="CONFIRMED",
+        category="SQL Injection", description="d",
+        evidence=["real line", "", "   "],
+        asset_keys=["url:http://example.com/x", "url:missing"])
+
+    finding = state.findings["findings"][0]
+    assert finding["cwe"] == ["CWE-89"]
+    assert finding["owasp"] == "A03:2021 – Injection"
+    assert finding["evidence"] == ["real line"]
+    assert finding["first_seen"] == finding["last_seen"]
+    edges = [e for e in state.assets["edges"]
+             if e.get("target") == fid]
+    assert len(edges) == 1
+    assert edges[0]["type"] == "AFFECTED_BY"
+    assert edges[0]["source"] == "url:http://example.com/x"
+
+
+def test_merge_bumps_last_seen_and_keeps_taxonomy():
+    state = _state()
+    first = state.add_finding(
+        title="Same", severity="LOW", confidence="FIRM",
+        category="Exposure", description="d")
+    before = [f for f in state.findings["findings"] if f["id"] == first][0]
+    assert before["last_seen"] == before["first_seen"]
+    second = state.add_finding(
+        title="Same", severity="HIGH", confidence="CONFIRMED",
+        category="Exposure", description="d2", verified=True)
+    assert first == second
+    merged = state.findings["findings"][0]
+    assert merged["severity"] == "HIGH"
+    assert merged["verified"] is True
+    assert merged["last_seen"] >= merged["first_seen"]
+
+
+def test_graph_build_sanitizes_and_scopes():
+    from core.attack_graph import AttackGraph
+    state = _state()
+    state.add_asset("url", "url:http://example.com/a",
+                    "http://example.com/a")
+    state.add_asset("url", "url:https://evil.example.net/x",
+                    "https://evil.example.com/x".replace("example.com", "example.net"))
+    state.add_asset("phone", "phone:123", "123")
+    state.add_asset("identity_credential", "identity:u", "u",
+                    confidence="CONFIRMED", sources=["t"],
+                    attrs={"token": "LIVESECRET", "role": "admin"})
+    graph = AttackGraph(state, scope_hosts={"example.com"})
+    graph.build()
+    keys = set(graph.nodes)
+    assert "url:http://example.com/a" in keys
+    assert "phone:123" not in keys
+    assert not any("evil" in key for key in keys), \
+        "third-party hosts must not enter the attack graph"
+    identity = graph.nodes.get("identity:u")
+    assert identity is not None
+    import json as _json
+    assert "LIVESECRET" not in _json.dumps(identity.attrs)
+    assert identity.attrs.get("role") == "admin"
+
+
+def test_graph_display_marks_affected_nodes():
+    from gui.graph import build_display_graph, to_gravis_graph
+    assets = {"nodes": [
+        {"key": "url:http://example.com/a", "type": "url",
+         "value": "http://example.com/a", "confidence": "FIRM",
+         "attrs": {}, "sources": ["t"]},
+        {"key": "url:http://example.com/b", "type": "url",
+         "value": "http://example.com/b", "confidence": "FIRM",
+         "attrs": {}, "sources": ["t"]},
+    ], "edges": []}
+    findings = [{"id": "FINDING-0001", "title": "SQLi", "severity": "HIGH",
+                 "asset_keys": ["url:http://example.com/a"]}]
+    display = build_display_graph(assets, aggregate=False,
+                                  findings=findings)
+    by_key = {n["key"]: n for n in display["nodes"]}
+    assert by_key["url:http://example.com/a"]["attrs"]["finding_count"] == 1
+    assert by_key["url:http://example.com/a"]["attrs"]["worst_finding"] == "HIGH"
+    assert "finding_count" not in by_key["url:http://example.com/b"]["attrs"]
+    gravis = to_gravis_graph(display)
+    assert gravis["graph"]["nodes"]["url:http://example.com/a"][
+        "metadata"]["border_color"] == "#ef4444"
+
+
+def test_probe_garbage_filter():
+    from core.probe_targets import is_probe_garbage
+    assert is_probe_garbage("http://h/?q=<sVg/onLOad=x>") is True
+    assert is_probe_garbage("http://h/?q=osintxss1234") is True
+    assert is_probe_garbage("http://h/rest/products/search?q=1") is False
+    assert is_probe_garbage("http://h/api/Users/{id}") is False
+
+
+# ── Relations/findings/graph rendering ──────────────────────────
+
+def test_report_renders_cwe_owasp_and_observed():
+    from core.reporting import build_report_bundle, render_markdown
+    state = _state()
+    state.add_finding(
+        title="SQLi", severity="HIGH", confidence="CONFIRMED",
+        category="SQL Injection", description="d")
+    bundle = build_report_bundle(state, "example.com")
+    markdown = render_markdown(bundle)
+    assert "CWE-89" in markdown
+    assert "A03:2021" in markdown
+    finding = state.findings["findings"][0]
+    assert finding["first_seen"] and finding["last_seen"]
+
+
+def test_module_relation_edges_created():
+    state = _state()
+    state.add_asset("url", "url:http://example.com/p",
+                    "http://example.com/p")
+    state.add_asset("parameter", "param:http://example.com/p:q", "q",
+                    confidence="FIRM", sources=["t"],
+                    attrs={"url": "http://example.com/p"})
+    state.add_edge("url:http://example.com/p",
+                   "param:http://example.com/p:q", "HAS_PARAMETER")
+    types = Counter(e.get("type") for e in state.assets["edges"])
+    assert types["HAS_PARAMETER"] == 1

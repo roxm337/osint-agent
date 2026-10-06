@@ -311,6 +311,12 @@ class AuthAudit(BaseModule):
                    "token": token,
                    "token_preview": redact_secret(token)},
         )
+        identity_key = f"identity:{identity.get('email') or identity.get('technique')}"
+        endpoint_key = f"url:{endpoint}"
+        known = {node.get("key") for node in self.state.assets.get("nodes", [])
+                 if node.get("key")}
+        if endpoint_key in known:
+            self.state.add_edge(identity_key, endpoint_key, "AUTHENTICATES_TO")
         self._audit_token_claims(endpoint, identity)
         technique = identity["technique"]
         if technique == "sqli_auth_bypass":

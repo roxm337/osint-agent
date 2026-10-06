@@ -424,7 +424,16 @@ class Orchestrator:
         await self._seed_surface()
 
         # Build attack graph from current state
-        graph = AttackGraph(self.state)
+        from urllib.parse import urlparse as _urlparse
+        _scope = {self.domain}
+        try:
+            _base_host = (_urlparse(self.base_url).hostname or "").lower()
+            if _base_host:
+                _scope.add(_base_host)
+        except ValueError:
+            pass
+        graph = AttackGraph(self.state,
+                            scope_hosts={h for h in _scope if h})
         graph.build()
         graph.save(str(self.output_dir / self.target / "attack_graph.json"))
         action_count = ActionRegistry.size()

@@ -9,6 +9,21 @@ CONFIDENCE_ORDER = {"TENTATIVE": 0, "FIRM": 1, "CONFIRMED": 2}
 SEVERITY_ORDER = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 
 
+def _clean_evidence(evidence) -> list:
+    """Drop empty and whitespace-only evidence lines.
+
+    Conditional evidence appends (`f"..." if x else ""`) used to leave
+    blank rows in findings and reports. A cleaner with no opinion about
+    content, only about emptiness.
+    """
+    cleaned = []
+    for item in evidence or []:
+        text = item if isinstance(item, str) else str(item or "")
+        if text.strip():
+            cleaned.append(item)
+    return cleaned
+
+
 class StateManager:
     """Persistent state for a single target investigation."""
 
@@ -154,13 +169,22 @@ class StateManager:
                     evidence_refs: Optional[list] = None,
                     risk_score: Optional[int] = None,
                     verified: bool = False,
-                    verification: Optional[dict] = None) -> str:
+                    verification: Optional[dict] = None,
+                    cwe: Optional[list] = None,
+                    owasp: Optional[str] = None) -> str:
         from core.scoring import score_finding
+        from core.taxonomy import classify
         if risk_score is None:
             risk_score = score_finding(
                 severity, confidence, asset_keys, category,
                 verified=verified,
             )
+        if cwe is None or owasp is None:
+            taxonomy = classify(category)
+            if cwe is None:
+                cwe = taxonomy["cwe"]
+            if owasp is None:
+                owasp = taxonomy["owasp"]
         # Tag with the module currently running so future re-runs can replace it.
         current_module = self.module.get("current") or ""
         # Same claim, same category, same assets: one finding, not N. The
@@ -188,6 +212,7 @@ class StateManager:
                     self._dirty = True
                     return existing["id"]
         fid = f"FINDING-{len(self.findings['findings']) + 1:04d}"
+        now = self._now()
         finding = {
             "id": fid,
             "module_id": current_module,
@@ -196,22 +221,40 @@ class StateManager:
             "confidence": confidence,
             "risk_score": risk_score,
             "category": category,
+            "cwe": list(cwe or []),
+            "owasp": owasp or "",
             "description": description,
-            "evidence": evidence or [],
+            "evidence": _clean_evidence(evidence),
             "evidence_refs": evidence_refs or [],
             "remediation": remediation,
             "asset_keys": asset_keys or [],
-            "created_at": self._now(),
+            "created_at": now,
+            "first_seen": now,
+            "last_seen": now,
             "verified": bool(verified),
             "verification": verification or {},
         }
         self.findings["findings"].append(finding)
         self.module["stats"]["total_findings"] = len(self.findings["findings"])
         self._dirty = True
+        self._link_finding_to_assets(finding)
         return fid
 
-    @staticmethod
-    def _merge_finding(existing: dict, severity: str, confidence: str,
+    def _link_finding_to_assets(self, finding: dict) -> None:
+        """Record finding↔asset relations for the graph views.
+
+        asset_keys point at assets but nothing drew the edge, so the
+        asset graph could never answer "what is affected here" and the
+        attack graph had to re-derive it. Only existing nodes are
+        linked; dangling keys stay as plain references.
+        """
+        known = {node.get("key") for node in self.assets.get("nodes", [])
+                 if node.get("key")}
+        for asset_key in finding.get("asset_keys", []) or []:
+            if asset_key in known:
+                self.add_edge(asset_key, finding["id"], "AFFECTED_BY")
+
+    def _merge_finding(self, existing: dict, severity: str, confidence: str,
                        risk_score: int, description: str,
                        evidence: Optional[list], remediation: str,
                        asset_keys: Optional[list],
@@ -219,6 +262,7 @@ class StateManager:
                        verification: Optional[dict],
                        current_module: str) -> None:
         """Fold a duplicate claim into the finding already on record."""
+        existing["last_seen"] = self._now()
         if int(risk_score or 0) > int(existing.get("risk_score") or 0):
             existing["severity"] = severity
             existing["confidence"] = confidence
@@ -238,11 +282,14 @@ class StateManager:
             for item in items:
                 if item not in merged:
                     merged.append(item)
+            if key == "evidence":
+                merged = _clean_evidence(merged)
             existing[key] = merged[:50]
         if verification:
             merged_verification = dict(verification)
             merged_verification.update(existing.get("verification") or {})
             existing["verification"] = merged_verification
+        self._link_finding_to_assets(existing)
 
     def get_findings_by_severity(self, severity: str) -> list:
         return [f for f in self.findings["findings"] if f["severity"] == severity]

@@ -643,6 +643,12 @@ class JSAnalysis(BaseModule):
         # or "search" from a route table is useless to every consumer
         # until it is joined onto the base URL it was found under.
         unique_endpoints = list({ep["endpoint"] for ep in all_endpoints})
+        sources_by_endpoint: dict[str, set] = {}
+        for entry in all_endpoints:
+            sources_by_endpoint.setdefault(entry["endpoint"], set()).add(
+                entry.get("source", ""))
+        known = {node.get("key") for node in self.state.assets.get("nodes", [])
+                 if node.get("key")}
         for endpoint in unique_endpoints[:30]:
             if endpoint.startswith("http") and self.domain not in endpoint:
                 continue
@@ -657,6 +663,11 @@ class JSAnalysis(BaseModule):
                 sources=["js_analysis"],
                 attrs={"discovered_in": "js_analysis"},
             )
+            for js_url in sources_by_endpoint.get(endpoint, set()):
+                js_key = f"js:{js_url}"
+                if js_url and js_key in known:
+                    self.state.add_edge(js_key, f"api:{absolute}",
+                                        "REFERENCES")
 
         seen_sinks = set()
         unique_dom_sinks = []

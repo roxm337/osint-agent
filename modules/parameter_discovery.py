@@ -89,6 +89,8 @@ class ParameterDiscovery(BaseModule):
             return "skipped"
 
         sensitive = []
+        known = {node.get("key") for node in self.state.assets.get("nodes", [])
+                 if node.get("key")}
         for item in unique:
             key = f"param:{item['url']}:{item['parameter']}"
             self.state.add_asset(
@@ -99,6 +101,9 @@ class ParameterDiscovery(BaseModule):
                 sources=[self.id],
                 attrs=item,
             )
+            page_key = f"url:{item['url']}"
+            if page_key in known:
+                self.state.add_edge(page_key, key, "HAS_PARAMETER")
             if _sensitive_parameter(item["parameter"]) and not item.get("seeded"):
                 sensitive.append(item)
 

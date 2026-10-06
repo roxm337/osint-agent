@@ -67,10 +67,13 @@ def build_graph(assets: dict) -> dict:
 
 
 def build_display_graph(assets: dict, aggregate: bool = True,
-                        aggregate_threshold: int = 10) -> dict:
+                        aggregate_threshold: int = 10,
+                        findings: list | None = None) -> dict:
     graph = build_graph(assets)
     nodes = graph["nodes"]
     edges = graph["edges"]
+    if findings:
+        _annotate_finding_counts(nodes, findings)
     if not aggregate:
         return graph
 
@@ -134,6 +137,27 @@ def build_display_graph(assets: dict, aggregate: bool = True,
     }
 
 
+def _annotate_finding_counts(nodes: list, findings: list) -> None:
+    """Mark nodes their findings affect: count + worst severity in attrs.
+
+    The graph answers "where does it hurt" at a glance instead of making
+    the operator cross-reference the triage table row by row.
+    """
+    _order = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+    by_asset: dict[str, list] = {}
+    for finding in findings or []:
+        for asset_key in finding.get("asset_keys", []) or []:
+            by_asset.setdefault(asset_key, []).append(finding)
+    for node in nodes:
+        hits = by_asset.get(node.get("key", ""), [])
+        if not hits:
+            continue
+        worst = max((str(f.get("severity", "INFO")).upper() for f in hits),
+                    key=lambda severity: _order.get(severity, 0))
+        node.setdefault("attrs", {})["finding_count"] = len(hits)
+        node["attrs"]["worst_finding"] = worst
+
+
 def to_gravis_graph(display_graph: dict, show_labels: bool = False,
                     show_edges: bool = True) -> dict:
     """Convert display graph to gravis JSON Graph Format."""
@@ -148,12 +172,20 @@ def to_gravis_graph(display_graph: dict, show_labels: bool = False,
         count = int(node.get("attrs", {}).get("count", 1) or 1)
         size = 38 + min(42, count * 2) if is_group else 24 + min(18, len(node.get("sources", [])) * 2)
         label = _label(node, show_labels or is_group or asset_type == "domain")
+        border_color = "#e2e8f0"
+        finding_count = int(node.get("attrs", {}).get("finding_count", 0) or 0)
+        worst = str(node.get("attrs", {}).get("worst_finding", "") or "")
+        if finding_count and worst in ("HIGH", "CRITICAL"):
+            # Affected and severe: red ring + slightly larger, so the eye
+            # lands on damage first and inventory second.
+            border_color = "#ef4444"
+            size += 8
         nodes[node_id] = {
             "label": label,
             "metadata": {
                 "color": color,
                 "size": size,
-                "border_color": "#e2e8f0",
+                "border_color": border_color,
                 "border_size": 2,
                 "hover": _node_hover(node),
                 "click": _node_click(node),
@@ -401,6 +433,9 @@ def _node_hover(node: dict) -> str:
     ]
     if attrs.get("count"):
         rows.append(f"count: {escape(str(attrs['count']))}")
+    if attrs.get("finding_count"):
+        rows.append(f"findings: {escape(str(attrs['finding_count']))} "
+                    f"(worst: {escape(str(attrs.get('worst_finding', '')))})")
     return "<br>".join(rows)
 
 

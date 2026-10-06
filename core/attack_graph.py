@@ -49,16 +49,69 @@ class AttackPath:
 # skipped, and the run printed no explanation at all.
 TESTABLE_NODE_TYPES = ("url", "parameter", "api_endpoint", "endpoint")
 
+# Asset types that belong in an attack graph. Everything else (phones,
+# people, inventories, per-module summaries, breach blobs) is recon
+# context for other views — including it here turns the graph into an
+# unreadable hairball where the three nodes that matter hide.
+GRAPH_NODE_TYPES = {
+    "domain", "subdomain", "ip", "webapp", "url", "endpoint",
+    "api_endpoint", "web_path", "port", "bucket", "js_file",
+    "parameter", "dom_sink", "idor_collection", "identity_credential",
+    "secret_candidate",
+}
+
+# Attr keys that must never reach a graph artifact: live sessions and
+# credential material do not belong in a file operators screenshot.
+_SENSITIVE_ATTR_KEYS = ("token", "password", "passwd", "secret",
+                        "cookie", "credential", "private_key", "api_key",
+                        "session", "authorization")
+
 
 class AttackGraph:
     """Attack graph that extends the asset/finding graph with exploit transitions."""
 
     probe_plan: dict = {}
 
-    def __init__(self, state: StateManager):
+    def __init__(self, state: StateManager, scope_hosts: set | None = None):
         self.state = state
         self.nodes: dict[str, AttackNode] = {}
         self.edges: list[AttackEdge] = []
+        # Hosts that count as the target app. Nodes outside the scope
+        # (youtube embeds, third-party trackers) become graph nodes for
+        # nothing and probe targets for less than nothing.
+        self.scope_hosts = {str(h).lower() for h in (scope_hosts or set()) if h}
+
+    def _in_scope_node(self, node_id: str, label: str = "") -> bool:
+        """Scope gate for graph membership and probe planning."""
+        if not self.scope_hosts:
+            return True
+        from urllib.parse import urlparse
+        for text in (node_id, label):
+            try:
+                host = (urlparse(str(text)).hostname or "").lower()
+            except ValueError:
+                continue
+            if not host:
+                continue
+            if host in self.scope_hosts or any(
+                    host == h or host.endswith("." + h)
+                    for h in self.scope_hosts):
+                return True
+            return False
+        return True
+
+    @staticmethod
+    def _sanitize_attrs(attrs: dict) -> dict:
+        """Strip live credential material from graph node attributes."""
+        cleaned = {}
+        for key, value in (attrs or {}).items():
+            lowered = str(key).lower()
+            if lowered in _SENSITIVE_ATTR_KEYS or lowered.endswith("_token"):
+                continue
+            if any(marker in lowered for marker in ("password", "secret")):
+                continue
+            cleaned[key] = value
+        return cleaned
 
     def build(self):
         """Build the attack graph from current state."""
@@ -70,12 +123,23 @@ class AttackGraph:
             key = node.get("key", "")
             if not key:
                 continue
+            node_type = node.get("type", "asset")
+            if node_type not in GRAPH_NODE_TYPES:
+                continue
+            value = node.get("value", key)
+            if node_type in ("url", "endpoint", "api_endpoint", "web_path",
+                             "js_file"):
+                from core.probe_targets import is_probe_garbage
+                if is_probe_garbage(value) or is_probe_garbage(key):
+                    continue
+                if not self._in_scope_node(key, value):
+                    continue
             self.nodes[key] = AttackNode(
                 id=key,
-                label=node.get("value", key),
-                node_type=node.get("type", "asset"),
+                label=value,
+                node_type=node_type,
                 confidence=node.get("confidence", "TENTATIVE"),
-                attrs=node.get("attrs", {}),
+                attrs=self._sanitize_attrs(node.get("attrs", {})),
             )
 
         # Add finding-derived vuln nodes
@@ -267,6 +331,11 @@ class AttackGraph:
                 continue
             url, param = self._surface(node)
             if not url:
+                continue
+            from core.probe_targets import is_probe_garbage
+            if is_probe_garbage(url) or not self._in_scope_node(nid, url):
+                blocked["out of scope or probe residue"] = \
+                    blocked.get("out of scope or probe residue", 0) + 1
                 continue
             considered += 1
             armed = False

@@ -122,7 +122,7 @@ class DeepCrawl(BaseModule):
                 sources=[self.id],
                 attrs={"path": urlparse(url).path, "query": urlparse(url).query},
             )
-            self.state.add_edge(f"domain:{self.domain}", f"{asset_type}:{url}", "crawled_url")
+            self.state.add_edge(f"domain:{self.domain}", f"{asset_type}:{url}", "DISCOVERED_VIA")
 
         api_urls = [url for url in http_urls if _looks_api(url)]
         admin_urls = [url for url in http_urls if _looks_admin(url)]

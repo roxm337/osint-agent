@@ -68,7 +68,7 @@ class BrowserCrawl(BaseModule):
                 sources=[self.id],
                 attrs={"path": urlparse(url).path, "query": urlparse(url).query},
             )
-            self.state.add_edge(f"domain:{self.domain}", f"{asset_type}:{url}", "rendered_crawl_url")
+            self.state.add_edge(f"domain:{self.domain}", f"{asset_type}:{url}", "DISCOVERED_VIA")
 
         for js_url in sorted(js_urls)[:200]:
             self.state.add_asset(

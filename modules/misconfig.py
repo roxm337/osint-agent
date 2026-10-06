@@ -398,9 +398,11 @@ class MisconfigProbes(BaseModule):
 
             has_content = len(body.strip()) > 50
 
+            # Probed paths are URLs, not app roots: typing them as
+            # webapp made the attack graph treat files as applications.
             self.state.add_asset(
-                "webapp",
-                f"webapp:{base_url}{path}",
+                "url",
+                f"url:{base_url}{path}",
                 f"{base_url}{path}",
                 confidence="CONFIRMED",
                 sources=["misconfig probe"],
@@ -450,8 +452,8 @@ class MisconfigProbes(BaseModule):
         elif status == 403:
             if any(kw in path for kw in [".git", ".htpasswd", ".env", "wp-config"]):
                 self.state.add_asset(
-                    "webapp",
-                    f"webapp:{base_url}{path}",
+                    "url",
+                    f"url:{base_url}{path}",
                     f"{base_url}{path}",
                     confidence="FIRM",
                     sources=["misconfig probe"],

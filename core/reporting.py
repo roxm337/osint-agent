@@ -286,6 +286,15 @@ def _render_finding(finding: dict, evidence_items: list[dict]) -> list[str]:
         f"- **Category:** {_escape_text(finding.get('category', ''))}",
         f"- **Description:** {_escape_text(finding.get('description', ''))}",
     ]
+    cwe = finding.get("cwe") or []
+    if cwe:
+        lines.append(f"- **CWE:** {', '.join(_escape_text(str(c)) for c in cwe)}")
+    if finding.get("owasp"):
+        lines.append(f"- **OWASP:** {_escape_text(finding.get('owasp'))}")
+    if finding.get("first_seen") or finding.get("last_seen"):
+        lines.append(
+            f"- **Observed:** first {_escape_text(str(finding.get('first_seen', '-')))} / "
+            f"last {_escape_text(str(finding.get('last_seen', '-')))}")
     if finding.get("verification"):
         v = finding["verification"]
         # Chain-executor proofs record action_id/selected_because/url/param;

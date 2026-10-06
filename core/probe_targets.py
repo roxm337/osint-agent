@@ -16,6 +16,25 @@ from urllib.parse import parse_qsl, urlparse
 from core.validators import is_public_target
 
 
+# Marker fragments our own probes leave in URLs. Crawlers record every
+# URL they visit — including the ones earlier modules injected payloads
+# into — and without this filter the graph treats a DOM-XSS probe URL
+# as discovered attack surface and proposes probing the probe.
+PROBE_MARKERS = (
+    "osintxss", "hxprobe", "domxss", "redirect-probe", "hopefully404",
+    "zz74x74zz", "zzz_no_such", "zxqseed9k", "onload=", "onerror=",
+    "javascript:", "<svg", "<iframe", "%60", "`",
+)
+
+
+def is_probe_garbage(url: str) -> bool:
+    """Was this URL manufactured by our own testing, not discovered?"""
+    lowered = str(url or "").lower()
+    if "${" in lowered:
+        return True
+    return any(marker in lowered for marker in PROBE_MARKERS)
+
+
 def _scope_hosts(base_url: str, domain: str) -> tuple:
     """(hosts, port_or_None): what counts as the same app."""
     try:
