@@ -149,13 +149,15 @@ class SQLiScan(BaseModule):
         return cookie, extra
 
     def _candidate_urls(self) -> list[str]:
+        from core.probe_targets import iter_probe_points
+        from core.validators import inject_param
         urls = []
-        for asset in self.state.get_assets_by_type("parameter"):
-            url = str(asset.get("attrs", {}).get("url", "")).strip()
-            param = str(asset.get("value", "")).strip()
-            if url and param:
-                separator = "&" if "?" in url else "?"
-                candidate = f"{url}{separator}{param}=1"
-                if candidate not in urls:
-                    urls.append(candidate)
+        for point in iter_probe_points(self.state, self.base_url, self.domain):
+            if point.get("method", "GET") != "GET":
+                continue
+            # inject_param appends query params and fills {id} path
+            # placeholders in place, so templates arrive concrete.
+            candidate = inject_param(point["url"], point["param"], "1")
+            if candidate not in urls:
+                urls.append(candidate)
         return urls

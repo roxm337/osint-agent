@@ -9,6 +9,59 @@ from modules.base import BaseModule
 from tools.wrappers import curl_json, curl_with_status
 
 
+def _extract_swagger_doc(body: str) -> dict:
+    """Pull the embedded swaggerDoc object out of a Swagger UI init script.
+
+    The spec is a JS object literal, not strict JSON (unquoted keys,
+    trailing commas), so brace-match from `"swaggerDoc":` and parse
+    leniently. Returns {} when nothing usable is found.
+    """
+    text = str(body or "")
+    anchor = text.find('"swaggerDoc"')
+    if anchor < 0:
+        return {}
+    start = text.find("{", anchor)
+    if start < 0:
+        return {}
+    depth = 0
+    in_string: str | None = None
+    escaped = False
+    for pos in range(start, len(text)):
+        char = text[pos]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == in_string:
+                in_string = None
+            continue
+        if char in ("'", '"'):
+            in_string = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = text[start:pos + 1]
+                break
+    else:
+        return {}
+    try:
+        parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, dict) else {}
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Lenient pass: quote bare keys, drop trailing commas.
+    try:
+        fixed = re.sub(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)", r'\1"\2"\3', candidate)
+        fixed = re.sub(r",(\s*[}\]])", r"\1", fixed)
+        parsed = json.loads(fixed)
+        return parsed if isinstance(parsed, dict) else {}
+    except (json.JSONDecodeError, ValueError):
+        return {}
+
+
 class RestAPIAudit(BaseModule):
     id = "rest_api_audit"
     name = "REST API Audit"
@@ -358,6 +411,62 @@ class RestAPIAudit(BaseModule):
                     "Remove server URLs that reveal internal infrastructure."
                 ),
             )
+
+            # Swagger UI shells embed the spec in swagger-ui-init.js next
+            # to the UI. Ingesting it turns one "docs exposed" finding
+            # into enumerated, method-annotated endpoints for every
+            # downstream testing module.
+            if not served_spec:
+                await self._ingest_swagger_ui(base_url, path)
+
+    async def _ingest_swagger_ui(self, base_url: str, ui_path: str) -> None:
+        """Parse the spec embedded in a Swagger UI shell's init script."""
+        import re as _re
+        directory = ui_path.rstrip("/").rsplit("/", 1)[0] or ""
+        init_url = f"{base_url}{directory}/swagger-ui-init.js"
+        try:
+            result = await curl_with_status(init_url, timeout=15)
+        except Exception:
+            return
+        body = result.get("body", "") or ""
+        if result.get("status", 0) != 200 or "swaggerDoc" not in body:
+            return
+        spec = _extract_swagger_doc(body)
+        if not spec:
+            return
+        paths = spec.get("paths", {}) or {}
+        count = 0
+        for route, operations in paths.items():
+            if not isinstance(operations, dict):
+                continue
+            methods = sorted(
+                method.upper() for method in operations
+                if method.lower() in ("get", "post", "put", "patch", "delete"))
+            if not methods:
+                continue
+            params = []
+            for operation in operations.values():
+                if not isinstance(operation, dict):
+                    continue
+                for param in operation.get("parameters", []) or []:
+                    if isinstance(param, dict) and param.get("name"):
+                        params.append(
+                            f"{param.get('in', 'query')}:{param.get('name')}")
+            full_url = f"{base_url}{route}"
+            self.state.add_asset(
+                "api_endpoint",
+                f"api:{full_url}",
+                full_url,
+                confidence="FIRM",
+                sources=["swagger spec"],
+                attrs={"methods": methods, "params": sorted(set(params)),
+                       "spec": init_url},
+            )
+            count += 1
+            if count >= 100:
+                break
+        if count:
+            self.log(f"  Swagger spec: {count} endpoints from {init_url}")
 
     async def _probe_generic_api(self, base_url: str):
         """Probe for generic REST API patterns and JWT exposure."""

@@ -230,30 +230,17 @@ class XSSScan(BaseModule):
         return None
 
     def _candidate_injection_points(self) -> list[dict]:
-        points = []
-        seen = set()
-
+        # One shared builder for every testing module: parameter assets,
+        # swagger-derived endpoints ({id} templates included), and crawled
+        # query URLs — all in-scope. GET-only here; POST/JSON bodies need
+        # body injection this pass does not do.
+        from core.probe_targets import iter_probe_points
+        points = iter_probe_points(self.state, self.base_url, self.domain)
         raw_url = str(self.config.get("target", {}).get("raw_url", "")).strip()
         if raw_url:
-            self._add_url_points(raw_url, points, seen, "raw_target")
-
-        for asset in self.state.get_assets_by_type("parameter"):
-            url = str(asset.get("attrs", {}).get("url", "")).strip()
-            param = str(asset.get("value", "")).strip()
-            if not url or not param:
-                continue
-            parsed = urlparse(url)
-            base_url = url if parsed.query else f"{url}?{param}=test"
-            key = (base_url, param)
-            if key not in seen:
-                seen.add(key)
-                points.append({"url": base_url, "param": param, "source": "parameter_asset"})
-
-        for asset_type in ("url", "api_endpoint"):
-            for asset in self.state.get_assets_by_type(asset_type):
-                self._add_url_points(str(asset.get("value", "")).strip(), points, seen, asset_type)
-
-        return points
+            self._add_url_points(raw_url, points, {
+                (p["url"], p["param"]) for p in points}, "raw_target")
+        return [p for p in points if p.get("method", "GET") == "GET"]
 
     def _add_url_points(self, url: str, points: list[dict], seen: set, source: str):
         parsed = urlparse(url)

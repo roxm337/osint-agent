@@ -75,6 +75,11 @@ class ParameterDiscovery(BaseModule):
                     )
                 )
 
+        # Drop out-of-scope and malformed URLs BEFORE dedupe: archive
+        # junk (youtube embeds, third-party trackers, `localhost:/8080`
+        # misbuilds) must never become sqlmap targets.
+        parameters = [item for item in parameters
+                      if self._in_scope(str(item.get("url", "")))]
         unique = _dedupe_parameters(parameters)
         if not unique:
             seeded = await self._seed_reflection_params()
@@ -136,7 +141,8 @@ class ParameterDiscovery(BaseModule):
         for asset_type in ("url", "api_endpoint", "web_path", "js_file"):
             for asset in self.state.get_assets_by_type(asset_type):
                 value = str(asset.get("value", "")).strip()
-                if value.startswith(("http://", "https://")):
+                if value.startswith(("http://", "https://")) \
+                        and self._in_scope(value):
                     urls.append(value)
         return urls
 
@@ -145,11 +151,46 @@ class ParameterDiscovery(BaseModule):
         for asset_type in ("webapp", "url"):
             for asset in self.state.get_assets_by_type(asset_type):
                 value = str(asset.get("value", "")).strip()
-                if value.startswith(("http://", "https://")) and value not in targets:
+                if value.startswith(("http://", "https://")) \
+                        and value not in targets and self._in_scope(value):
                     targets.append(value)
         if not targets:
             targets.append(self.base_url)
         return targets
+
+    def _in_scope(self, url: str) -> bool:
+        """Same app, same port, parseable. Archive junk (youtube embeds,
+        third-party trackers, `localhost:/8080` malformed builds) never
+        becomes an injection point: sqlmap and dalfox cost minutes per
+        URL, and every out-of-scope point is minutes burned plus
+        findings attributed to someone else's server."""
+        from urllib.parse import urlparse
+        try:
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+            port = parsed.port
+        except ValueError:
+            return False
+        if not host:
+            return False
+        try:
+            base = urlparse(self.base_url)
+            base_host = (base.hostname or "").lower()
+            base_port = base.port or (443 if base.scheme == "https" else 80)
+        except ValueError:
+            return False
+        if host != base_host and host != self.domain.lower() \
+                and not host.endswith("." + self.domain.lower()):
+            return False
+        # On localhost-style targets the port distinguishes apps (:3000
+        # is Juice Shop, :8094 is something else entirely). On the public
+        # internet the host is the scope boundary; alt ports on the same
+        # host stay in scope.
+        from core.validators import is_public_target
+        if is_public_target(self.domain):
+            return True
+        scheme_default = 443 if parsed.scheme == "https" else 80
+        return (port or scheme_default) == base_port
 
     async def _seed_reflection_params(self) -> list[dict]:
         """Probe live pages for reflection under common parameter names.
@@ -242,8 +283,12 @@ def _dedupe_parameters(items: list[dict]) -> list[dict]:
 
 def _sensitive_parameter(name: str) -> bool:
     lowered = str(name).lower()
+    # High-signal names only. Generic web tokens (id, url, user, next,
+    # return, file, path, page, q) match every normal app and fired this
+    # finding everywhere; they still become parameter assets that the
+    # injection modules test, which is where their value lives.
     tokens = (
-        "token", "key", "secret", "redirect", "url", "next", "return",
-        "id", "user", "account", "file", "path", "debug", "admin",
+        "token", "key", "secret", "password", "passwd", "auth", "admin",
+        "debug", "api_key", "apikey", "credential", "private",
     )
     return any(token in lowered for token in tokens)

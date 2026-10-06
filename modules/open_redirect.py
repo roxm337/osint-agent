@@ -282,6 +282,19 @@ class OpenRedirectScan(BaseModule):
                     targets.append((url, param))
                 if len(targets) >= limit:
                     return targets
+        # Shared probe points (swagger params, crawled query URLs) merge
+        # in under the same cap: a redirect-shaped parameter the crawler
+        # saw is worth more than the fortieth DEFAULT_PATHS guess.
+        if len(targets) < limit:
+            from core.probe_targets import iter_probe_points
+            for point in iter_probe_points(self.state, base, self.domain):
+                if point.get("method", "GET") != "GET":
+                    continue
+                pair = (point["url"], point["param"])
+                if pair not in targets:
+                    targets.append(pair)
+                if len(targets) >= limit:
+                    break
         return targets
 
     def _discovered(self) -> list:

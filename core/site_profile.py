@@ -67,6 +67,16 @@ PATH_RULES: list[tuple[re.Pattern, str, str]] = [
      "Exposed Configuration File"),
     (re.compile(r"adminer|/admin\.php|/admin/console"), "MEDIUM",
      "Admin Console Exposed"),
+    (re.compile(r"/metrics$|/metrics/"), "MEDIUM",
+     "Exposed Prometheus Metrics"),
+    (re.compile(r"/\.well-known/security\.txt$"), "LOW",
+     "Security Policy Exposed"),
+    (re.compile(r"\.md\.bak$|\.bak$|\.backup$|\.old$"), "HIGH",
+     "Backup File Exposed"),
+    (re.compile(r"/\.terraform/|\.tfstate$|docker-compose\.ya?ml$"), "HIGH",
+     "IaC State Exposed"),
+    (re.compile(r"^/ftp/"), "LOW",
+     "Exposed File Drop"),
 ]
 
 # Verdicts, in the order a module should care about them.

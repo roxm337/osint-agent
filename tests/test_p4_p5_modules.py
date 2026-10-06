@@ -39,6 +39,25 @@ def test_parameter_discovery_uses_existing_urls_without_tools():
     assert result == "done"
     params = state.get_assets_by_type("parameter")
     assert {item["value"] for item in params} == {"q", "next"}
+    # Generic web tokens drive injection testing as assets; they no longer
+    # file a MEDIUM finding just for existing.
+    assert state.findings["findings"] == []
+
+
+def test_parameter_discovery_flags_high_signal_names():
+    tmpdir = Path(tempfile.mkdtemp())
+    state = StateManager(str(tmpdir / "run" / "example.com"))
+    state.add_asset(
+        "url",
+        "url:https://example.com/search?q=test&api_key=xxx",
+        "https://example.com/search?q=test&api_key=xxx",
+    )
+
+    result = asyncio.run(
+        ParameterDiscovery(state, {"target": {"domain": "example.com"}}).run()
+    )
+
+    assert result == "done"
     assert state.findings["findings"][0]["title"] == "Sensitive Parameter Names Discovered"
 
 
