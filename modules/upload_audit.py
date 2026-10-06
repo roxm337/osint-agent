@@ -44,10 +44,18 @@ class UploadAudit(BaseModule):
             self.state.skip_module(self.id, "no upload endpoints discovered")
             return "skipped"
 
+        import time as _time_guard
+        try:
+            _guard_deadline = float(self.config.get("module_timeout", 300) or 300)
+        except (TypeError, ValueError):
+            _guard_deadline = 300.0
+        _stop_at = _time_guard.monotonic() + max(60.0, _guard_deadline - 30.0)
         cfg = self._cfg()
         self._auth_headers = self._session_headers()
         reported = 0
         for endpoint in endpoints[:10]:
+            if _time_guard.monotonic() >= _stop_at:
+                break
             if await self._audit_endpoint(endpoint, cfg):
                 reported += 1
 

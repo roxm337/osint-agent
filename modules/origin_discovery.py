@@ -193,6 +193,11 @@ class OriginDiscovery(BaseModule):
         """Historical + CT-derived IPs outside known CDN ranges."""
         import time
         from core.validators import is_public_target
+        try:
+            _deadline = float(self.config.get("module_timeout", 300) or 300)
+        except (TypeError, ValueError):
+            _deadline = 300.0
+        _stop_at = time.monotonic() + max(60.0, _deadline - 60.0)
         candidates: dict[str, dict] = {}
         public = is_public_target(self.domain)
 
@@ -239,6 +244,9 @@ class OriginDiscovery(BaseModule):
                 if name and name.endswith(self.domain.lower()):
                     names.add(name)
         for name in sorted(names)[:40]:
+            if time.monotonic() >= _stop_at:
+                self.log("  Time-box hit during CT resolution")
+                break
             try:
                 resolved = await dig("A", name)
             except Exception:
@@ -248,6 +256,9 @@ class OriginDiscovery(BaseModule):
 
         # Current A records of known subdomains outside CDN ranges.
         for asset in self.state.get_assets_by_type("subdomain")[:100]:
+            if time.monotonic() >= _stop_at:
+                self.log("  Time-box hit during subdomain resolution")
+                break
             host = str(asset.get("value", "")).strip()
             if not host:
                 continue

@@ -36,9 +36,18 @@ class ResponseAudit(BaseModule):
             self.state.skip_module(self.id, "no JSON endpoints discovered")
             return "skipped"
 
+        import time as _time_guard
+        try:
+            _guard_deadline = float(self.config.get("module_timeout", 300) or 300)
+        except (TypeError, ValueError):
+            _guard_deadline = 300.0
+        _stop_at = _time_guard.monotonic() + max(60.0, _guard_deadline - 30.0)
         identities = self._identity_tokens()
         reported = 0
         for url in targets[:40]:
+            if _time_guard.monotonic() >= _stop_at:
+                self.log("  Time-box hit — keeping audited responses so far")
+                break
             finding = await self._audit_url(url, None)
             if finding:
                 reported += 1

@@ -55,6 +55,12 @@ class ErrorAudit(BaseModule):
     active = True
 
     async def run(self) -> str:
+        import time
+        try:
+            _deadline = float(self.config.get("module_timeout", 300) or 300)
+        except (TypeError, ValueError):
+            _deadline = 300.0
+        _stop_at = time.monotonic() + max(60.0, _deadline - 30.0)
         self.profile = await self._profile()
         reported = 0
 
@@ -65,11 +71,15 @@ class ErrorAudit(BaseModule):
 
         # 2. Type violations on known endpoints: /api/Users/abc,
         # /rest/basket/xyz — typed routers confess in 500s.
+        checked = 0
         for asset in self.state.get_assets_by_type("api_endpoint"):
+            if time.monotonic() >= _stop_at or checked >= 15:
+                break
             value = str(asset.get("value", "") or "")
             if "{id}" in value or value.rstrip("/").split("/")[-1].isdigit():
                 continue
             base = value.rstrip("/")
+            checked += 1
             if await self._check_url(f"{base}/abcXYZ", "type violation"):
                 reported += 1
                 if reported >= 5:

@@ -46,8 +46,17 @@ class DomXSSScan(BaseModule):
 
         cfg = self._cfg()
         max_pages = int(cfg.get("max_pages", 25) or 25)
+        import time
+        try:
+            _deadline = float(self.config.get("module_timeout", 300) or 300)
+        except (TypeError, ValueError):
+            _deadline = 300.0
+        _stop_at = time.monotonic() + max(60.0, _deadline - 30.0)
         reported = 0
         for page_url in pages[:max_pages]:
+            if time.monotonic() >= _stop_at:
+                self.log("  Time-box hit — keeping the executions confirmed so far")
+                break
             if await self._test_page(page_url):
                 reported += 1
 

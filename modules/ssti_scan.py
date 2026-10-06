@@ -43,10 +43,18 @@ class SSTIScan(BaseModule):
             self.state.skip_module(self.id, "no parameterized URLs")
             return "skipped"
 
+        import time as _time_guard
+        try:
+            _guard_deadline = float(self.config.get("module_timeout", 300) or 300)
+        except (TypeError, ValueError):
+            _guard_deadline = 300.0
+        _stop_at = _time_guard.monotonic() + max(60.0, _guard_deadline - 30.0)
         cfg = self._cfg()
         max_points = int(cfg.get("max_points", 40) or 40)
         reported = 0
         for point in points[:max_points]:
+            if _time_guard.monotonic() >= _stop_at:
+                break
             if await self._test_point(point):
                 reported += 1
 

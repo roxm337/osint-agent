@@ -466,7 +466,15 @@ class AuthAudit(BaseModule):
                     and value not in targets:
                 targets.append(value)
 
+        import time as _time_guard
+        try:
+            _guard_deadline = float(self.config.get("module_timeout", 300) or 300)
+        except (TypeError, ValueError):
+            _guard_deadline = 300.0
+        _stop_at = _time_guard.monotonic() + max(60.0, _guard_deadline - 30.0)
         for url in targets[:10]:
+            if _time_guard.monotonic() >= _stop_at:
+                break
             anon = await _get(url, None)
             if anon.get("status") not in (401, 403):
                 continue
@@ -629,6 +637,12 @@ class AuthAudit(BaseModule):
         BOLA review, since writing your own record may be legitimate.
         """
         import json as _json
+        import time as _time_guard
+        try:
+            _guard_deadline = float(self.config.get("module_timeout", 300) or 300)
+        except (TypeError, ValueError):
+            _guard_deadline = 300.0
+        _stop_at = _time_guard.monotonic() + max(60.0, _guard_deadline - 30.0)
         token = identity.get("token", "")
         auth = {"Authorization": f"Bearer {token}"} if token else None
         candidates = []
@@ -644,6 +658,8 @@ class AuthAudit(BaseModule):
                 candidates.append(value)
 
         for url in candidates[:5]:
+            if _time_guard.monotonic() >= _stop_at:
+                break
             before = await _get(url, None)
             if before["status"] != 200:
                 continue
