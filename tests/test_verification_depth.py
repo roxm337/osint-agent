@@ -558,6 +558,39 @@ def test_kev_adjacent_and_nvd_are_medium_leads():
 
 # ── MEDIUM wave: observations verified, names demoted ──
 
+def test_direct_http_port_files_info_inventory():
+    import tools.wrappers as wrappers
+    from modules.port_scan_module import PortScan
+    state = _state()
+    module = PortScan(state, _config())
+
+    async def fake_curl(url, **kwargs):
+        return {"status": 200,
+                "body": "<html><title>AI Content Agent Dashboard</title></html>",
+                "headers": "Server: Next.js"}
+
+    with patch.object(wrappers, "curl", new=fake_curl):
+        _run(module._fingerprint_http_port("203.0.113.9", 3001))
+    assert len(state.findings["findings"]) == 1
+    finding = state.findings["findings"][0]
+    assert finding["severity"] == "INFO"
+    assert finding["verified"] is True
+    assert "AI Content Agent Dashboard" in finding["description"]
+
+
+def test_direct_http_port_empty_body_files_nothing():
+    import tools.wrappers as wrappers
+    from modules.port_scan_module import PortScan
+    state = _state()
+    module = PortScan(state, _config())
+
+    async def fake_curl(url, **kwargs):
+        return {"status": 200, "body": "", "headers": ""}
+
+    with patch.object(wrappers, "curl", new=fake_curl):
+        _run(module._fingerprint_http_port("203.0.113.9", 3001))
+    assert state.findings["findings"] == []
+
 def test_verified_low_on_webapp_stays_low_without_intel():
     from core.prioritization import prioritize_findings
     findings = [{

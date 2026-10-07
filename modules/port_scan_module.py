@@ -109,6 +109,19 @@ VERIFY_HTTP_PROBES = {
 }
 
 
+def _looks_http(port: int, service: str, version: str) -> bool:
+    """Off-table open port that probably speaks HTTP: worth one GET."""
+    if port in (80, 443):
+        return False
+    text = f"{service} {version}".lower()
+    if any(token in text for token in
+           ("http", "uvicorn", "gunicorn", "next.js", "node", "express",
+            "proxy", "haproxy", "envoy", "traefik", "caddy")):
+        return True
+    return port in (3000, 3001, 8000, 8002, 8080, 8443, 5000, 5001,
+                    4000, 4200, 5173, 9000, 9090)
+
+
 class PortScan(BaseModule):
     id = "port_scan"
     name = "Port Scan"
@@ -173,6 +186,8 @@ class PortScan(BaseModule):
 
                 if port in HIGH_RISK_PORT_FINDINGS:
                     await self._report_port(target_ip, port, service, version)
+                elif _looks_http(port, service, version):
+                    await self._fingerprint_http_port(target_ip, port)
 
         self.state.complete_module(self.id)
         return "done"
@@ -213,6 +228,64 @@ class PortScan(BaseModule):
             verification={"method": f"unauthenticated {proof_lines[0]}",
                           "url": f"{target_ip}:{port}"} if proven else {},
         )
+
+    async def _fingerprint_http_port(self, target_ip: str, port: int) -> None:
+        """One bounded GET on an off-table HTTP port: what app answers?
+
+        The table covers known-dangerous services; everything else was
+        assets-only, so a live AI dashboard on :3001 and an auth-gated
+        API on :8002 vanished from the report. This files INFO inventory
+        with the observed title — a title that differs from the main
+        site means a different app, which is the lead. No status gate:
+        a 401 JSON API and a 200 dashboard are both answers worth
+        recording; an empty body is not.
+        """
+        from tools.wrappers import curl as _curl
+        for scheme in ("http", "https"):
+            url = f"{scheme}://{target_ip}:{port}/"
+            try:
+                response = await _curl(url, output="full", timeout=12,
+                                       follow_redirects=False)
+            except Exception:
+                continue
+            body = (response.get("body", "") or "").strip()
+            if not body:
+                continue
+            title_match = re.search(r"<title>([^<]{1,120})</title>", body,
+                                    re.IGNORECASE)
+            title = title_match.group(1).strip() if title_match else ""
+            server = ""
+            for line in str(response.get("headers", "") or "").splitlines():
+                if line.lower().startswith("server:"):
+                    server = line.split(":", 1)[1].strip()[:80]
+                    break
+            if not title and not body.startswith(("{", "[")):
+                continue
+            self.state.add_finding(
+                title=f"Direct HTTP Service on Port {port}",
+                severity="INFO",
+                confidence="CONFIRMED",
+                category="Network Exposure",
+                description=(
+                    f"{target_ip}:{port} answers {scheme.upper()} directly, "
+                    f"bypassing the front door on 80/443"
+                    f"{f' as {title!r}' if title else ''}"
+                    f"{f' ({server})' if server else ''}. Compare the title "
+                    f"with the main site: a different app here (staging, "
+                    f"dashboard, API) is the attack surface to map next."
+                ),
+                evidence=[f"URL: {url}",
+                          f"Title: {title or '(no title)'}"]
+                + ([f"Server: {server}"] if server else [])
+                + ([f"Body: {body[:150]}"] if not title else []),
+                remediation="Confirm the service on this port is intentional "
+                            "and authenticated; firewall the rest.",
+                asset_keys=[f"port:{target_ip}:{port}"],
+                verified=True,
+                verification={"method": "http_port_fingerprint",
+                              "url": url},
+            )
+            return
 
     async def _prove_unauth_access(self, ip: str, port: int
                                    ) -> tuple[bool, list[str]]:
