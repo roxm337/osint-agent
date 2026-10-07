@@ -388,8 +388,19 @@ nuclei:
 
 oob:
   # Configure real callback infrastructure for blind SSRF/XXE/SQLi/RCE checks.
-  # callback_domain example: "oob.your-bounty-box.example"
+  # Two modes, both optional (empty = OOB checks stay dormant):
+  #
+  # public — multiplexed session against the interactsh network. No
+  #   server of your own: needs only the interactsh-client binary
+  #   (baked into the docker image). Free and throttled; fine for
+  #   own-asset work, not for stealth.
+  #   mode: public
+  #
+  # wrapper — your own interactsh-compatible HTTP shim (self-hosted
+  #   server or a custom poll API). Needs a domain + wildcard DNS.
+  #   callback_domain example: "oob.your-bounty-box.example"
   # server_url/poll_url can point at an interactsh-compatible HTTP wrapper.
+  mode: ""
   callback_domain: ""
   server_url: ""
   poll_url: ""

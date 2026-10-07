@@ -115,6 +115,17 @@ class BaseModule:
         cfg = self.config.get("oob") or {}
         if isinstance(cfg, dict) and cfg.get("enabled") is False:
             return None
+        # Public mode: multiplexed session against the interactsh
+        # network, no self-hosted server needed. Every module keeps
+        # the same register/callback/poll interface.
+        if isinstance(cfg, dict) and str(cfg.get("mode", "")).lower() == "public":
+            from tools.external import PublicInteractshClient
+            client = PublicInteractshClient(
+                server=str(cfg.get("server_url") or "https://interactsh.com"),
+                poll_interval=float(cfg.get("poll_interval", 2.0) or 2.0),
+                poll_timeout=float(cfg.get("poll_timeout", 30.0) or 30.0),
+            )
+            return client if client.enabled else None
         client = InteractshClient(config=cfg if isinstance(cfg, dict) else {})
         return client if client.enabled else None
 

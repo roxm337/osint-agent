@@ -429,3 +429,87 @@ def test_graphql_cop_missing_binary_skips(monkeypatch):
     result = asyncio.run(external.graphql_cop_scan("https://t/graphql"))
     assert result == {"available": False, "results": {},
                       "error": "missing"}
+
+
+# ── Public interactsh sessions (Option A) ────────────────────────
+
+def test_parse_interactsh_session_line():
+    parse = external._parse_interactsh_session_line
+    assert parse('{"url":"https://c1234.interactsh.com"}') == \
+        "c1234.interactsh.com"
+    assert parse('Your domain: https://abc.oast.live/ here') == \
+        "abc.oast.live"
+    # Bare INF line against the session's own server domains.
+    assert parse('[INF] db37mgc7c1618oadidqgprgsosbn3b7gz.oast.pro',
+                 ("oast.pro", "oast.live")) == \
+        "db37mgc7c1618oadidqgprgsosbn3b7gz.oast.pro"
+    # Banner hostnames from other domains never match.
+    assert parse('projectdiscovery.io', ("oast.pro",)) == ""
+    assert parse('c1234.evil.example listening', ("oast.pro",)) == ""
+    assert parse('') == ""
+    assert parse('listening for interactions...') == ""
+
+
+def test_poll_interactsh_log_reads_incrementally(tmp_path):
+    log = tmp_path / "sess.jsonl"
+    log.write_text(
+        '{"full-id":"aaa.oast/x","raw-request":"GET /x"}\n'
+        'noise line\n'
+        '{"full-id":"aaa.oast/y","raw-request":"GET /y"}\n')
+    hits, offset = external._poll_interactsh_log(str(log), 0)
+    assert len(hits) == 2
+    assert offset > 0
+    hits2, _ = external._poll_interactsh_log(str(log), offset)
+    assert hits2 == []
+    assert external._poll_interactsh_log("/nonexistent.jsonl", 0) == ([], 0)
+
+
+def test_public_client_callback_url_shapes():
+    client = external.PublicInteractshClient()
+    assert client.callback_url("abc.oast.com", "/xss") == \
+        "https://abc.oast.com/xss"
+    assert client.callback_url("", "/x") == \
+        "http://unregistered.oob.invalid/x"
+    assert client.callback_url("http://h/o", "p") == "http://h/o/p"
+
+
+def test_interactsh_session_reuses_live_process(monkeypatch):
+    class FakeProc:
+        returncode = None
+    external._PUBLIC_SESSION["https://s.test"] = {
+        "proc": FakeProc(), "url": "abc.s.test", "log": "/tmp/x",
+        "offset": 3}
+    try:
+        out = asyncio.run(external.interactsh_session("https://s.test"))
+        assert out["available"] is True
+        assert out["url"] == "abc.s.test"
+        assert out["reused"] is True
+    finally:
+        external._PUBLIC_SESSION.pop("https://s.test", None)
+
+
+def test_interactsh_session_missing_binary(monkeypatch):
+    monkeypatch.setattr(external, "tool_available", lambda name: False)
+    out = asyncio.run(external.interactsh_session("https://s.test"))
+    assert out == {"available": False, "error": "missing"}
+
+
+def test_oob_public_mode_returns_public_client():
+    from modules.base import BaseModule
+    from state.manager import StateManager
+    import tempfile
+    state = StateManager(tempfile.mkdtemp())
+    module = BaseModule(
+        state, {"target": {"domain": "example.test"},
+                "oob": {"mode": "public"}})
+    client = module.oob()
+    assert isinstance(client, external.PublicInteractshClient)
+
+
+def test_oob_unconfigured_returns_none():
+    from modules.base import BaseModule
+    from state.manager import StateManager
+    import tempfile
+    state = StateManager(tempfile.mkdtemp())
+    module = BaseModule(state, {"target": {"domain": "example.test"}})
+    assert module.oob() is None

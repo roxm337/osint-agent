@@ -31,6 +31,7 @@ DOCKER_TOOLS = frozenset({
     "dalfox", "sqlmap", "corsy", "smuggler",
     "subzy", "assetfinder", "waybackurls", "dig", "whois",
     "jsluice", "gxss", "uro", "gitleaks", "graphql-cop",
+    "interactsh-client",
 })
 
 _BACKEND = {"mode": "local", "image": "osint-tools:latest"}
@@ -1085,3 +1086,225 @@ async def graphql_cop_scan(endpoint: str, timeout: int = 180) -> dict:
         "exit_code": result.get("exit_code"),
         "error": result.get("error"),
     }
+
+
+# ── Public interactsh sessions (Option A: no self-hosted infra) ────
+#
+# One client process per scan (multiplexed, killed on exit) holds a
+# session against the public interactsh server. Every payload gets the
+# same correlation domain with a distinct path; poll() matches the
+# full request URL, so parallel probes stay distinguishable.
+# PublicInteractshClient below speaks the same
+# register_callback/callback_url/poll interface as InteractshClient,
+# which is why BaseModule.oob() can hand it to every module unchanged.
+
+_PUBLIC_SESSION: dict = {}
+
+
+def _parse_interactsh_session_line(line: str, domains: tuple = ()) -> str:
+    """Extract the assigned correlation hostname from a client line.
+
+    The client prints a bare `[INF] <corr>.<server>` line (no scheme,
+    no JSON on stdout), so matching anchors on the server domains the
+    session was opened against — never on a generic hostname, which
+    would catch banner text like projectdiscovery.io first.
+    """
+    text = line.strip()
+    if not text:
+        return ""
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        data = None
+    if isinstance(data, dict):
+        for key in ("url", "correlation-id", "correlation_id",
+                    "domain", "host"):
+            value = data.get(key)
+            if isinstance(value, str) and "." in value:
+                return value.split("://", 1)[-1].split("/", 1)[0]
+    match = re.search(r"https?://([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})",
+                      text)
+    if match:
+        return match.group(1)
+    for domain in domains:
+        domain = domain.strip().lower()
+        if not domain:
+            continue
+        match = re.search(
+            r"\b([A-Za-z0-9][A-Za-z0-9-]*\." + re.escape(domain) + r")",
+            text, re.IGNORECASE)
+        if match:
+            return match.group(1).lower()
+    return ""
+
+
+def _poll_interactsh_log(path: str, since: int) -> tuple:
+    """Read new client log lines, returning (interactions, new_offset)."""
+    interactions = []
+    try:
+        with open(path, "r", errors="replace") as handle:
+            handle.seek(since)
+            chunk = handle.read()
+            offset = handle.tell()
+    except (OSError, ValueError):
+        return [], since
+    for line in chunk.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except (ValueError, TypeError):
+            data = None
+        if isinstance(data, dict) and (
+                data.get("raw-request") or data.get("full-id")
+                or data.get("unique-id") or "interaction" in line.lower()):
+            interactions.append(data)
+        elif "interactsh" in line.lower() and (
+                "dns" in line.lower() or "http" in line.lower()
+                or "request" in line.lower()):
+            interactions.append({"raw": line})
+    return interactions, offset
+
+
+async def interactsh_session(server: str = "oast.pro,oast.live,oast.site,oast.online,oast.fun,oast.me",
+                             log_dir: str | None = None,
+                             timeout: int = 60) -> dict:
+    """Start (or reuse) the process-wide public interactsh session."""
+    import asyncio as _asyncio
+    import tempfile as _tempfile
+    import time as _time
+    global _PUBLIC_SESSION
+    active = _PUBLIC_SESSION.get(server)
+    if active and active.get("proc") is not None \
+            and active["proc"].returncode is None:
+        return {"available": True, **{k: v for k, v in active.items()
+                                      if k != "proc"},
+                "reused": True}
+    if not tool_available("interactsh-client"):
+        return {"available": False, "error": "missing"}
+    directory = log_dir or os.path.join(os.getcwd(), "reports")
+    os.makedirs(directory, exist_ok=True)
+    handle = _tempfile.NamedTemporaryFile(
+        "w", prefix="interactsh-", suffix=".jsonl",
+        delete=False, dir=directory)
+    log_path = handle.name
+    handle.close()
+    try:
+        current = ["interactsh-client", "-server", server,
+                   "-json", "-duc", "-o", log_path]
+        proc = await _asyncio.create_subprocess_exec(
+            *(docker_run_args(current, stdin=False)
+              if _BACKEND["mode"] == "docker" else current),
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.STDOUT,
+        )
+    except Exception as exc:
+        return {"available": False, "error": str(exc)}
+    host = ""
+    deadline = _time.monotonic() + timeout
+    buffer = b""
+    while _time.monotonic() < deadline:
+        try:
+            chunk = await _asyncio.wait_for(
+                proc.stdout.read(1024),
+                timeout=max(1.0, deadline - _time.monotonic()))
+        except Exception:
+            break
+        if not chunk:
+            break
+        buffer += chunk
+        domains = tuple(
+            part.split("://", 1)[-1].strip().lower()
+            for part in server.split(","))
+        for line in buffer.decode(errors="replace").splitlines():
+            host = _parse_interactsh_session_line(line, domains) or host
+        if host:
+            break
+    if not host:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return {"available": False,
+                "error": "no session domain published"}
+    _PUBLIC_SESSION[server] = {"proc": proc, "url": host,
+                               "log": log_path, "offset": 0}
+    return {"available": True, "url": host, "log": log_path,
+            "offset": 0, "reused": False}
+
+
+def close_interactsh_sessions() -> None:
+    """Terminate multiplexed interactsh clients (atexit safety net)."""
+    for session in list(_PUBLIC_SESSION.values()):
+        proc = session.get("proc")
+        try:
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+        except Exception:
+            pass
+    _PUBLIC_SESSION.clear()
+
+
+class PublicInteractshClient:
+    """InteractshClient-compatible facade over a public session.
+
+    register_callback hands back the session domain (payloads ride in
+    distinct paths via callback_url); poll matches the full request
+    URL so parallel probes stay distinguishable. The process is shared
+    scan-wide and reaped on interpreter exit.
+    """
+
+    def __init__(self, server: str = "oast.pro,oast.live,oast.site,oast.online,oast.fun,oast.me",
+                 poll_interval: float = 2.0,
+                 poll_timeout: float = 30.0):
+        self.server = server
+        self.poll_interval = poll_interval
+        self.poll_timeout = poll_timeout
+        self.enabled = True
+        self._corr = ""
+        self._offset = 0
+
+    async def register_callback(self, payload: str) -> str:
+        import atexit as _atexit
+        session = await interactsh_session(self.server)
+        if not session.get("available"):
+            self.enabled = False
+            return ""
+        _atexit.register(close_interactsh_sessions)
+        self._corr = str(session.get("url", ""))
+        self._offset = int(session.get("offset", 0))
+        return self._corr
+
+    def callback_url(self, corr_id: str, path: str = "/") -> str:
+        host = corr_id or self._corr
+        if not host:
+            return f"http://unregistered.oob.invalid{path}"
+        if "://" in host:
+            base = host.rstrip("/")
+        else:
+            base = f"https://{host}"
+        if not path.startswith("/"):
+            path = "/" + path
+        return f"{base}{path}"
+
+    async def poll(self, corr_id: str) -> list[dict]:
+        import asyncio as _asyncio
+        import time as _time
+        session = _PUBLIC_SESSION.get(self.server) or {}
+        log_path = str(session.get("log", "") or "")
+        if not log_path:
+            return []
+        needle = (corr_id or self._corr).strip().lower()
+        deadline = _time.monotonic() + self.poll_timeout
+        offset = self._offset
+        while _time.monotonic() < deadline:
+            interactions, offset = _poll_interactsh_log(log_path, offset)
+            hits = [item for item in interactions
+                    if needle and needle in json.dumps(item).lower()]
+            if hits:
+                self._offset = offset
+                return hits
+            await _asyncio.sleep(self.poll_interval)
+        self._offset = offset
+        return []
