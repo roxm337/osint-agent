@@ -110,12 +110,14 @@ class ParameterDiscovery(BaseModule):
         if sensitive:
             self.state.add_finding(
                 title="Sensitive Parameter Names Discovered",
-                severity="MEDIUM",
+                severity="LOW",
                 confidence="FIRM",
                 category="Parameter Discovery",
                 description=(
                     "Parameter mining found names commonly associated with secrets, "
-                    "redirects, authorization, or object references."
+                    "redirects, authorization, or object references. Names "
+                    "alone prove nothing — they are the input list for "
+                    "injection and auth testing, not a vulnerability."
                 ),
                 evidence=[
                     f"{item['url']} -> {item['parameter']}"

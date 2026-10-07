@@ -427,6 +427,9 @@ class OriginDiscovery(BaseModule):
                         f"Markers: {reveals or ['server-change']}",
                     ],
                     remediation="Configure CDN/WAF to strip IP spoofing headers from untrusted sources.",
+                    verified=True,
+                    verification={"method": "spoofed_header_differential",
+                                  "url": self.base_url},
                 )
 
 

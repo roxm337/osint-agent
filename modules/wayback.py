@@ -172,6 +172,9 @@ class WaybackMachine(BaseModule):
                               for url, vals in list(secret_shaped.items())[:10]],
                     remediation="Rotate any credentials found in historical URLs; "
                                 "never pass secrets in URL parameters.",
+                    verified=True,
+                    verification={"method": "live_shape_observed",
+                                  "url": next(iter(secret_shaped))},
                 )
             elif live_with_values:
                 self.state.add_finding(
@@ -221,6 +224,9 @@ class WaybackMachine(BaseModule):
                     evidence=[f"{url} (HTTP {live[url]['status']})"
                               for url in confirmed[:10]],
                     remediation="Verify these files are no longer accessible; check current state.",
+                    verified=True,
+                    verification={"method": "live_distinct_content",
+                                  "url": confirmed[0] if confirmed else ""},
                 )
             else:
                 self.state.add_finding(

@@ -199,6 +199,9 @@ class BreachCheck(BaseModule):
                 evidence=[f"{r.get('site')}: {r.get('url', '')} :: {r.get('match', '')}"
                           for r in credential_pastes[:5]],
                 remediation="Rotate exposed credentials; request paste takedown.",
+                verified=True,
+                verification={"method": "paste_content_observed",
+                              "url": credential_pastes[0].get("url", "")},
             )
         elif mention_pastes:
             self.state.add_finding(

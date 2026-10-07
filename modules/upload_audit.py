@@ -187,6 +187,9 @@ class UploadAudit(BaseModule):
                     remediation="Allowlist extensions AND content types "
                                 "server-side; re-encode or sandbox uploads.",
                     asset_keys=[f"url:{url}"],
+                    verified=True,
+                    verification={"method": "stored_file_served_intact",
+                                  "url": location},
                 )
                 return True
         return filed

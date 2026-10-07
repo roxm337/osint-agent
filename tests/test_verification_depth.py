@@ -556,6 +556,79 @@ def test_kev_adjacent_and_nvd_are_medium_leads():
             assert f["confidence"] == "TENTATIVE"
 
 
+# ── MEDIUM wave: observations verified, names demoted ──
+
+def test_sensitive_param_names_are_low_inventory():
+    from modules.parameter_discovery import ParameterDiscovery
+    import tempfile
+    from pathlib import Path
+    from state.manager import StateManager
+    state = StateManager(str(Path(tempfile.mkdtemp()) / "run" / "example.com"))
+    state.add_asset(
+        "url",
+        "url:https://example.com/search?q=test&api_key=xxx",
+        "https://example.com/search?q=test&api_key=xxx",
+    )
+    _run(ParameterDiscovery(
+        state, {"target": {"domain": "example.com"}}).run())
+    match = next(f for f in state.findings["findings"]
+                 if f["title"] == "Sensitive Parameter Names Discovered")
+    assert match["severity"] == "LOW", \
+        "names alone are an input list, not a vulnerability"
+
+
+def test_origin_header_bypass_is_verified():
+    import modules.origin_discovery as od
+    from modules.origin_discovery import OriginDiscovery
+    state = _state()
+    module = OriginDiscovery(state, _config())
+
+    async def fake_curl(url, **kwargs):
+        if kwargs.get("headers", {}).get("X-Forwarded-For") == "127.0.0.1":
+            return {"status": 200, "body": "o" * 1200,
+                    "headers": "Server: nginx\nX-Backend: origin1"}
+        return {"status": 200, "body": "b" * 600,
+                "headers": "Server: cloudflare"}
+
+    with patch.object(od, "curl", new=fake_curl):
+        _run(module._test_cdn_bypass_headers("https://example.test"))
+    match = next(f for f in state.findings["findings"]
+                 if "Exposes Origin Markers" in f["title"])
+    assert match["verified"] is True
+
+
+def test_wayback_live_findings_carry_proof():
+    import modules.wayback as wb
+    from modules.wayback import WaybackMachine
+    state = _state()
+    module = WaybackMachine(state, _config())
+
+    async def fake_cdx(domain, **kwargs):
+        return [{"original": "https://example.test/dl?api_key=AKIAZZZZZZZZZZZZZZZZ",
+                 "timestamp": "20200101"},
+                {"original": "https://example.test/.env",
+                 "timestamp": "20200101"}]
+
+    async def fake_gau(domain, timeout=90):
+        return []
+
+    async def fake_fetch(url, timeout=10):
+        if url == "https://example.test":
+            return {"status": 200, "body": "BASE SHELL", "time_ms": 5,
+                    "url": url}
+        return {"status": 200, "body": "distinct live content " + "x" * 100,
+                "time_ms": 5, "url": url}
+
+    with patch.object(wb, "wayback_cdx", new=fake_cdx), \
+         patch.object(wb, "gau_urls", new=fake_gau), \
+         patch.object(wb, "curl_with_status", new=fake_fetch):
+        _run(module.run())
+    for f in state.findings["findings"]:
+        if f["title"] in ("Live URLs With Secret-Shaped Parameter Values",
+                          "Sensitive Files Reachable Now"):
+            assert f["verified"] is True, f["title"]
+            assert f["verification"].get("method"), f["title"]
+
 # ── audit-clean wave: origin, tech, TLS hygiene, REST docs ──
 
 def test_origin_confirmed_is_verified():
