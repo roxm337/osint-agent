@@ -130,8 +130,9 @@ class FastExposureScan(BaseModule):
 
         header_findings = await self._check_headers(base_url, timeout)
         cors_finding = await self._check_cors(base_url, timeout)
+        health_finding = await self._check_health(base_url, timeout)
         path_findings = await self._check_paths(base_url, paths, concurrency, timeout)
-        all_findings = header_findings + ([cors_finding] if cors_finding else []) + path_findings
+        all_findings = header_findings + ([cors_finding] if cors_finding else []) + ([health_finding] if health_finding else []) + path_findings
 
         evidence_id = self.state.add_evidence(
             self.id,
@@ -156,6 +157,8 @@ class FastExposureScan(BaseModule):
                 evidence_refs=[evidence_id],
                 remediation=finding.get("remediation", "Restrict public exposure and apply web hardening."),
                 asset_keys=[f"webapp:{base_url}"],
+                verified=bool(finding.get("verified", False)),
+                verification=finding.get("verification") or {},
             )
 
         self.state.add_asset(
@@ -235,6 +238,56 @@ class FastExposureScan(BaseModule):
             ],
             "remediation": "Use a strict allowlist for trusted origins and avoid credentialed wildcard CORS.",
         }
+
+    async def _check_health(self, base_url: str, timeout: int) -> dict | None:
+        """Health endpoint leaking internals: db, uptime, versions.
+
+        A bare {status:ok} is hygiene-neutral and stays silent. Keys
+        naming the database, uptime, collections, versions, or build
+        identity are fingerprinting served to anyone who asks — INFO
+        inventory with the fetched JSON as proof.
+        """
+        import json as _json
+        internals = ("database", "db_", "uptime", "version",
+                     "collection", "vector_size", "git", "commit",
+                     "hostname", "process", "memory")
+        for path in ("/api/health", "/health"):
+            try:
+                result = await curl(f"{base_url}{path}",
+                                    output="body", timeout=timeout)
+            except Exception:
+                continue
+            body = (result.get("body", "") or "").strip()
+            if not body.startswith("{"):
+                continue
+            try:
+                data = _json.loads(body)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            hits = sorted({k for k in data
+                           if any(t in str(k).lower() for t in internals)})
+            if not hits:
+                continue
+            return {
+                "title": "Health Endpoint Discloses Internals",
+                "severity": "INFO",
+                "confidence": "CONFIRMED",
+                "category": "Information Disclosure",
+                "description": (
+                    f"GET {path} returns internals ({', '.join(hits)}) "
+                    f"to unauthenticated callers. Fingerprinting, not a "
+                    f"vulnerability — strip to status only."),
+                "evidence": [f"URL: {base_url}{path}",
+                               f"Keys: {', '.join(hits)}"],
+                "remediation": "Reduce health output to {status:ok} "
+                                 "for public callers.",
+                "verified": True,
+                "verification": {"method": "health_json_internals",
+                                   "url": f"{base_url}{path}"},
+            }
+        return None
 
     async def _check_paths(self, base_url: str, paths: list[str],
                            concurrency: int, timeout: int) -> list[dict]:

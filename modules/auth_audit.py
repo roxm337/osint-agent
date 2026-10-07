@@ -93,6 +93,10 @@ class AuthAudit(BaseModule):
             if self._cfg().get("test_password_change") is True:
                 await self._password_change_probe(identities[0])
 
+        await self._ratelimit_bypass_check(endpoints)
+        if self._cfg().get("test_registration_oracle") is True:
+            await self._register_oracle()
+
         self.state.complete_module(self.id)
         self.log(f"Auth audit: {len(identities)} session(s) established")
         return "done"
@@ -123,6 +127,160 @@ class AuthAudit(BaseModule):
     def _cfg(self) -> dict:
         cfg = self.config.get("modules", {}).get(self.id, {})
         return cfg if isinstance(cfg, dict) else {}
+
+    async def _ratelimit_bypass_check(self, endpoints: list) -> None:
+        """Front-door throttle vs direct backend port: one burst, one probe.
+
+        Login rate limits often live in the reverse proxy, not the app.
+        A handful of bad logins trips the front-door 429; the same login
+        sent straight at a backend port the scan fingerprinted (proved
+        live: front 429 while :3000 answered 401) defeats spraying
+        protection entirely. Bounded: up to 6 front-door tries to find
+        the gate, then a single direct request per HTTP-ish port.
+        """
+        from urllib.parse import urlparse
+        gated_endpoint = ""
+        gate_note = ""
+        for endpoint in endpoints[:6]:
+            try:
+                result = await curl(
+                    endpoint, method="POST",
+                    headers={"Content-Type": "application/json"},
+                    data=_json_dumps(
+                        {"email": "ratelimit-probe-zz9@example.invalid",
+                         "password": "wrongpass123"}),
+                    output="full", timeout=15)
+            except Exception:
+                continue
+            if result.get("status", 0) == 429:
+                gated_endpoint = endpoint
+                gate_note = (result.get("body", "") or "")[:150]
+                break
+        if not gated_endpoint:
+            return
+        from modules.port_scan_module import _looks_http
+        path = urlparse(gated_endpoint).path or "/"
+        payload = _json_dumps(
+            {"email": "ratelimit-probe-zz9@example.invalid",
+             "password": "wrongpass123"})
+        for asset in self.state.get_assets_by_type("port"):
+            attrs = asset.get("attrs", {}) or {}
+            ip = str(attrs.get("ip", "") or "")
+            try:
+                port = int(attrs.get("port", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if not ip or not _looks_http(
+                    port, str(attrs.get("service", "")),
+                    str(attrs.get("version", ""))):
+                continue
+            direct = f"http://{ip}:{port}{path}"
+            try:
+                result = await curl(
+                    direct, method="POST",
+                    headers={"Content-Type": "application/json",
+                             "Host": self.domain},
+                    data=payload, output="full", timeout=15)
+            except Exception:
+                continue
+            status = result.get("status", 0)
+            if status == 429:
+                continue  # gate holds on this port too
+            body = (result.get("body", "") or "")[:200]
+            if status in (200, 201, 400, 401, 422) and body:
+                self.state.add_finding(
+                    title="Login Rate Limit Bypass via Direct Backend Port",
+                    severity="MEDIUM",
+                    confidence="CONFIRMED",
+                    category="Broken Authentication",
+                    description=(
+                        f"{gated_endpoint} throttles repeated failures "
+                        f"({gate_note or 'HTTP 429'}), but the same login "
+                        f"sent straight to {direct} is processed "
+                        f"(HTTP {status}). Brute-force and credential "
+                        f"spraying protection lives in the proxy, not "
+                        f"the app."),
+                    evidence=[f"Front door: HTTP 429 at {gated_endpoint}",
+                              f"Direct: HTTP {status} at {direct}: "
+                              f"{body[:150]}"],
+                    remediation="Enforce the attempt limit in the "
+                                "application (or share the counter with "
+                                "the proxy), and firewall backend ports "
+                                "from the internet.",
+                    asset_keys=[f"url:{direct}"],
+                    verified=True,
+                    verification={"method": "ratelimit_differential",
+                                  "url": direct},
+                )
+                return
+
+    async def _register_oracle(self) -> None:
+        """Registration oracle: success vs already-exists differential.
+
+        OPT-IN ONLY (modules.auth_audit.test_registration_oracle: true):
+        this creates one real account. A distinct already-exists answer
+        for the second identical registration is a user-enumeration
+        oracle for phishing and spray-list building.
+        """
+        candidates = []
+        for asset in self.state.get_assets_by_type("api_endpoint"):
+            value = str(asset.get("value", "") or "")
+            if "register" in value.lower() and value not in candidates:
+                candidates.append(value)
+        for path in ("/api/auth/register", "/api/register", "/register"):
+            url = f"{self.base_url}{path}"
+            if url not in candidates:
+                candidates.append(url)
+        email = f"oracle-probe-{secrets.token_hex(4)}@{self.domain}"
+        body_shape = {"email": email, "password": "OracleProbe123!",
+                      "name": "oracle probe"}
+        first = await self._register_attempt(candidates, body_shape)
+        if not first:
+            return
+        second = await self._register_attempt([first["url"]], body_shape)
+        if not second:
+            return
+        if _reads_registered(first) and _reads_exists(second):
+            self.state.add_finding(
+                title="User Enumeration via Registration Oracle",
+                severity="LOW",
+                confidence="CONFIRMED",
+                category="Information Disclosure",
+                description=(
+                    f"Registering {email} succeeded, then registering it "
+                    f"again returned a distinct already-exists answer. "
+                    f"Attackers can confirm registered addresses. "
+                    f"Delete the test account {email}."),
+                evidence=[f"First: {first['body'][:150]}",
+                          f"Second: {second['body'][:150]}"],
+                remediation="Return the same generic response for new "
+                            "and existing addresses (send the verification "
+                            "mail either way).",
+                asset_keys=[f"url:{first['url']}"],
+                verified=True,
+                verification={"method": "registration_oracle",
+                              "url": first["url"]},
+            )
+
+    async def _register_attempt(self, urls: list, body: dict) -> dict | None:
+        """One registration-shaped POST per candidate URL, first success."""
+        import json as _json
+        for url in urls[:8]:
+            for payload in (dict(body),
+                            {"username": body["email"], **body}):
+                try:
+                    result = await curl(
+                        url, method="POST",
+                        headers={"Content-Type": "application/json"},
+                        data=_json.dumps(payload),
+                        output="full", timeout=15)
+                except Exception:
+                    continue
+                text = result.get("body", "") or ""
+                if result.get("status", 0) in (200, 201) and text:
+                    return {"url": url, "status": result.get("status", 0),
+                            "body": text}
+        return None
 
     async def _password_change_probe(self, identity: dict) -> None:
         """Change the session's password without the current one.
@@ -768,6 +926,24 @@ def _json_equal_ignoring_volatile(first, second) -> bool:
             _json_equal_ignoring_volatile(a, b)
             for a, b in zip(first, second))
     return first == second
+
+
+def _reads_registered(attempt: dict) -> bool:
+    """First registration looks like success, not an error."""
+    if attempt.get("status") not in (200, 201):
+        return False
+    text = str(attempt.get("body", "") or "").lower()
+    return any(marker in text for marker in
+               ("success", "created", "welcome", "verify",
+                "check your email", "registered"))
+
+
+def _reads_exists(attempt: dict) -> bool:
+    """Second identical registration is distinctly already-exists."""
+    text = str(attempt.get("body", "") or "").lower()
+    return any(marker in text for marker in
+               ("already exists", "already registered", "already in use",
+                "already taken", "duplicate", "email taken"))
 
 
 async def _get(url: str, auth: dict | None) -> dict:

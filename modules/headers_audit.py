@@ -39,7 +39,7 @@ class HeadersAudit(BaseModule):
             return "skipped"
 
         csp_seen = set()
-        cookies_seen: dict[str, dict] = {}
+        cookies_seen: dict[str, tuple] = {}
         for url in pages[:12]:
             try:
                 result = await curl(url, output="full", timeout=15)
@@ -52,12 +52,13 @@ class HeadersAudit(BaseModule):
                 self._audit_csp(url, csp)
             for name, attrs in _parse_cookies(
                     result.get("headers", "")).items():
-                cookies_seen.setdefault(name, attrs)
+                cookies_seen.setdefault(name, (attrs, url))
             if len(cookies_seen) > 40:
                 break
 
-        for name, attrs in cookies_seen.items():
-            self._audit_cookie(name, attrs)
+        for name, (attrs, url) in cookies_seen.items():
+            self._audit_cookie(name, attrs,
+                               secure_context=url.startswith("https://"))
 
         await self._audit_methods()
 
@@ -130,7 +131,8 @@ class HeadersAudit(BaseModule):
                 verification={"method": "csp_policy_parsed", "url": url},
             )
 
-    def _audit_cookie(self, name: str, attrs: dict) -> None:
+    def _audit_cookie(self, name: str, attrs: dict,
+                        secure_context: bool = True) -> None:
         lowered = name.lower()
         if not any(hint in lowered for hint in _SESSION_COOKIE_HINTS):
             return
@@ -141,21 +143,31 @@ class HeadersAudit(BaseModule):
         if samesite not in ("lax", "strict"):
             issues.append(f"SameSite {samesite or 'unset'} "
                           "(cross-site sending allowed)")
+        # Secure only judges on HTTPS: flagging it on a plaintext site
+        # prescribes a cookie the browser would never send back. On an
+        # HTTPS page without it, any cleartext fetch (or SSL-strip)
+        # carries the session — the exact session-theft primitive.
+        missing_secure = not attrs.get("secure") and secure_context
+        if missing_secure:
+            issues.append("missing Secure (sent over cleartext HTTP)")
         if not issues:
             return
         self.state.add_finding(
             title=f"Session Cookie Missing Flags: {name}",
-            severity="MEDIUM" if not attrs.get("httponly") else "LOW",
+            severity="MEDIUM" if (not attrs.get("httponly")
+                                  or missing_secure) else "LOW",
             confidence="CONFIRMED",
             category="Hardening Deficiency",
             description=(
                 f"Session cookie {name} sets "
                 f"{'; '.join(issues)}. One stored XSS becomes session "
-                f"theft without HttpOnly; lax CSRF posture without SameSite."),
+                f"theft without HttpOnly; lax CSRF posture without SameSite; "
+                f"no Secure means the cookie rides plaintext too."),
             evidence=[f"Cookie: {name}",
                       f"Attributes: {attrs.get('raw', '')[:200]}"],
-            remediation="Set HttpOnly and SameSite=Lax (Strict for "
-                        "high-value sessions); Secure on HTTPS.",
+            remediation="Set HttpOnly, SameSite=Lax (Strict for "
+                        "high-value sessions), and Secure on HTTPS; "
+                        "serve the app HTTPS-only with HSTS.",
             asset_keys=[],
             verified=True,
             verification={"method": "cookie_flags_observed",

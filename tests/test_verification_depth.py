@@ -74,7 +74,7 @@ def test_headers_audit_quiet_on_tight_policy():
         return {"status": 200,
                 "headers": ("HTTP/1.1 200 OK\n"
                             "Content-Security-Policy: script-src 'self'; object-src 'none'\n"
-                            "Set-Cookie: sessionid=abc; Path=/; HttpOnly; SameSite=Lax\n"),
+                            "Set-Cookie: sessionid=abc; Path=/; HttpOnly; SameSite=Lax; Secure\n"),
                 "body": ""}
 
     with patch.object(ha, "curl", new=fake_curl):
@@ -556,7 +556,190 @@ def test_kev_adjacent_and_nvd_are_medium_leads():
             assert f["confidence"] == "TENTATIVE"
 
 
-# ── MEDIUM wave: observations verified, names demoted ──
+# ── autopilot hunt wave: Secure flag, throttle bypass, oracle, health ──
+
+def test_cookie_missing_secure_on_https_is_medium():
+    import modules.headers_audit as ha
+    from modules.headers_audit import HeadersAudit
+    state = _state()
+    state.add_asset("url", "url:https://example.test/",
+                    "https://example.test/", confidence="FIRM",
+                    sources=["test"])
+    module = HeadersAudit(state, _config())
+
+    async def fake_curl(url, **kwargs):
+        if kwargs.get("method") == "OPTIONS":
+            return {"status": 200, "headers": "Allow: GET, HEAD",
+                    "body": ""}
+        return {"status": 200,
+                "headers": ("HTTP/1.1 200 OK\n"
+                            "Set-Cookie: auth-token=abc; Path=/; HttpOnly; SameSite=Strict\n"),
+                "body": ""}
+
+    with patch.object(ha, "curl", new=fake_curl):
+        _run(module.run())
+    match = next(f for f in state.findings["findings"]
+                 if "Session Cookie" in f["title"])
+    assert match["severity"] == "MEDIUM"
+    assert "Secure" in match["description"]
+    assert match["verified"] is True
+
+
+def test_cookie_secure_not_judged_on_plaintext():
+    import modules.headers_audit as ha
+    from modules.headers_audit import HeadersAudit
+    state = _state("plain.test")
+    state.add_asset("url", "url:http://plain.test/",
+                    "http://plain.test/", confidence="FIRM",
+                    sources=["test"])
+    config = {"target": {"domain": "plain.test",
+                         "base_url": "http://plain.test"},
+              "auth": {"identities": []}, "waf": {},
+              "modules": {}}
+    module = HeadersAudit(state, config)
+
+    async def fake_curl(url, **kwargs):
+        if kwargs.get("method") == "OPTIONS":
+            return {"status": 200, "headers": "Allow: GET, HEAD",
+                    "body": ""}
+        return {"status": 200,
+                "headers": ("HTTP/1.1 200 OK\n"
+                            "Set-Cookie: auth-token=abc; Path=/; HttpOnly; SameSite=Strict\n"),
+                "body": ""}
+
+    with patch.object(ha, "curl", new=fake_curl):
+        _run(module.run())
+    assert state.findings["findings"] == [], \
+        "Secure on plaintext would break the site — not a finding"
+
+
+def test_ratelimit_bypass_via_direct_port():
+    import modules.auth_audit as aa
+    from modules.auth_audit import AuthAudit
+    state = _state()
+    state.add_asset("port", "port:1.2.3.4:3000", "1.2.3.4:3000",
+                    confidence="CONFIRMED", sources=["test"],
+                    attrs={"ip": "1.2.3.4", "port": 3000,
+                           "service": "http", "version": ""})
+    module = AuthAudit(state, _config())
+
+    async def fake_curl(url, **kwargs):
+        if url.startswith("http://1.2.3.4:3000"):
+            return {"status": 401, "body": '{"error":"Invalid credentials"}',
+                    "headers": ""}
+        return {"status": 429, "body": '{"error":"Too many attempts"}',
+                "headers": ""}
+
+    with patch.object(aa, "curl", new=fake_curl):
+        _run(module._ratelimit_bypass_check(
+            ["https://example.test/api/auth/login"]))
+    match = next(f for f in state.findings["findings"]
+                 if "Rate Limit Bypass" in f["title"])
+    assert match["severity"] == "MEDIUM"
+    assert match["verified"] is True
+    assert match["verification"]["method"] == "ratelimit_differential"
+
+
+def test_ratelimit_bypass_quiet_when_gate_holds():
+    import modules.auth_audit as aa
+    from modules.auth_audit import AuthAudit
+    state = _state()
+    state.add_asset("port", "port:1.2.3.4:3000", "1.2.3.4:3000",
+                    confidence="CONFIRMED", sources=["test"],
+                    attrs={"ip": "1.2.3.4", "port": 3000,
+                           "service": "http", "version": ""})
+    module = AuthAudit(state, _config())
+
+    async def fake_curl(url, **kwargs):
+        return {"status": 429, "body": '{"error":"Too many attempts"}',
+                "headers": ""}
+
+    with patch.object(aa, "curl", new=fake_curl):
+        _run(module._ratelimit_bypass_check(
+            ["https://example.test/api/auth/login"]))
+    assert state.findings["findings"] == []
+
+
+def test_register_oracle_opt_in_off_by_default():
+    import modules.auth_audit as aa
+    from modules.auth_audit import AuthAudit
+    state = _state()
+    state.add_asset("api_endpoint",
+                    "api_endpoint:https://example.test/api/auth/register",
+                    "https://example.test/api/auth/register",
+                    confidence="FIRM", sources=["test"],
+                    attrs={"methods": ["POST"]})
+    module = AuthAudit(state, _config())
+    touched = []
+
+    async def fake_curl(url, **kwargs):
+        touched.append((url, str(kwargs.get("data", ""))))
+        return {"status": 404, "body": "<html>shell</html>", "headers": ""}
+
+    with patch.object(aa, "curl", new=fake_curl):
+        _run(module.run())
+    assert not any("oracle-probe" in data for _, data in touched), \
+        "opt-in off must not send registration bodies"
+
+
+def test_register_oracle_proves_enumeration_when_enabled():
+    import modules.auth_audit as aa
+    from modules.auth_audit import AuthAudit
+    state = _state()
+    config = _config()
+    config["modules"] = {"auth_audit": {"test_registration_oracle": True}}
+    module = AuthAudit(state, config)
+    calls = []
+
+    async def fake_curl(url, **kwargs):
+        import json as _json
+        calls.append(_json.loads(kwargs.get("data", "{}")))
+        if len(calls) == 1:
+            return {"status": 200,
+                    "body": '{"success":true,"user":{"id":"1"}}',
+                    "headers": ""}
+        return {"status": 200,
+                "body": '{"error":"User already exists"}',
+                "headers": ""}
+
+    with patch.object(aa, "curl", new=fake_curl):
+        _run(module._register_oracle())
+    match = next(f for f in state.findings["findings"]
+                 if "Registration Oracle" in f["title"])
+    assert match["severity"] == "LOW"
+    assert match["verified"] is True
+    assert "Delete the test account" in match["description"]
+
+
+def test_health_internals_files_info():
+    import modules.fast_exposure_scan as fe
+    from modules.fast_exposure_scan import FastExposureScan
+    state = _state()
+    module = FastExposureScan(state, _config())
+
+    async def fake_curl(url, **kwargs):
+        return {"status": 200,
+                "body": '{"status":"ok","database":"connected","uptime":531407}',
+                "headers": ""}
+
+    with patch.object(fe, "curl", new=fake_curl):
+        found = _run(module._check_health("https://example.test", 4))
+    assert found["severity"] == "INFO"
+    assert found["verified"] is True
+    assert "database" in found["description"]
+
+
+def test_health_bare_ok_stays_silent():
+    import modules.fast_exposure_scan as fe
+    from modules.fast_exposure_scan import FastExposureScan
+    state = _state()
+    module = FastExposureScan(state, _config())
+
+    async def fake_curl(url, **kwargs):
+        return {"status": 200, "body": '{"status":"ok"}', "headers": ""}
+
+    with patch.object(fe, "curl", new=fake_curl):
+        assert _run(module._check_health("https://example.test", 4)) is None
 
 def test_direct_http_port_files_info_inventory():
     import tools.wrappers as wrappers
@@ -645,6 +828,8 @@ def test_origin_skips_high_on_direct_hosting():
     assert not [f for f in state.findings["findings"]
                 if "Origin IP Discovered Behind" in f["title"]], \
         "direct hosting has no CDN to bypass — the asset suffices"
+
+# ── MEDIUM wave: observations verified, names demoted ──
 
 def test_sensitive_param_names_are_low_inventory():
     from modules.parameter_discovery import ParameterDiscovery
