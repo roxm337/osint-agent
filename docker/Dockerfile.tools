@@ -39,6 +39,13 @@ RUN for i in 1 2 3; do if go install github.com/tomnomnom/anew@latest; then brea
 RUN for i in 1 2 3; do if go install github.com/tomnomnom/qsreplace@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
 RUN for i in 1 2 3; do if go install github.com/tomnomnom/gf@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
 RUN for i in 1 2 3; do if go install github.com/PentestPad/subzy@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+# Tier-1 hunt upgrades (2026-10 research): jsluice extracts URLs/words
+# from JS bundles (feeds endpoint discovery); Gxss filters reflection
+# candidates so dalfox only fires on live params. jsluice needs cgo
+# (tree-sitter) while the rest of the stage builds static.
+RUN apt-get update && apt-get install -y --no-install-recommends gcc && rm -rf /var/lib/apt/lists/*
+RUN for i in 1 2 3; do if CGO_ENABLED=1 go install github.com/BishopFox/jsluice/cmd/jsluice@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+RUN for i in 1 2 3; do if go install github.com/KathanP19/Gxss@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
 RUN for i in 1 2 3; do if go install github.com/sensepost/gowitness@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
 
 # ── Runtime ───────────────────────────────────────────────────────
@@ -96,10 +103,10 @@ RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main
 RUN nuclei -update-templates -silent 2>/dev/null; true
 
 # Python toolchain (theHarvester is source-only: the PyPI name is a
-# stub. CMSeeK is git-only too).
+# stub. uro dedups/filters URL lists for the recon pipeline).
 RUN pip install --no-cache-dir --break-system-packages \
     --ignore-installed blinker \
-    sqlmap arjun maigret holehe droopescan \
+    sqlmap arjun maigret holehe droopescan uro \
  && git clone --depth 1 https://github.com/laramies/theHarvester /opt/theharvester \
  && python3.14 -m venv /opt/venv-harvester \
  && /opt/venv-harvester/bin/pip install --no-cache-dir /opt/theharvester \
@@ -149,6 +156,14 @@ RUN git clone --depth 1 https://github.com/drwetter/testssl.sh /opt/testssl \
  && ln -s /opt/testssl/testssl.sh /usr/local/bin/testssl.sh
 
 
+# gitleaks (release binary; complements trufflehog with different
+# rulesets and a filesystem mode the secret-validation flow consumes).
+RUN case "$TARGETARCH" in arm64) GLARCH="arm64" ;; *) GLARCH="x64" ;; esac \
+ && GL=$(curl -s https://api.github.com/repos/gitleaks/gitleaks/releases/latest | jq -r .tag_name) \
+ && wget -q -O /tmp/gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/${GL}/gitleaks_${GL#v}_linux_${GLARCH}.tar.gz" \
+ && tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks && rm /tmp/gitleaks.tar.gz \
+ && gitleaks version 2>&1 | head -n 1
+
 # feroxbuster (project release binary per arch, no rust toolchain).
 RUN case "$TARGETARCH" in \
     arm64) FERARCH="aarch64" ;; \
@@ -157,6 +172,17 @@ RUN case "$TARGETARCH" in \
  && wget -q -O /tmp/ferox.tar.gz "https://github.com/epi052/feroxbuster/releases/latest/download/${FERARCH}-linux-feroxbuster.tar.gz" \
  && tar -xzf /tmp/ferox.tar.gz -C /usr/local/bin feroxbuster 2>/dev/null; rm -f /tmp/ferox.tar.gz; true
 
+# graphql-cop (dolevf): GraphQL security auditor our graphql module
+# corroborates against. GraphQLer (pip): dependency-aware GraphQL
+# fuzzer — chains queries/mutations by object dependency.
+RUN git clone --depth 1 https://github.com/dolevf/graphql-cop /opt/graphql-cop \
+ && pip install --no-cache-dir --break-system-packages \
+    --ignore-installed blinker -r /opt/graphql-cop/requirements.txt \
+ && printf '#!/bin/sh\nexec python3 /opt/graphql-cop/graphql-cop.py "$@"\n' > /usr/local/bin/graphql-cop \
+ && chmod +x /usr/local/bin/graphql-cop \
+ && pip install --no-cache-dir --break-system-packages GraphQLer \
+ && command -v graphql-cop >/dev/null \
+ && python3 -c "import graphqler"
 # Go httpx restore: pip dependencies ship a Python console script also
 # named `httpx`, which overwrites the ProjectDiscovery binary installed
 # earlier. Re-install Go httpx last so the scanner wins the PATH.
@@ -175,6 +201,7 @@ RUN for bin in nmap naabu nuclei ffuf httpx subfinder amass dnsx gau katana \
     sqlmap corsy smuggler trufflehog testssl.sh gobuster \
     feroxbuster droopescan cmseek maigret holehe theHarvester \
     subzy assetfinder waybackurls anew qsreplace gf chromium \
+    jsluice Gxss uro gitleaks graphql-cop \
     dig whois curl openssl; do \
     command -v "$bin" >/dev/null || echo "WARN: $bin not on PATH"; done; true
 

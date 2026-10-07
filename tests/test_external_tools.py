@@ -266,6 +266,7 @@ def test_backend_defaults_to_local(monkeypatch):
 
 def test_backend_reads_config_and_env(monkeypatch):
     monkeypatch.delenv("OSINT_TOOLS_BACKEND", raising=False)
+    monkeypatch.delenv("OSINT_TOOLS_IMAGE", raising=False)
     assert external.configure_tool_backend(
         {"tools": {"backend": "docker", "image": "custom:1"}}) == "docker"
     assert external._BACKEND["image"] == "custom:1"
@@ -281,7 +282,9 @@ def test_backend_reads_config_and_env(monkeypatch):
     external.configure_tool_backend({})
 
 
-def test_docker_run_args_rewrites_repo_paths():
+def test_docker_run_args_rewrites_repo_paths(monkeypatch):
+    monkeypatch.delenv("OSINT_TOOLS_BACKEND", raising=False)
+    monkeypatch.delenv("OSINT_TOOLS_IMAGE", raising=False)
     import os
     external.configure_tool_backend(
         {"tools": {"backend": "docker", "image": "img:t"}})
@@ -302,6 +305,8 @@ def test_docker_run_args_rewrites_repo_paths():
 
 
 def test_run_command_routes_through_docker(monkeypatch):
+    monkeypatch.delenv("OSINT_TOOLS_BACKEND", raising=False)
+    monkeypatch.delenv("OSINT_TOOLS_IMAGE", raising=False)
     external.configure_tool_backend(
         {"tools": {"backend": "docker", "image": "img:t"}})
     monkeypatch.setattr(external, "_docker_ready", lambda: True)
@@ -344,6 +349,8 @@ def test_run_command_stays_local_for_unknown_binaries(monkeypatch):
 
 
 def test_tool_available_uses_image_presence_in_docker_mode(monkeypatch):
+    monkeypatch.delenv("OSINT_TOOLS_BACKEND", raising=False)
+    monkeypatch.delenv("OSINT_TOOLS_IMAGE", raising=False)
     external.configure_tool_backend(
         {"tools": {"backend": "docker", "image": "img:t"}})
     monkeypatch.setattr(external, "_docker_ready", lambda: True)
@@ -356,6 +363,9 @@ def test_tool_available_uses_image_presence_in_docker_mode(monkeypatch):
 
 
 def test_docker_wrap_shell_passthrough_and_wrap(monkeypatch):
+    monkeypatch.delenv("OSINT_TOOLS_BACKEND", raising=False)
+    monkeypatch.delenv("OSINT_TOOLS_IMAGE", raising=False)
+    external.configure_tool_backend({})
     assert external.docker_wrap_shell("echo hello") == "echo hello"
     external.configure_tool_backend(
         {"tools": {"backend": "docker", "image": "img:t"}})
@@ -373,3 +383,49 @@ def test_docker_wrap_shell_passthrough_and_wrap(monkeypatch):
     # Non-tool commands pass through even in docker mode.
     assert external.docker_wrap_shell("whoami") == "whoami"
     external.configure_tool_backend({})
+
+
+# ── Tier-1 hunt tools: jsluice + graphql-cop ─────────────────────
+
+def test_new_tools_in_docker_contract():
+    assert {"jsluice", "gxss", "uro", "gitleaks", "graphql-cop"} <= set(
+        external.DOCKER_TOOLS)
+
+
+def test_jsluice_extracts_urls_from_bundle(monkeypatch):
+    async def fake_run(args, timeout=None, stdin_data=""):
+        assert args[:2] == ["jsluice", "urls"]
+        return {"stdout": '{"url":"https://t/api/users"}\n/api/auth/login\n',
+                "stderr": "", "exit_code": 0, "error": None}
+
+    monkeypatch.setattr(external, "tool_available", lambda name: True)
+    monkeypatch.setattr(external, "run_command", fake_run)
+    found = asyncio.run(external.jsluice_urls("var x=fetch('/api/a');"))
+    assert found == ["https://t/api/users", "/api/auth/login"]
+
+
+def test_jsluice_missing_binary_returns_empty(monkeypatch):
+    monkeypatch.setattr(external, "tool_available", lambda name: False)
+    assert asyncio.run(external.jsluice_urls("x")) == []
+
+
+def test_graphql_cop_parses_json(monkeypatch):
+    async def fake_run(args, timeout=None, stdin_data=""):
+        assert args == ["graphql-cop", "-t", "https://t/graphql",
+                        "-o", "json"]
+        return {"stdout": '{"introspection": true}',
+                "stderr": "", "exit_code": 0, "error": None}
+
+    monkeypatch.setattr(external, "tool_available", lambda name: True)
+    monkeypatch.setattr(external, "run_command", fake_run)
+    result = asyncio.run(
+        external.graphql_cop_scan("https://t/graphql"))
+    assert result["available"] is True
+    assert result["results"] == {"introspection": True}
+
+
+def test_graphql_cop_missing_binary_skips(monkeypatch):
+    monkeypatch.setattr(external, "tool_available", lambda name: False)
+    result = asyncio.run(external.graphql_cop_scan("https://t/graphql"))
+    assert result == {"available": False, "results": {},
+                      "error": "missing"}

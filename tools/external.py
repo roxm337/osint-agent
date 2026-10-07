@@ -30,6 +30,7 @@ DOCKER_TOOLS = frozenset({
     "hakrawler", "arjun", "gowitness",
     "dalfox", "sqlmap", "corsy", "smuggler",
     "subzy", "assetfinder", "waybackurls", "dig", "whois",
+    "jsluice", "gxss", "uro", "gitleaks", "graphql-cop",
 })
 
 _BACKEND = {"mode": "local", "image": "osint-tools:latest"}
@@ -1025,3 +1026,62 @@ async def naabu_scan(target: str, ports: str = "top-1000",
                     ports_found.append({"host": parts[0], "port": int(parts[1])})
     return ports_found
 
+
+
+async def jsluice_urls(js_body: str, timeout: int = 60) -> list:
+    """Extract URLs and paths from a JS bundle via jsluice (BishopFox).
+
+    The bundle body is staged to a temp file under the repo root so the
+    docker backend maps it into /work; the file is removed afterwards.
+    jsluice emits one JSON object per finding — the url field of each
+    is returned (plain-text lines pass through untouched).
+    """
+    if not tool_available("jsluice"):
+        return []
+    import tempfile
+    path = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
+                                         dir=os.getcwd()) as handle:
+            handle.write(js_body)
+            path = handle.name
+        result = await run_command(["jsluice", "urls", path],
+                                   timeout=timeout)
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    found = []
+    for line in result.get("stdout", "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except (ValueError, TypeError):
+            data = None
+        if isinstance(data, dict) and data.get("url"):
+            found.append(str(data["url"]))
+        else:
+            found.append(line)
+    return found
+
+
+async def graphql_cop_scan(endpoint: str, timeout: int = 180) -> dict:
+    """Corroborate GraphQL posture with graphql-cop (dolevf, -o json)."""
+    if not tool_available("graphql-cop"):
+        return {"available": False, "results": {}, "error": "missing"}
+    result = await run_command(
+        ["graphql-cop", "-t", endpoint, "-o", "json"], timeout=timeout)
+    try:
+        data = json.loads(result.get("stdout") or "{}")
+    except (ValueError, TypeError):
+        data = {}
+    return {
+        "available": True,
+        "results": data,
+        "exit_code": result.get("exit_code"),
+        "error": result.get("error"),
+    }
