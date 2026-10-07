@@ -91,10 +91,20 @@ def prioritize_findings(findings: list[dict], scoring_config: dict | None = None
             "confidence_discount": CONFIDENCE_DISCOUNT.get(confidence, 0.55)
             if not confirmed else 1.0,
         }
-        severity = _max_severity(
-            finding.get("severity", "INFO"),
-            _severity_from_score(score),
-        )
+        # Severity rewrites need intelligence behind them. A KEV flag or
+        # a CVSS/EPSS number can promote (HIGH/FIRM + KEV → CRITICAL),
+        # but exposure alone must not: a verified LOW on the main webapp
+        # otherwise auto-promotes to MEDIUM on every run (LOW × 1.0 +
+        # asset and verified bumps cross the 40 line), defeating the
+        # module's class judgment that hygiene stays LOW. Score and
+        # priority still order it; severity stays as filed.
+        if cvss or epss or kev:
+            severity = _max_severity(
+                finding.get("severity", "INFO"),
+                _severity_from_score(score),
+            )
+        else:
+            severity = str(finding.get("severity", "INFO") or "INFO").upper()
         if not confirmed and severity == "CRITICAL":
             severity = "HIGH"
         finding["severity"] = severity

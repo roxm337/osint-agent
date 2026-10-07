@@ -122,30 +122,39 @@ class OriginDiscovery(BaseModule):
                 likely.append({**candidate, "proof": proof})
 
         if confirmed:
-            self.state.add_finding(
-                title=f"Origin IP Discovered Behind {cdn_detected.title() + ' ' if cdn_detected else ''}CDN".replace("  ", " ").strip(),
-                severity="HIGH",
-                confidence="CONFIRMED",
-                category="CDN Bypass",
-                description=(
-                    f"Real origin server IP(s) serve byte-identical content to "
-                    f"the CDN baseline or present a certificate covering "
-                    f"{self.domain}: "
-                    f"{[c['ip'] for c in confirmed]}. "
-                    f"Direct access bypasses WAF/CDN protections and rate limiting."
-                ),
-                evidence=[
-                    f"{c['ip']} (source: {c['source']}; {c['proof']})"
-                    for c in confirmed
-                ],
-                remediation=(
-                    "Restrict origin server to only accept connections from CDN IP ranges. "
-                    "Implement firewall rules blocking direct access from non-CDN sources."
-                ),
-                verified=True,
-                verification={"method": "origin_content_or_cert",
-                              "url": self.base_url},
-            )
+            if not cdn_detected:
+                # Direct hosting: the "origin" is the site's own address,
+                # confirmed trivially. There is no CDN to bypass, so the
+                # HIGH finding and its firewall remediation would be
+                # vacuous — the ip asset above already records the mapping.
+                self.log("  Direct hosting (no CDN in front): candidate IPs "
+                         "are the site's own addresses, not a bypass — "
+                         "no finding filed")
+            else:
+                self.state.add_finding(
+                    title=f"Origin IP Discovered Behind {cdn_detected.title() + ' ' if cdn_detected else ''}CDN".replace("  ", " ").strip(),
+                    severity="HIGH",
+                    confidence="CONFIRMED",
+                    category="CDN Bypass",
+                    description=(
+                        f"Real origin server IP(s) serve byte-identical content to "
+                        f"the CDN baseline or present a certificate covering "
+                        f"{self.domain}: "
+                        f"{[c['ip'] for c in confirmed]}. "
+                        f"Direct access bypasses WAF/CDN protections and rate limiting."
+                    ),
+                    evidence=[
+                        f"{c['ip']} (source: {c['source']}; {c['proof']})"
+                        for c in confirmed
+                    ],
+                    remediation=(
+                        "Restrict origin server to only accept connections from CDN IP ranges. "
+                        "Implement firewall rules blocking direct access from non-CDN sources."
+                    ),
+                    verified=True,
+                    verification={"method": "origin_content_or_cert",
+                                  "url": self.base_url},
+                )
         if likely:
             self.state.add_finding(
                 title=f"Likely Origin IP(s) (Unconfirmed): {len(likely)} candidate(s)",

@@ -558,6 +558,61 @@ def test_kev_adjacent_and_nvd_are_medium_leads():
 
 # ── MEDIUM wave: observations verified, names demoted ──
 
+def test_verified_low_on_webapp_stays_low_without_intel():
+    from core.prioritization import prioritize_findings
+    findings = [{
+        "id": "F-1", "title": "Missing Security Headers", "severity": "LOW",
+        "confidence": "CONFIRMED", "category": "Hardening Deficiency",
+        "asset_keys": ["webapp:https://example.test"],
+        "verified": True,
+        "verification": {"method": "response_headers_observed"},
+        "created_at": "2026-01-01",
+    }]
+    out = prioritize_findings(findings)
+    assert out[0]["severity"] == "LOW", \
+        "exposure alone must not rewrite the module's class judgment"
+    assert out[0]["risk_score"] >= 15
+
+
+def test_intel_backed_upgrade_still_promotes():
+    from core.prioritization import prioritize_findings
+    findings = [{
+        "id": "F-1", "title": "KEV-listed CVE", "severity": "HIGH",
+        "confidence": "FIRM", "category": "Exploit Intelligence",
+        "asset_keys": ["webapp:https://example.test"],
+        "intelligence": {"cvss": 9.8, "epss": 0.8, "kev": True},
+        "created_at": "2026-01-01",
+    }]
+    assert prioritize_findings(findings)[0]["severity"] == "CRITICAL"
+
+
+def test_origin_skips_high_on_direct_hosting():
+    import modules.origin_discovery as od
+    from modules.origin_discovery import OriginDiscovery
+    state = _state()
+    module = OriginDiscovery(state, _config())
+
+    async def fake_curl(url, **kwargs):
+        return {"status": 200, "body": "x" * 300,
+                "headers": "server: nginx"}
+
+    async def fake_gather(self, cdn):
+        assert cdn is None
+        return [{"ip": "1.2.3.4", "source": "subdomain:api.example.test"}]
+
+    async def fake_verify(self, ip, base_hash):
+        return ("confirmed", "byte-identical body")
+
+    with patch.object(od, "curl", new=fake_curl), \
+         patch.object(OriginDiscovery, "_gather_candidates",
+                      new=fake_gather), \
+         patch.object(OriginDiscovery, "_verify_origin",
+                      new=fake_verify):
+        _run(module.run())
+    assert not [f for f in state.findings["findings"]
+                if "Origin IP Discovered Behind" in f["title"]], \
+        "direct hosting has no CDN to bypass — the asset suffices"
+
 def test_sensitive_param_names_are_low_inventory():
     from modules.parameter_discovery import ParameterDiscovery
     import tempfile
