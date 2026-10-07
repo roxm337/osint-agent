@@ -1,7 +1,10 @@
 """Wrappers for optional external pentest tools."""
 
 import asyncio
+import base64
 import json
+import os
+import shlex
 import re
 import shutil
 import subprocess
@@ -10,7 +13,139 @@ from urllib.parse import parse_qsl, urlparse
 from typing import List, Optional
 
 
+# ── Tool backend: local binaries or the docker toolchain image ──────
+#
+# Default is local (zero behavior change). With tools.backend=docker
+# (config `tools:` section or OSINT_TOOLS_BACKEND=docker), every binary
+# in DOCKER_TOOLS runs inside the image instead: `docker run --rm`
+# with the repo root mounted at /work, so file outputs land back in
+# reports/ exactly like a local run. Teammates then need only Python
+# and Docker — never the toolchain itself.
+
+DOCKER_TOOLS = frozenset({
+    "nmap", "naabu", "masscan", "nuclei", "ffuf", "httpx",
+    "subfinder", "amass", "dnsx", "gau", "katana",
+    "searchsploit", "trufflehog", "testssl.sh", "wpscan",
+    "nikto", "whatweb", "gobuster", "feroxbuster",
+    "hakrawler", "arjun", "gowitness",
+    "dalfox", "sqlmap", "corsy", "smuggler",
+    "subzy", "assetfinder", "waybackurls", "dig", "whois",
+})
+
+_BACKEND = {"mode": "local", "image": "osint-tools:latest"}
+_DOCKER_OK: bool | None = None
+
+
+def configure_tool_backend(config: dict | None = None) -> str:
+    """Select the tool backend from config, env wins. Returns the mode."""
+    global _DOCKER_OK
+    tools_cfg = (config or {}).get("tools", {}) or {}
+    mode = str(os.environ.get("OSINT_TOOLS_BACKEND", "")
+               or tools_cfg.get("backend", "local")).strip().lower()
+    image = str(os.environ.get("OSINT_TOOLS_IMAGE", "")
+                or tools_cfg.get("image", "osint-tools:latest")).strip()
+    _BACKEND["mode"] = mode if mode in ("local", "docker") else "local"
+    _BACKEND["image"] = image or "osint-tools:latest"
+    _DOCKER_OK = None
+    return _BACKEND["mode"]
+
+
+def tool_backend() -> str:
+    """Current backend mode ("local" unless configured otherwise)."""
+    return _BACKEND["mode"]
+
+
+def _docker_ready() -> bool:
+    """The image resolves locally. Cached per process; restart to re-check."""
+    global _DOCKER_OK
+    if _DOCKER_OK is not None:
+        return _DOCKER_OK
+    try:
+        proc = subprocess.run(
+            ["docker", "image", "inspect", _BACKEND["image"]],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+        _DOCKER_OK = proc.returncode == 0
+    except Exception:
+        _DOCKER_OK = False
+    return _DOCKER_OK
+
+
+def _docker_wants(args: List[str]) -> bool:
+    return (_BACKEND["mode"] == "docker" and bool(args)
+            and str(args[0]) in DOCKER_TOOLS and _docker_ready())
+
+
+def _rewrite_arg(arg: str, cwd: str) -> str:
+    """Map a host path under the repo root to its /work twin inside."""
+    if not arg or arg.startswith("-") or "://" in arg:
+        return arg
+    try:
+        path = Path(arg)
+        if not path.is_absolute():
+            candidate = Path(cwd) / arg
+            if candidate.exists():
+                return f"/work/{candidate.relative_to(cwd).as_posix()}"
+            return arg
+        try:
+            return f"/work/{path.relative_to(cwd).as_posix()}"
+        except ValueError:
+            return arg
+    except Exception:
+        return arg
+
+
+def docker_run_args(args: List[str], stdin: bool = False) -> List[str]:
+    """Wrap a tool invocation for the container. Pure function (testable)."""
+    cwd = os.getcwd()
+    cmd = ["docker", "run", "--rm"]
+    if stdin:
+        cmd.append("-i")
+    # argv form (no shell): the space in the path is safe as one element.
+    cmd += ["-v", f"{cwd}:/work", "-w", "/work",
+            "--network", "bridge", _BACKEND["image"]]
+    return cmd + [_rewrite_arg(str(a), cwd) for a in args]
+
+
+def _shell_tool(command: str) -> str:
+    """Which baked binary a shell one-liner actually invokes, if any."""
+    padded = f" {command} "
+    for tool in DOCKER_TOOLS:
+        if (padded.startswith(f" {tool} ")
+                or f"| {tool} " in padded
+                or f"|| {tool} " in padded):
+            return tool
+    return ""
+
+
+def docker_wrap_shell(command: str) -> str:
+    """Wrap a shell one-liner for the container (wrappers.py helpers).
+
+    Local mode returns the command untouched. Docker mode base64s it
+    through stdin so no quoting layer can corrupt pipes, quotes, or
+    redirects — the container shell receives the exact bytes.
+    """
+    if _BACKEND["mode"] != "docker" or not _docker_ready():
+        return command
+    if not _shell_tool(command):
+        return command
+    encoded = base64.b64encode(command.encode()).decode()
+    cwd = os.getcwd()
+    # Host paths under the repo root mean /work paths inside.
+    pinned = command.replace(cwd, "/work")
+    if pinned != command:
+        encoded = base64.b64encode(pinned.encode()).decode()
+    # shlex.quote: repo paths routinely contain spaces.
+    volume = shlex.quote(f"{cwd}:/work")
+    return (f"printf %s {encoded} | base64 -d | docker run --rm -i "
+            f"-v {volume} -w /work --network bridge "
+            f"{_BACKEND['image']} sh")
+
+
 def tool_available(name: str) -> bool:
+    if _BACKEND["mode"] == "docker" and name in DOCKER_TOOLS:
+        return _docker_ready()
     return shutil.which(name) is not None
 
 
@@ -24,11 +159,17 @@ def tools_available() -> dict:
         "hakrawler", "arjun", "paramspider", "gowitness",
         "dalfox", "sqlmap", "corsy", "smuggler", "openredirex",
     ]
-    return {t: shutil.which(t) is not None for t in tools}
+    return {t: tool_available(t) for t in tools}
 
 async def run_command(args: List[str], timeout: int = 120,
                       stdin_data: str = "") -> dict:
-    """Run a command without shell interpolation."""
+    """Run a command without shell interpolation.
+
+    Docker backend: tool binaries run inside the toolchain image with
+    the repo mounted at /work, so outputs land back in reports/.
+    """
+    if _docker_wants(args):
+        args = docker_run_args(args, stdin=bool(stdin_data))
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,

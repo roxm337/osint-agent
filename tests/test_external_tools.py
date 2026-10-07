@@ -253,3 +253,123 @@ def test_parse_cms_text_findings():
 
     assert results == [{"evidence": "Outdated version detected"}]
 
+
+
+# ── Docker tool backend ──────────────────────────────────────────
+
+def test_backend_defaults_to_local(monkeypatch):
+    monkeypatch.delenv("OSINT_TOOLS_BACKEND", raising=False)
+    monkeypatch.delenv("OSINT_TOOLS_IMAGE", raising=False)
+    assert external.configure_tool_backend({}) == "local"
+    assert external.configure_tool_backend(None) == "local"
+
+
+def test_backend_reads_config_and_env(monkeypatch):
+    monkeypatch.delenv("OSINT_TOOLS_BACKEND", raising=False)
+    assert external.configure_tool_backend(
+        {"tools": {"backend": "docker", "image": "custom:1"}}) == "docker"
+    assert external._BACKEND["image"] == "custom:1"
+    monkeypatch.setenv("OSINT_TOOLS_BACKEND", "local")
+    assert external.configure_tool_backend(
+        {"tools": {"backend": "docker"}}) == "local"
+    monkeypatch.setenv("OSINT_TOOLS_BACKEND", "docker")
+    monkeypatch.setenv("OSINT_TOOLS_IMAGE", "img:2")
+    assert external.configure_tool_backend({}) == "docker"
+    assert external._BACKEND["image"] == "img:2"
+    monkeypatch.delenv("OSINT_TOOLS_BACKEND", raising=False)
+    monkeypatch.delenv("OSINT_TOOLS_IMAGE", raising=False)
+    external.configure_tool_backend({})
+
+
+def test_docker_run_args_rewrites_repo_paths():
+    import os
+    external.configure_tool_backend(
+        {"tools": {"backend": "docker", "image": "img:t"}})
+    cwd = os.getcwd()
+    args = external.docker_run_args(
+        ["ffuf", "-u", "https://t/FUZZ", "-o", f"{cwd}/reports/x.json",
+         "-w", "/usr/share/seclists/rockyou.txt"], stdin=False)
+    assert args[:3] == ["docker", "run", "--rm"]
+    assert "-i" not in args
+    assert f"{cwd}:/work" in args
+    assert f"/work/reports/x.json" in args
+    # Outside the repo: passed through untouched.
+    assert "/usr/share/seclists/rockyou.txt" in args
+    assert "https://t/FUZZ" in args
+    args_in = external.docker_run_args(["nuclei", "-l", "t.txt"], stdin=True)
+    assert "-i" in args_in
+    external.configure_tool_backend({})
+
+
+def test_run_command_routes_through_docker(monkeypatch):
+    external.configure_tool_backend(
+        {"tools": {"backend": "docker", "image": "img:t"}})
+    monkeypatch.setattr(external, "_docker_ready", lambda: True)
+    seen = {}
+
+    async def fake_exec(*args, **kwargs):
+        seen["args"] = args
+        class P:
+            returncode = 0
+            async def communicate(self, input=None):
+                return (b"out", b"")
+        return P()
+
+    monkeypatch.setattr(external.asyncio, "create_subprocess_exec", fake_exec)
+    result = asyncio.run(external.run_command(["nuclei", "-version"]))
+    assert seen["args"][0] == "docker"
+    assert "img:t" in seen["args"]
+    assert result["stdout"] == "out"
+    external.configure_tool_backend({})
+
+
+def test_run_command_stays_local_for_unknown_binaries(monkeypatch):
+    external.configure_tool_backend(
+        {"tools": {"backend": "docker", "image": "img:t"}})
+    monkeypatch.setattr(external, "_docker_ready", lambda: True)
+    seen = {}
+
+    async def fake_exec(*args, **kwargs):
+        seen["args"] = args
+        class P:
+            returncode = 0
+            async def communicate(self, input=None):
+                return (b"out", b"")
+        return P()
+
+    monkeypatch.setattr(external.asyncio, "create_subprocess_exec", fake_exec)
+    asyncio.run(external.run_command(["definitely-not-a-tool-zzz", "x"]))
+    assert seen["args"][0] == "definitely-not-a-tool-zzz"
+    external.configure_tool_backend({})
+
+
+def test_tool_available_uses_image_presence_in_docker_mode(monkeypatch):
+    external.configure_tool_backend(
+        {"tools": {"backend": "docker", "image": "img:t"}})
+    monkeypatch.setattr(external, "_docker_ready", lambda: True)
+    assert external.tool_available("nuclei") is True
+    monkeypatch.setattr(external, "_docker_ready", lambda: False)
+    assert external.tool_available("nuclei") is False
+    # Non-baked binaries still resolve locally.
+    assert external.tool_available("definitely-not-a-tool-zzz") is False
+    external.configure_tool_backend({})
+
+
+def test_docker_wrap_shell_passthrough_and_wrap(monkeypatch):
+    assert external.docker_wrap_shell("echo hello") == "echo hello"
+    external.configure_tool_backend(
+        {"tools": {"backend": "docker", "image": "img:t"}})
+    monkeypatch.setattr(external, "_docker_ready", lambda: True)
+    wrapped = external.docker_wrap_shell(
+        "echo 'a' | httpx -silent -json 2>/dev/null")
+    assert wrapped.startswith("printf %s ")
+    assert "docker run --rm -i" in wrapped
+    assert "img:t sh" in wrapped
+    # Round-trips byte-identically through base64.
+    import base64
+    payload = wrapped.split("printf %s ", 1)[1].split(" | base64", 1)[0]
+    assert base64.b64decode(payload).decode() == \
+        "echo 'a' | httpx -silent -json 2>/dev/null"
+    # Non-tool commands pass through even in docker mode.
+    assert external.docker_wrap_shell("whoami") == "whoami"
+    external.configure_tool_backend({})

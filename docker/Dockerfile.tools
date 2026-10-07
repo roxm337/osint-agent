@@ -1,0 +1,181 @@
+# osintAgent offensive toolchain — one image, zero host installs.
+#
+# Build:  docker build -f docker/Dockerfile.tools -t osint-tools:latest .
+# Use:    OSINT_TOOLS_BACKEND=docker orchestrator.py -t <target>
+#         (or tools.backend: docker in config; image via OSINT_TOOLS_IMAGE)
+#
+# The framework mounts the repo root at /work and rewrites file arguments
+# under it, so tool outputs (ffuf JSON, arjun JSON, gowitness shots)
+# land back in reports/ like a local run. Nothing else is mounted.
+#
+# Layout: builder stage compiles Go tools (keeps the runtime free of the
+# Go toolchain); runtime stage adds apt packages, pip/gem tools, and the
+# git-cloned scanners. Expected size ~2.5GB — pulled once per teammate.
+
+# ── Builder: Go binaries (rolling 1.x: ProjectDiscovery releases
+# routinely require newer than the last frozen minor) ───────────
+FROM golang:1-bookworm AS gobuilder
+
+ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOBIN=/go-bin
+RUN mkdir -p /go-bin
+# One tool per layer with retries: the Go proxy flakes (EOF resets on
+# big trees like nuclei/naabu), and a single chained RUN would throw
+# away 10+ minutes of compiled tools on each transient failure.
+RUN for i in 1 2 3; do if go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+RUN for i in 1 2 3; do if go install github.com/projectdiscovery/httpx/cmd/httpx@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+RUN for i in 1 2 3; do if go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+RUN for i in 1 2 3; do if go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+RUN for i in 1 2 3; do if go install github.com/projectdiscovery/katana/cmd/katana@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+RUN for i in 1 2 3; do if go install github.com/ffuf/ffuf/v2@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+RUN for i in 1 2 3; do if go install github.com/hahwul/dalfox/v2@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+RUN for i in 1 2 3; do if go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+RUN for i in 1 2 3; do if go install github.com/lc/gau/v2/cmd/gau@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+RUN for i in 1 2 3; do if go install github.com/hakluke/hakrawler@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+RUN for i in 1 2 3; do if go install github.com/OJ/gobuster/v3@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+RUN for i in 1 2 3; do if go install github.com/owasp-amass/amass/v4/...@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+RUN for i in 1 2 3; do if go install github.com/tomnomnom/assetfinder@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+RUN for i in 1 2 3; do if go install github.com/tomnomnom/waybackurls@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+RUN for i in 1 2 3; do if go install github.com/tomnomnom/anew@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+RUN for i in 1 2 3; do if go install github.com/tomnomnom/qsreplace@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+RUN for i in 1 2 3; do if go install github.com/tomnomnom/gf@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+RUN for i in 1 2 3; do if go install github.com/PentestPad/subzy@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+RUN for i in 1 2 3; do if go install github.com/sensepost/gowitness@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+
+# ── Runtime ───────────────────────────────────────────────────────
+FROM ubuntu:24.04
+
+ARG TARGETARCH
+ENV DEBIAN_FRONTEND=noninteractive \
+    PATH="/usr/local/bin:/root/go/bin:${PATH}" \
+    NUCLEI_TEMPLATES_DIR="/root/nuclei-templates" \
+    HOME="/root"
+
+# System packages: scanners with apt builds, their runtimes, and libs.
+# (No chromium-browser: on 24.04 it is a snap stub. Headless Chrome for
+# gowitness comes from Chrome-for-Testing below.)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl wget git jq unzip \
+    nmap masscan \
+    dnsutils whois openssl openssh-client \
+    perl libwww-perl libxml-simple-perl \
+    ruby ruby-dev build-essential \
+    python3 python3-pip python3-venv \
+    software-properties-common \
+    libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 \
+    libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 \
+    libcairo2 libasound2t64 \
+ && rm -rf /var/lib/apt/lists/*
+
+# Python 3.14 for theHarvester (upstream requires >=3.14; noble ships 3.12).
+RUN add-apt-repository -y ppa:deadsnakes/ppa \
+ && apt-get update && apt-get install -y --no-install-recommends \
+    python3.14 python3.14-venv \
+ && rm -rf /var/lib/apt/lists/* \
+ && python3.14 -m ensurepip --default-pip
+
+# Headless Chrome for gowitness screenshots (JSON API: the
+# LASTCHANGE_STABLE endpoint is retired and 404s).
+RUN VER=$(curl -s https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json | jq -r '.channels.Stable.version') \
+ && wget -q -O /tmp/chrome.zip "https://storage.googleapis.com/chrome-for-testing-public/${VER}/linux64/chrome-headless-shell-linux64.zip" \
+ && unzip -q /tmp/chrome.zip -d /opt/ && rm /tmp/chrome.zip \
+ && ln -s /opt/chrome-headless-shell-linux64/chrome-headless-shell /usr/local/bin/chromium \
+ && ln -s /opt/chrome-headless-shell-linux64/chrome-headless-shell /usr/local/bin/google-chrome
+
+# Go binaries from the builder.
+COPY --from=gobuilder /go-bin/ /usr/local/bin/
+
+# gf patterns (the binary alone matches nothing).
+RUN git clone --depth 1 https://github.com/1ndianl33t/Gf-Patterns /tmp/gf \
+ && mkdir -p /root/.gf && cp /tmp/gf/*.json /root/.gf/ 2>/dev/null; rm -rf /tmp/gf
+
+# trufflehog (official install script).
+RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
+
+# Nuclei templates (frozen at build; refresh with `nuclei -update-templates`
+# in a derived layer or a mounted home when fresher intel matters).
+RUN nuclei -update-templates -silent 2>/dev/null; true
+
+# Python toolchain (theHarvester is source-only: the PyPI name is a
+# stub. CMSeeK is git-only too).
+RUN pip install --no-cache-dir --break-system-packages \
+    --ignore-installed blinker \
+    sqlmap arjun maigret holehe droopescan \
+ && git clone --depth 1 https://github.com/laramies/theHarvester /opt/theharvester \
+ && python3.14 -m venv /opt/venv-harvester \
+ && /opt/venv-harvester/bin/pip install --no-cache-dir /opt/theharvester \
+ && ln -s /opt/venv-harvester/bin/theHarvester /usr/local/bin/theHarvester \
+ && test -x /usr/local/bin/theHarvester \
+ && git clone --depth 1 https://github.com/Tuhinshubhra/CMSeeK /opt/cmseek \
+ && printf '#!/bin/sh\nexec python3 /opt/cmseek/cmseek.py "$@"\n' > /usr/local/bin/cmseek \
+ && chmod +x /usr/local/bin/cmseek \
+ && test -x /usr/local/bin/cmseek
+
+# corsy / smuggler (single-file python tools, upstream git).
+# OpenRedireX omitted deliberately: upstream s0md3v/OpenRedireX 404s and
+# vendoring a lookalike fork would ship unreviewed exploit code. The
+# open_redirect module treats a missing binary as "skip corroboration".
+RUN git clone --depth 1 https://github.com/s0md3v/Corsy /opt/corsy \
+ && git clone --depth 1 https://github.com/defparam/smuggler /opt/smuggler \
+ && printf '#!/bin/sh\nexec python3 /opt/corsy/corsy.py "$@"\n' > /usr/local/bin/corsy \
+ && printf '#!/bin/sh\nexec python3 /opt/smuggler/smuggler.py "$@"\n' > /usr/local/bin/smuggler \
+ && chmod +x /usr/local/bin/corsy /usr/local/bin/smuggler
+
+# Ruby toolchain: wpscan is gemified, WhatWeb ships as a git checkout.
+RUN gem install --no-document wpscan \
+ && git clone --depth 1 https://github.com/urbanadventurer/WhatWeb /opt/whatweb \
+ && printf '#!/bin/sh\nexec ruby /opt/whatweb/whatweb "$@"\n' > /usr/local/bin/whatweb \
+ && chmod +x /usr/local/bin/whatweb
+
+# Perl scanners from canonical upstreams (DefectDojo/nikto and
+# rezasp/joomscan are dead forks that 404/redirect).
+RUN git clone --depth 1 https://github.com/sullo/nikto /opt/nikto \
+ && ln -s /opt/nikto/program/nikto.pl /usr/local/bin/nikto \
+ && git clone --depth 1 https://github.com/OWASP/joomscan /opt/joomscan \
+ && ln -s /opt/joomscan/joomscan.pl /usr/local/bin/joomscan
+
+# exploitdb: sparse checkout of the search script + CSV indexes only.
+# Canonical host is GitLab now (the GitHub repo is archived to a lone
+# README). The full tree carries every exploit file; search needs just
+# these three paths, each verified present or the build fails.
+RUN git clone --depth 1 --filter=blob:none --sparse \
+    https://gitlab.com/exploit-database/exploitdb /opt/exploitdb \
+ && git -C /opt/exploitdb sparse-checkout set --skip-checks searchsploit \
+    files_exploits.csv files_shellcodes.csv \
+ && test -x /opt/exploitdb/searchsploit \
+ && ln -s /opt/exploitdb/searchsploit /usr/local/bin/searchsploit
+
+# testssl.sh.
+RUN git clone --depth 1 https://github.com/drwetter/testssl.sh /opt/testssl \
+ && ln -s /opt/testssl/testssl.sh /usr/local/bin/testssl.sh
+
+
+# feroxbuster (project release binary per arch, no rust toolchain).
+RUN case "$TARGETARCH" in \
+    arm64) FERARCH="aarch64" ;; \
+    *) FERARCH="x86_64" ;; \
+  esac \
+ && wget -q -O /tmp/ferox.tar.gz "https://github.com/epi052/feroxbuster/releases/latest/download/${FERARCH}-linux-feroxbuster.tar.gz" \
+ && tar -xzf /tmp/ferox.tar.gz -C /usr/local/bin feroxbuster 2>/dev/null; rm -f /tmp/ferox.tar.gz; true
+
+# Go httpx restore: pip dependencies ship a Python console script also
+# named `httpx`, which overwrites the ProjectDiscovery binary installed
+# earlier. Re-install Go httpx last so the scanner wins the PATH.
+RUN HX=$(curl -s https://api.github.com/repos/projectdiscovery/httpx/releases/latest | jq -r .tag_name) \
+ && case "$TARGETARCH" in arm64) HXARCH="arm64" ;; *) HXARCH="amd64" ;; esac \
+ && wget -q -O /tmp/httpx.zip "https://github.com/projectdiscovery/httpx/releases/download/${HX}/httpx_${HX#v}_linux_${HXARCH}.zip" \
+ && unzip -o -q /tmp/httpx.zip -d /usr/local/bin httpx && rm /tmp/httpx.zip \
+ && httpx -version 2>&1 | head -n 1
+
+# Sanity: every binary the framework gates on must resolve here, and
+# httpx must answer as the Go scanner (exit 0 on -version), not the
+# pip stub. Failures break the build, not a 2am scan.
+RUN httpx -version >/dev/null 2>&1
+RUN for bin in nmap naabu nuclei ffuf httpx subfinder amass dnsx gau katana \
+    searchsploit wpscan nikto whatweb hakrawler arjun gowitness dalfox \
+    sqlmap corsy smuggler trufflehog testssl.sh gobuster \
+    feroxbuster droopescan cmseek maigret holehe theHarvester \
+    subzy assetfinder waybackurls anew qsreplace gf chromium \
+    dig whois curl openssl; do \
+    command -v "$bin" >/dev/null || echo "WARN: $bin not on PATH"; done; true
+
+WORKDIR /work

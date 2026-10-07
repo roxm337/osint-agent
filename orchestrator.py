@@ -16,6 +16,7 @@ from tools.wrappers import (
     close_engine, configure_http_limiter, configure_http_session, curl_with_status,
     engine_stats,
 )
+from tools.external import configure_tool_backend
 from core.attack_graph import AttackGraph, AttackPath
 from core.surface import seed_surface
 from core.budget_manager import BudgetManager, BudgetExceededError
@@ -205,6 +206,7 @@ class Orchestrator:
             max_per_minute=rl.get("per_minute", 60),
         )
         configure_http_session(self.config)
+        configure_tool_backend(self.config)
 
         print(f"\n{'='*60}")
         print(f"  OSINT Agent — {self.target}")

@@ -13,6 +13,8 @@ from urllib.parse import quote, urlencode
 
 from tools import http_engine as _http_engine_mod
 from tools.http_engine import HttpEngine
+from tools.external import docker_wrap_shell
+from tools.external import tool_available as _tool_available
 
 # Pooled aiohttp engine. Created lazily on first request and reused for the
 # whole run so connections (and TLS handshakes) are shared across modules.
@@ -144,7 +146,13 @@ def configure_http_limiter(max_concurrent: int = 5, max_per_minute: int = 60):
 
 
 async def bash(command: str, timeout: int = 120) -> dict:
-    """Execute a shell command with timeout. Returns {stdout, stderr, exit_code}."""
+    """Execute a shell command with timeout. Returns {stdout, stderr, exit_code}.
+
+    Docker tool backend: commands invoking a baked binary are transparently
+    re-routed into the toolchain image (repo mounted at /work); anything
+    else runs locally as before.
+    """
+    command = docker_wrap_shell(command)
     try:
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -1000,7 +1008,7 @@ async def ssl_scan(host: str, port: int = 443) -> dict:
 
     result = {"host": host, "port": port, "certificate": cert, "protocols": protocols}
 
-    if shutil.which("testssl.sh"):
+    if _tool_available("testssl.sh"):
         ts = await bash(
             f"testssl.sh --quiet --color 0 --jsonfile /dev/stdout {host}:{port} 2>/dev/null",
             timeout=120
@@ -1029,7 +1037,7 @@ async def check_host(host: str, port: int = 443) -> dict:
 async def httpx_probe(targets: list, timeout: int = 10) -> list:
     """Probe targets with httpx for HTTP service fingerprinting."""
     import shutil
-    if not shutil.which("httpx"):
+    if not _tool_available("httpx"):
         return []
     targets_str = "\n".join(targets)
     result = await bash(
@@ -1051,7 +1059,7 @@ async def httpx_probe(targets: list, timeout: int = 10) -> list:
 async def gau_urls(domain: str, timeout: int = 60) -> list:
     """Get All URLs via gau (GetAllUrls) — scrapes Wayback, OTX, CommonCrawl."""
     import shutil
-    if not shutil.which("gau"):
+    if not _tool_available("gau"):
         return []
     result = await bash(
         f"gau --subs {domain} --threads 5 --timeout 30 2>/dev/null",
@@ -1063,7 +1071,7 @@ async def gau_urls(domain: str, timeout: int = 60) -> list:
 async def subfinder_scan(domain: str, timeout: int = 60) -> list:
     """Run subfinder passive subdomain enumeration."""
     import shutil
-    if not shutil.which("subfinder"):
+    if not _tool_available("subfinder"):
         return []
     result = await bash(
         f"subfinder -d {domain} -silent -all 2>/dev/null",
@@ -1076,7 +1084,7 @@ async def subfinder_scan(domain: str, timeout: int = 60) -> list:
 async def amass_passive(domain: str, timeout: int = 120) -> list:
     """Run amass passive subdomain enumeration."""
     import shutil
-    if not shutil.which("amass"):
+    if not _tool_available("amass"):
         return []
     result = await bash(
         f"amass enum -passive -d {domain} -nocolor 2>/dev/null",
@@ -1089,7 +1097,7 @@ async def amass_passive(domain: str, timeout: int = 120) -> list:
 async def dnsx_resolve(hostnames: list, timeout: int = 60) -> dict:
     """Bulk DNS resolution via dnsx — faster than dig for large lists."""
     import shutil
-    if not shutil.which("dnsx"):
+    if not _tool_available("dnsx"):
         return {}
     input_str = "\n".join(hostnames)
     result = await bash(
@@ -1114,7 +1122,7 @@ async def dnsx_resolve(hostnames: list, timeout: int = 60) -> dict:
 async def trufflehog_scan(target: str, timeout: int = 120) -> list:
     """Run trufflehog for secret scanning against a URL or filesystem path."""
     import shutil
-    if not shutil.which("trufflehog"):
+    if not _tool_available("trufflehog"):
         return []
     result = await bash(
         f"trufflehog git --repo={target} --json --no-update 2>/dev/null || "

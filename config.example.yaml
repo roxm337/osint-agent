@@ -1,5 +1,17 @@
 # OSINT Agent Configuration
 
+# External tool backend: where scanner binaries run.
+#   local (default) — use binaries installed on this machine.
+#   docker — run every baked binary inside the toolchain image instead.
+#     Teammates then need only Python and Docker: no nmap/nuclei/sqlmap/
+#     wpscan installs. The repo root mounts at /work in the container,
+#     so tool outputs land back in reports/ like a local run.
+#     Build once: docker build -f docker/Dockerfile.tools -t osint-tools:latest .
+# Env overrides (win over this file): OSINT_TOOLS_BACKEND, OSINT_TOOLS_IMAGE.
+tools:
+  backend: "local"            # local | docker
+  image: "osint-tools:latest"
+
 target:
   domain: ""  # Set via CLI or prompt
   mode: "deep"  # passive | active | deep

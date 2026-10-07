@@ -9,6 +9,7 @@ from core.keyvault import KeyVault
 from core.verification_oracle import configure_oob
 from state.manager import StateManager
 from tools.wrappers import bash, configure_http_session, curl, dig, whois_lookup
+from tools.external import configure_tool_backend
 
 logger = logging.getLogger("osint-agent")
 
@@ -33,6 +34,7 @@ class BaseModule:
         self.output_dir = Path(config.get("paths", {}).get("output_dir", "reports"))
         self.keys = KeyVault(config)
         configure_http_session(config)
+        configure_tool_backend(config)
         configure_oob(config)
 
     @property
