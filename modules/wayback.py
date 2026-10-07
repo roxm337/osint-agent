@@ -160,12 +160,13 @@ class WaybackMachine(BaseModule):
             if secret_shaped:
                 self.state.add_finding(
                     title="Live URLs With Secret-Shaped Parameter Values",
-                    severity="HIGH",
+                    severity="MEDIUM",
                     confidence="FIRM",
                     category="Credential Exposure",
                     description=(
                         f"{len(secret_shaped)} currently reachable URL(s) carry "
-                        "secret-shaped parameter values. Rotate them; never "
+                        "secret-shaped parameter values. Shape is not proof "
+                        "a credential works — rotate on suspicion and never "
                         "pass secrets in URL parameters."),
                     evidence=[f"{url} :: {', '.join(vals)}"
                               for url, vals in list(secret_shaped.items())[:10]],

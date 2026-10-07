@@ -752,7 +752,7 @@ class JSAnalysis(BaseModule):
             self.state.add_finding(
                 title=f"Attacker-Controlled Source Reaches a DOM Sink: "
                       f"{len(unique_dom_flows)} flow(s)",
-                severity="HIGH",
+                severity="MEDIUM",
                 confidence="TENTATIVE",
                 category="Client-Side Attack Surface",
                 description=(
@@ -761,7 +761,8 @@ class JSAnalysis(BaseModule):
                     f"postMessage data) and write it to a DOM sink. A flow is "
                     f"source-reachable in the same statement, not a confirmed "
                     f"XSS: sanitisation, encoding or a framework escape may sit "
-                    f"in between. These are the sinks worth reading first."
+                    f"in between. A prioritised reading list, not a "
+                    f"vulnerability — confirm execution before escalating."
                 ),
                 evidence=[
                     f"{f['src']} -> {f['sink']} in "

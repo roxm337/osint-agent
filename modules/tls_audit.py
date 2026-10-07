@@ -302,6 +302,9 @@ class TLSAudit(BaseModule):
                 evidence=["nmap ssl-ccs-injection: VULNERABLE"],
                 remediation="Update OpenSSL; disable session ticket CCS.",
                 asset_keys=[f"domain:{host}"],
+                verified=True,
+                verification={"method": "nmap_tls_script_vulnerable",
+                              "url": f"{host}:{port}"},
             )
         grade = ""
         for line in stdout.splitlines():
@@ -335,7 +338,9 @@ class TLSAudit(BaseModule):
             evidence=lines or ["nmap reported VULNERABLE"],
             remediation="Patch immediately; this is remotely exploitable.",
             asset_keys=[f"domain:{host}"],
-            verified=False,
+            verified=True,
+            verification={"method": "nmap_tls_script_vulnerable",
+                          "url": f"{host}"},
         )
 
     async def _negotiated_weak_cipher(self, host: str, port: int) -> str:

@@ -470,6 +470,92 @@ def test_tls_cert_expired_is_verified():
     assert match["verified"] is True
 
 
+# ── severity calibration: shape and catalog matches are not vulns ──
+def test_kev_exact_without_version_is_high_not_critical():
+    from modules.exploit_lookup import ExploitLookup
+    state = _state()
+    state.add_asset("webapp", "webapp:https://example.test",
+                    "https://example.test", confidence="FIRM",
+                    sources=["test"], attrs={"cms": "WordPress"})
+    module = ExploitLookup(state, _config())
+    import modules.exploit_lookup as el
+
+    async def fake_kev(terms):
+        return [{"cve": "CVE-2024-0001", "product": "WordPress",
+                 "name": "Test RCE", "match_strength": "exact",
+                 "matched_term": "wordpress"}]
+
+    async def fake_nvd(term):
+        return []
+
+    with patch.object(el, "check_cisa_kev", new=fake_kev), \
+         patch.object(el, "nvd_cve_search", new=fake_nvd), \
+         patch.object(el, "searchsploit", new=AsyncMock(return_value={"results": []})), \
+         patch.object(el, "tool_available", return_value=False):
+        _run(module.run())
+    match = next(f for f in state.findings["findings"] if "KEV Match" in f["title"])
+    assert match["severity"] == "HIGH", \
+        "exact product without a fingerprinted version must not be CRITICAL"
+
+
+def test_kev_exact_with_version_is_critical():
+    from modules.exploit_lookup import ExploitLookup
+    state = _state()
+    state.add_asset("webapp", "webapp:https://example.test",
+                    "https://example.test", confidence="FIRM",
+                    sources=["test"],
+                    attrs={"cms": "WordPress",
+                           "product_versions": {"WordPress": "6.0"}})
+    module = ExploitLookup(state, _config())
+    import modules.exploit_lookup as el
+
+    async def fake_kev(terms):
+        return [{"cve": "CVE-2024-0001", "product": "WordPress",
+                 "name": "Test RCE", "match_strength": "exact",
+                 "matched_term": "wordpress"}]
+
+    async def fake_nvd(term):
+        return []
+
+    with patch.object(el, "check_cisa_kev", new=fake_kev), \
+         patch.object(el, "nvd_cve_search", new=fake_nvd), \
+         patch.object(el, "searchsploit", new=AsyncMock(return_value={"results": []})), \
+         patch.object(el, "tool_available", return_value=False):
+        _run(module.run())
+    match = next(f for f in state.findings["findings"] if "KEV Match" in f["title"])
+    assert match["severity"] == "CRITICAL"
+
+
+def test_kev_adjacent_and_nvd_are_medium_leads():
+    from modules.exploit_lookup import ExploitLookup
+    state = _state()
+    state.add_asset("webapp", "webapp:https://example.test",
+                    "https://example.test", confidence="FIRM",
+                    sources=["test"], attrs={"cms": "WordPress"})
+    module = ExploitLookup(state, _config())
+    import modules.exploit_lookup as el
+
+    async def fake_kev(terms):
+        return [{"cve": "CVE-2024-0002", "product": "WordPress Plugin X",
+                 "name": "Test bug", "match_strength": "substring",
+                 "matched_term": "word"}]
+
+    async def fake_nvd(term):
+        return [{"id": "CVE-2024-0003", "cvss_score": 9.8,
+                 "description": "x" * 120}]
+
+    with patch.object(el, "check_cisa_kev", new=fake_kev), \
+         patch.object(el, "nvd_cve_search", new=fake_nvd), \
+         patch.object(el, "searchsploit", new=AsyncMock(return_value={"results": []})), \
+         patch.object(el, "tool_available", return_value=False):
+        _run(module.run())
+    for f in state.findings["findings"]:
+        if "Adjacent" in f["title"] or "Critical CVEs" in f["title"]:
+            assert f["severity"] == "MEDIUM", \
+                f"TENTATIVE lead must not outrank proven MEDIUM: {f['title']}"
+            assert f["confidence"] == "TENTATIVE"
+
+
 # ── audit-clean wave: origin, tech, TLS hygiene, REST docs ──
 
 def test_origin_confirmed_is_verified():

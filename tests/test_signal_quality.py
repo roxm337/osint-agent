@@ -587,7 +587,9 @@ def test_wayback_liveness_gates_historical_claims(monkeypatch):
                    for t in titles), titles
     live = [f for f in state.findings["findings"]
             if f["title"] == "Live URLs With Secret-Shaped Parameter Values"][0]
-    assert live["severity"] == "HIGH"
+    # Shape is not proof a credential works: MEDIUM rotate-on-suspicion,
+    # per the same doctrine that caps secret_validation at MEDIUM.
+    assert live["severity"] == "MEDIUM"
 
 
 # ── Wave B: email harvest ─────────────────────────────────────────
