@@ -66,6 +66,13 @@ class AuthAudit(BaseModule):
             self.state.skip_module(self.id, "no login endpoints discovered")
             return "skipped"
 
+        # Cheap and independent: a ~7-request burst that must run before
+        # the per-endpoint loop, which can eat the whole module budget
+        # one 45s stall at a time on a tarpitting host.
+        await self._ratelimit_bypass_check(endpoints)
+        if self._cfg().get("test_registration_oracle") is True:
+            await self._register_oracle()
+
         self.profile = await self._profile()
         identities = []
         for endpoint in endpoints[:12]:
@@ -92,10 +99,6 @@ class AuthAudit(BaseModule):
             await self._write_access_probes(identities[0])
             if self._cfg().get("test_password_change") is True:
                 await self._password_change_probe(identities[0])
-
-        await self._ratelimit_bypass_check(endpoints)
-        if self._cfg().get("test_registration_oracle") is True:
-            await self._register_oracle()
 
         self.state.complete_module(self.id)
         self.log(f"Auth audit: {len(identities)} session(s) established")
@@ -135,26 +138,36 @@ class AuthAudit(BaseModule):
         A handful of bad logins trips the front-door 429; the same login
         sent straight at a backend port the scan fingerprinted (proved
         live: front 429 while :3000 answered 401) defeats spraying
-        protection entirely. Bounded: up to 6 front-door tries to find
-        the gate, then a single direct request per HTTP-ish port.
+        protection entirely. Bounded: up to 6 consecutive failures per
+        endpoint (3 endpoints max) to trip the gate, then a single
+        direct request per HTTP-ish port.
         """
         from urllib.parse import urlparse
+        api_first = sorted(
+            endpoints[:12],
+            key=lambda e: 0 if any(
+                s in e for s in ("/api/", "/auth/", "/rest/")) else 1)
         gated_endpoint = ""
         gate_note = ""
-        for endpoint in endpoints[:6]:
-            try:
-                result = await curl(
-                    endpoint, method="POST",
-                    headers={"Content-Type": "application/json"},
-                    data=_json_dumps(
-                        {"email": "ratelimit-probe-zz9@example.invalid",
-                         "password": "wrongpass123"}),
-                    output="full", timeout=15)
-            except Exception:
-                continue
-            if result.get("status", 0) == 429:
-                gated_endpoint = endpoint
-                gate_note = (result.get("body", "") or "")[:150]
+        payload = _json_dumps(
+            {"email": "ratelimit-probe-zz9@example.invalid",
+             "password": "wrongpass123"})
+        # The gate trips on consecutive failures to ONE login (proved
+        # live: 6 rapid failures → 429), not one failure across six.
+        for endpoint in api_first[:3]:
+            for _ in range(6):
+                try:
+                    result = await curl(
+                        endpoint, method="POST",
+                        headers={"Content-Type": "application/json"},
+                        data=payload, output="full", timeout=15)
+                except Exception:
+                    break
+                if result.get("status", 0) == 429:
+                    gated_endpoint = endpoint
+                    gate_note = (result.get("body", "") or "")[:150]
+                    break
+            if gated_endpoint:
                 break
         if not gated_endpoint:
             return

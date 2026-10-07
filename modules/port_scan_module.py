@@ -244,8 +244,9 @@ class PortScan(BaseModule):
         for scheme in ("http", "https"):
             url = f"{scheme}://{target_ip}:{port}/"
             try:
-                response = await _curl(url, output="full", timeout=12,
-                                       follow_redirects=False)
+                # Redirects followed: a bare 307 to /login carries no
+                # fingerprint, the login page it points at does.
+                response = await _curl(url, output="full", timeout=12)
             except Exception:
                 continue
             body = (response.get("body", "") or "").strip()

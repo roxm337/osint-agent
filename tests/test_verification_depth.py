@@ -640,6 +640,37 @@ def test_ratelimit_bypass_via_direct_port():
     assert match["verification"]["method"] == "ratelimit_differential"
 
 
+def test_ratelimit_bypass_burst_trips_gate_on_sixth():
+    """The gate trips on consecutive failures to ONE login."""
+    import modules.auth_audit as aa
+    from modules.auth_audit import AuthAudit
+    state = _state()
+    state.add_asset("port", "port:1.2.3.4:3000", "1.2.3.4:3000",
+                    confidence="CONFIRMED", sources=["test"],
+                    attrs={"ip": "1.2.3.4", "port": 3000,
+                           "service": "http", "version": ""})
+    module = AuthAudit(state, _config())
+    calls = []
+
+    async def fake_curl(url, **kwargs):
+        calls.append(url)
+        if url.startswith("http://1.2.3.4:3000"):
+            return {"status": 401, "body": '{"error":"Invalid credentials"}',
+                    "headers": ""}
+        if len([u for u in calls if "example.test" in u]) >= 6:
+            return {"status": 429, "body": '{"error":"Too many attempts"}',
+                    "headers": ""}
+        return {"status": 401, "body": '{"error":"Invalid credentials"}',
+                "headers": ""}
+
+    with patch.object(aa, "curl", new=fake_curl):
+        _run(module._ratelimit_bypass_check(
+            ["https://example.test/api/auth/login"]))
+    match = next(f for f in state.findings["findings"]
+                 if "Rate Limit Bypass" in f["title"])
+    assert match["verified"] is True
+
+
 def test_ratelimit_bypass_quiet_when_gate_holds():
     import modules.auth_audit as aa
     from modules.auth_audit import AuthAudit
