@@ -177,6 +177,14 @@ class Orchestrator:
         except OSError:
             is_default = False
         base = {} if is_default else self._read_config_file("config.yaml")
+        if not base and not is_default:
+            # config.yaml is gitignored, so fresh clones do not have one.
+            # Without this the merge base is empty and a scoped -c run
+            # silently loses every wordlist — the exact defect this
+            # layering exists to prevent. The example is the product
+            # defaults; it lives next to this file, not in CWD.
+            example = Path(__file__).resolve().parent / "config.example.yaml"
+            base = self._read_config_file(str(example))
         if not override:
             if base:
                 return base

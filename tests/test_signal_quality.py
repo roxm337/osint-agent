@@ -1077,6 +1077,15 @@ def test_browser_sinks_are_inventory_not_findings(monkeypatch):
                 "error": None}
 
     monkeypatch.setattr(crawl_module, "_render_page", fake_render)
+
+    async def _playwright_present():
+        return True
+
+    # The module rightly skips without playwright; the skip is not what
+    # this test is about, so the gate is stubbed and the sink inventory
+    # is what gets asserted. (CI has no playwright installed.)
+    monkeypatch.setattr(crawl_module, "_playwright_available",
+                        _playwright_present)
     state = _state()
 
     result = asyncio.run(BrowserCrawl(
