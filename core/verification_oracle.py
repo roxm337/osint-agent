@@ -58,6 +58,13 @@ class DifferentialAnalyzer:
         "word_count", "line_count",
     ]
 
+    # Identifiers, not measurements: a hash that differs at all means the
+    # bytes differ, and a percent-change on two hash magnitudes is noise.
+    # (The numeric branch below made "hello world" vs a longer body score
+    # 2/6 instead of 3/6 whenever PYTHONHASHSEED put the two hashes within
+    # 15% of each other — a seed-dependent flake in two suites.)
+    IDENTITY_KEYS = {"body_hash"}
+
     async def baseline(self, url: str, method: str = "GET",
                        headers: Optional[dict] = None) -> dict:
         result = await curl(url, method=method, headers=headers or {},
@@ -101,6 +108,11 @@ class DifferentialAnalyzer:
             if b is None or t is None:
                 continue
             total_checks += 1
+            if key in self.IDENTITY_KEYS:
+                if b != t:
+                    diff_count += 1
+                    details[key] = {"baseline": str(b)[:200], "test": str(t)[:200]}
+                continue
             if isinstance(b, (int, float)) and isinstance(t, (int, float)):
                 if b == 0:
                     continue

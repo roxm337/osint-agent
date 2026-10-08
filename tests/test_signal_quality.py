@@ -140,6 +140,28 @@ def test_verify_reproducible_flapping_marker_does_not_confirm(monkeypatch):
     assert result.success is False
 
 
+def test_compare_counts_body_hash_by_equality_not_magnitude(monkeypatch):
+    """A hash is an identifier, not a measurement. The numeric branch
+    scored two close-magnitude hashes as 'same', so PYTHONHASHSEED decided
+    whether divergence reached 0.4 — a seed-dependent flake in this test
+    and in test_sqli_union_confirms_version."""
+    from core.verification_oracle import DifferentialAnalyzer
+
+    analyzer = DifferentialAnalyzer()
+    base = {"status": 200, "body_length": 11, "body_hash": 1000,
+            "response_time_ms": 5, "word_count": 2, "line_count": 1,
+            "headers": {}}
+    # Same shape, different bytes, hashes within 15% by magnitude.
+    test = {"status": 200, "body_length": 11, "body_hash": 1099,
+            "response_time_ms": 5, "word_count": 2, "line_count": 1,
+            "headers": {}}
+
+    verdict = analyzer.compare(base, test)
+
+    assert verdict.score == 1 / 6
+    assert verdict.confidence.value == "TENTATIVE"
+
+
 def test_verify_reproducible_baseline_pair_confirms_divergence(monkeypatch):
     import tools.wrappers as wrappers
 
