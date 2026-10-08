@@ -722,6 +722,8 @@ Examples:
                         help="Run a single agent phase")
     parser.add_argument("--tools", action="store_true",
                         help="List available external tools")
+    parser.add_argument("--check-config", action="store_true",
+                        help="Show config coverage for known keys and exit")
     parser.add_argument("--install-tools", nargs="*",
                         help="Install missing external tools (optionally by category)")
 
@@ -772,6 +774,27 @@ Examples:
         print()
         return
 
+    if args.check_config:
+        from core.config_doctor import coverage as _coverage
+        _probe = Orchestrator(
+            target=args.target,
+            output_dir=args.output,
+            config_path=args.config,
+            mode="auto",  # coverage reads config only; nothing runs
+        )
+        print(f"\nConfig coverage ({args.config} over config.yaml, "
+              f"env OSINT_TOOLS_BACKEND/OSINT_TOOLS_IMAGE wins at runtime):")
+        missing = 0
+        for dotted, present, value, why in _coverage(_probe.config):
+            mark = "set" if present else "default"
+            if not present:
+                missing += 1
+            print(f"  [{mark:7s}] {dotted} = {value!r}\n"
+                  f"           {why}")
+        print(f"\n  {missing} key(s) on defaults — copy them from "
+              f"config.example.yaml to tune.\n")
+        return
+
     mode = "active" if args.active else args.mode
     orchestrator = Orchestrator(
         target=args.target,
@@ -783,6 +806,12 @@ Examples:
     orchestrator.max_risk = args.max_risk
     orchestrator.max_actions = args.max_actions
     orchestrator.max_chains = args.max_chains
+
+    # Stale configs run new features on invisible code defaults. Say so
+    # once, up front — silent when the file covers everything.
+    from core.config_doctor import doctor as _doctor
+    for warning in _doctor(orchestrator.config):
+        print(f"  config: {warning}")
 
     if args.pentest and args.execute and args.max_risk not in ("SAFE", "LOW"):
         print(f"\n  Chain execution enabled, risk ceiling {args.max_risk}.")

@@ -419,7 +419,7 @@ oob:
   poll_interval: 2
   poll_timeout: 30
   # `enabled: false` turns off OOB everywhere without deleting the settings.
-  # enabled: true
+  enabled: true
 
 xss:
   max_points: 80
