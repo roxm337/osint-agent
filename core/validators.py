@@ -4,6 +4,7 @@ import base64
 import ipaddress
 import json
 import re
+from typing import Optional
 from urllib.parse import urlparse, parse_qs, quote, urlencode
 
 
