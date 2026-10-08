@@ -1535,7 +1535,8 @@ def test_xss_blind_callback_confirms(monkeypatch):
     async def fake_curl(url, **kwargs):
         return {"status": 200, "body": "<html>static</html>"}
 
-    async def fake_dalfox(urls, timeout=600, blind=None):
+    async def fake_dalfox(urls, timeout=600, blind=None, blind_oob=False,
+                          rate_limit=0):
         assert blind and "interactsh" in blind or "oob" in blind or blind, \
             "blind pass must carry the OOB callback URL"
         return {"available": True, "results": [{

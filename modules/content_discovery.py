@@ -34,7 +34,12 @@ a login page.
 from urllib.parse import urlparse
 
 from modules.base import BaseModule
-from tools.external import ffuf, parse_ffuf_json, tool_available
+from tools.external import (
+    ffuf,
+    kiterunner_scan,
+    parse_ffuf_json,
+    tool_available,
+)
 
 
 INTERESTING_STATUSES = {200, 204, 301, 302, 307, 308, 401, 403}
@@ -99,44 +104,76 @@ class ContentDiscovery(BaseModule):
             self.state.skip_module(self.id, "disabled in config")
             return "skipped"
 
-        self.log("Running ffuf content discovery...")
-        if not tool_available("ffuf"):
-            self.state.skip_module(self.id, "ffuf not installed")
+        kr_cfg = cfg.get("kiterunner", {})
+        kr_cfg = kr_cfg if isinstance(kr_cfg, dict) else {}
+        kr_enabled = bool(kr_cfg.get("enabled", True)) and tool_available("kr")
+        ffuf_ok = tool_available("ffuf")
+        if not ffuf_ok and not kr_enabled:
+            self.state.skip_module(self.id, "ffuf and kiterunner not installed")
             return "skipped"
 
         base_url = self.base_url
-        words = self.config.get("wordlists", {}).get("content_discovery", [])
-        if not words:
-            self.state.skip_module(self.id, "no content discovery wordlist")
-            return "skipped"
-        # High-value paths no generic wordlist carries, plus operator and
-        # lab-pack additions (packs merge into the configured wordlist).
-        # Merged under the same cap discipline as configured words.
-        words = list(words) + [w for w in HIGH_VALUE_SEEDS if w not in words]
-
         run_dir = self.state.state_dir / "tool-output"
         run_dir.mkdir(exist_ok=True)
-        wordlist_path = run_dir / "ffuf-content.txt"
-        output_path = run_dir / "ffuf-content.json"
-        wordlist_path.write_text("\n".join(w.strip("/") for w in words if w) + "\n")
+        tools_used: list[str] = []
+        hits: list[dict] = []
+        word_count = 0
+        kr_summary: dict = {}
+        ffuf_exit, ffuf_stderr = None, ""
 
-        result = await ffuf(
-            f"{base_url}/FUZZ",
-            str(wordlist_path),
-            str(output_path),
-            rate=self.config.get("rate_limits", {}).get("scan", {}).get("per_minute", 10),
-            timeout=240,
-            # Calibrate against a random path, otherwise a catch-all site
-            # returns a "hit" for every word in the list.
-            extra_args=["-ac"],
-        )
-        if not result.get("available", True):
-            self.state.skip_module(self.id, "ffuf not installed")
+        if ffuf_ok:
+            words = self.config.get("wordlists", {}).get("content_discovery", [])
+            if not words:
+                self.log("  ffuf pass skipped: no content discovery wordlist")
+            else:
+                self.log("Running ffuf content discovery...")
+                # High-value paths no generic wordlist carries, plus operator
+                # and lab-pack additions (packs merge into the configured
+                # wordlist). Merged under the same cap discipline as
+                # configured words.
+                words = list(words) + [w for w in HIGH_VALUE_SEEDS if w not in words]
+                word_count = len(words)
+                wordlist_path = run_dir / "ffuf-content.txt"
+                output_path = run_dir / "ffuf-content.json"
+                wordlist_path.write_text(
+                    "\n".join(w.strip("/") for w in words if w) + "\n")
+
+                result = await ffuf(
+                    f"{base_url}/FUZZ",
+                    str(wordlist_path),
+                    str(output_path),
+                    rate=self.config.get("rate_limits", {}).get("scan", {}).get("per_minute", 10),
+                    timeout=240,
+                    # Calibrate against a random path, otherwise a catch-all
+                    # site returns a "hit" for every word in the list.
+                    extra_args=["-ac"],
+                )
+                if result.get("available", True):
+                    tools_used.append("ffuf")
+                    output_text = output_path.read_text() if output_path.exists() else "{}"
+                    for hit in parse_ffuf_json(output_text):
+                        hit["tool"] = "ffuf"
+                        hits.append(hit)
+                    ffuf_exit = result.get("exit_code")
+                    ffuf_stderr = result.get("stderr", "")
+                else:
+                    ffuf_exit, ffuf_stderr = None, "ffuf unavailable"
+        else:
+            ffuf_exit, ffuf_stderr = None, "ffuf not installed"
+
+        if kr_enabled:
+            kr_hits = await self._kiterunner_pass(kr_cfg, base_url, run_dir)
+            if kr_hits is not None:
+                tools_used.append("kr")
+                hits = hits + kr_hits["hits"]
+                kr_summary = kr_hits["summary"]
+
+        if not tools_used:
+            self.state.skip_module(self.id, "no discovery tool produced output")
             return "skipped"
 
-        output_text = output_path.read_text() if output_path.exists() else "{}"
         hits = [
-            hit for hit in parse_ffuf_json(output_text)
+            hit for hit in hits
             if int(hit.get("status") or 0) in INTERESTING_STATUSES
         ]
 
@@ -146,15 +183,16 @@ class ContentDiscovery(BaseModule):
 
         evidence_id = self.state.add_evidence(
             self.id,
-            "ffuf",
+            "content_discovery",
             base_url,
             {
-                "command": "ffuf",
+                "command": "+".join(tools_used),
                 "url_template": f"{base_url}/FUZZ",
-                "word_count": len(words),
+                "word_count": word_count,
                 "autocalibrated": True,
-                "exit_code": result.get("exit_code"),
-                "stderr": result.get("stderr", ""),
+                "exit_code": ffuf_exit,
+                "stderr": ffuf_stderr,
+                "kiterunner": kr_summary,
                 "filtered_as_wildcard": sorted(wildcard)[:50],
                 "results": real_hits,
             },
@@ -163,6 +201,7 @@ class ContentDiscovery(BaseModule):
         categories = {url: classify_content_hit(hit)
                       for url, hit in ((h["url"], h) for h in real_hits)}
         for hit in real_hits:
+            tool = str(hit.get("tool", "ffuf") or "ffuf")
             self.state.add_asset(
                 "web_path",
                 f"web_path:{hit['url']}",
@@ -171,7 +210,7 @@ class ContentDiscovery(BaseModule):
                 # path's existence is confirmed even where the classification
                 # is only a guess about what the path is.
                 confidence="CONFIRMED",
-                sources=["ffuf"],
+                sources=[tool],
                 attrs={**hit, "category": categories[hit["url"]]},
             )
 
@@ -248,7 +287,7 @@ class ContentDiscovery(BaseModule):
             f"content_discovery:{self.domain}",
             self.domain,
             confidence="CONFIRMED",
-            sources=["ffuf"],
+            sources=tools_used,
             attrs={
                 "hits": len(real_hits),
                 "served": len(served),
@@ -257,16 +296,80 @@ class ContentDiscovery(BaseModule):
                 "discovered": len(real_hits) - len(served) - len(protected)
                 - len(redirected),
                 "filtered_as_wildcard": filtered,
-                "output": str(output_path),
+                "kiterunner_hits": kr_summary.get("hits", 0),
             },
         )
         self.state.complete_module(self.id)
         self.log(
-            f"ffuf hits: {len(real_hits)} real "
+            f"content hits: {len(real_hits)} real "
             f"({len(served)} served, {len(protected)} protected, "
             f"{len(redirected)} redirected, {filtered} filtered as wildcard)"
         )
         return "done"
+
+    async def _kiterunner_pass(self, kr_cfg: dict, base_url: str,
+                               run_dir) -> dict | None:
+        """API-route brute force via kiterunner (assetnote wordlists).
+
+        Targets are the base URL plus the distinct origins of discovered
+        api_endpoint assets (APIs usually live on their own host),
+        capped at max_targets. Hits reuse the module's grading — a 200
+        on /admin is a MEDIUM whether ffuf or kr found it — with words:0
+        so the shared wildcard grouping still applies.
+        """
+        wordlist = str(kr_cfg.get("wordlist", "apiroutes-260227") or
+                       "apiroutes-260227")
+        try:
+            max_routes = max(1, min(20000, int(kr_cfg.get("max_routes", 1500))))
+        except (TypeError, ValueError):
+            max_routes = 1500
+        try:
+            max_targets = max(1, min(10, int(kr_cfg.get("max_targets", 2))))
+        except (TypeError, ValueError):
+            max_targets = 2
+
+        targets = [base_url]
+        for asset in self.state.get_assets_by_type("api_endpoint"):
+            value = str(asset.get("value", "") or "")
+            if not value.startswith(("http://", "https://")):
+                continue
+            try:
+                parsed = urlparse(value)
+                origin = f"{parsed.scheme}://{parsed.netloc}"
+            except ValueError:
+                continue
+            if origin not in targets:
+                targets.append(origin)
+            if len(targets) >= max_targets:
+                break
+        targets = targets[:max_targets]
+
+        self.log(f"  kiterunner: {len(targets)} target(s), "
+                 f"{max_routes} routes each ({wordlist})...")
+        result = await kiterunner_scan(
+            targets,
+            timeout=900,
+            wordlist=wordlist,
+            max_routes=max_routes,
+        )
+        if not result.get("available", True):
+            return None
+        hits = result.get("results", [])
+        for hit in hits:
+            hit.setdefault("words", 0)
+            hit["tool"] = "kiterunner"
+        self.log(f"  kiterunner: {len(hits)} API route hit(s)")
+        return {
+            "hits": hits,
+            "summary": {
+                "targets": targets,
+                "wordlist": result.get("wordlist", wordlist),
+                "max_routes": result.get("max_routes", max_routes),
+                "hits": len(hits),
+                "exit_codes": result.get("exit_codes", []),
+                "error": result.get("error"),
+            },
+        }
 
     def _wildcard_group(self, hits: list) -> set:
         """URLs that look like the site's catch-all, so they can be discarded.

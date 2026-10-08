@@ -27,7 +27,8 @@ RUN for i in 1 2 3; do if go install github.com/projectdiscovery/naabu/v2/cmd/na
 RUN for i in 1 2 3; do if go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
 RUN for i in 1 2 3; do if go install github.com/projectdiscovery/katana/cmd/katana@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
 RUN for i in 1 2 3; do if go install github.com/ffuf/ffuf/v2@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
-RUN for i in 1 2 3; do if go install github.com/hahwul/dalfox/v2@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
+# dalfox v2 retired: v3 is a Rust rewrite (no go install). The release
+# binary lands in the runtime stage below.
 RUN for i in 1 2 3; do if go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
 RUN for i in 1 2 3; do if go install github.com/lc/gau/v2/cmd/gau@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
 RUN for i in 1 2 3; do if go install github.com/hakluke/hakrawler@latest; then break; fi; if [ $i = 3 ]; then exit 1; fi; sleep 20; done
@@ -191,10 +192,41 @@ RUN git clone --depth 1 https://github.com/dolevf/graphql-cop /opt/graphql-cop \
 # named `httpx`, which overwrites the ProjectDiscovery binary installed
 # earlier. Re-install Go httpx last so the scanner wins the PATH.
 RUN HX=$(curl -s https://api.github.com/repos/projectdiscovery/httpx/releases/latest | jq -r .tag_name) \
- && case "$TARGETARCH" in arm64) HXARCH="arm64" ;; *) HXARCH="amd64" ;; esac \
- && wget -q -O /tmp/httpx.zip "https://github.com/projectdiscovery/httpx/releases/download/${HX}/httpx_${HX#v}_linux_${HXARCH}.zip" \
- && unzip -o -q /tmp/httpx.zip -d /usr/local/bin httpx && rm /tmp/httpx.zip \
- && httpx -version 2>&1 | head -n 1
+  && case "$TARGETARCH" in arm64) HXARCH="arm64" ;; *) HXARCH="amd64" ;; esac \
+  && wget -q -O /tmp/httpx.zip "https://github.com/projectdiscovery/httpx/releases/download/${HX}/httpx_${HX#v}_linux_${HXARCH}.zip" \
+  && unzip -o -q /tmp/httpx.zip -d /usr/local/bin httpx && rm /tmp/httpx.zip \
+  && httpx -version 2>&1 | head -n 1
+
+# dalfox v3 (Rust rewrite — no go install). Static musl binary, pinned
+# to the latest release at build. Legacy `url/file/pipe` aliases still
+# work, but flags changed: `-f jsonl` (not `--format json`) for
+# line-delimited output, no `--skip-bav`, exit 1 means findings.
+RUN DL=$(curl -s https://api.github.com/repos/hahwul/dalfox/releases/latest | jq -r .tag_name) \
+  && case "$TARGETARCH" in arm64) DLARCH="aarch64" ;; *) DLARCH="x86_64" ;; esac \
+  && mkdir -p /tmp/dlx \
+  && wget -q -O /tmp/dlx/dalfox.tar.gz "https://github.com/hahwul/dalfox/releases/download/${DL}/dalfox-${DL}-linux-${DLARCH}-musl.tar.gz" \
+  && tar -xzf /tmp/dlx/dalfox.tar.gz -C /tmp/dlx \
+  && install -m0755 "$(find /tmp/dlx -name dalfox -type f | head -n 1)" /usr/local/bin/dalfox \
+  && rm -rf /tmp/dlx \
+  && dalfox --version 2>&1 | head -n 1
+
+# kiterunner (assetnote, AGPL-3.0): contextual API content discovery.
+# Invoked as `kr brute <target> -A=<wordlist>:<N> -o json`; wordlists
+# download from wordlist.assetnote.io at scan time (default
+# apiroutes-260227, overridable in config). Pinned v1.0.2 (latest).
+RUN case "$TARGETARCH" in arm64) KRARCH="arm64" ;; *) KRARCH="amd64" ;; esac \
+  && wget -q -O /tmp/kr.tgz "https://github.com/assetnote/kiterunner/releases/download/v1.0.2/kiterunner_1.0.2_linux_${KRARCH}.tar.gz" \
+  && tar -xzf /tmp/kr.tgz -C /usr/local/bin kr && rm -f /tmp/kr.tgz \
+  && kr --help >/dev/null 2>&1
+
+# semgrep (own venv like theHarvester: debian owns system PyJWT and pip
+# cannot uninstall it. SAST over downloaded JS bundles with repo-local
+# rules (rules/semgrep/, offline deterministic — no registry, no metrics).
+RUN python3 -m venv /opt/venv-semgrep \
+  && /opt/venv-semgrep/bin/pip install --no-cache-dir semgrep \
+  && ln -s /opt/venv-semgrep/bin/semgrep /usr/local/bin/semgrep \
+  && test -x /usr/local/bin/semgrep \
+  && semgrep --version 2>&1 | head -n 1
 
 # Sanity: every binary the framework gates on must resolve here, and
 # httpx must answer as the Go scanner (exit 0 on -version), not the
@@ -206,6 +238,7 @@ RUN for bin in nmap naabu nuclei ffuf httpx subfinder amass dnsx gau katana \
     feroxbuster droopescan cmseek maigret holehe theHarvester \
     subzy assetfinder waybackurls anew qsreplace gf chromium \
     jsluice Gxss uro gitleaks graphql-cop interactsh-client \
+    kr semgrep \
     dig whois curl openssl; do \
     command -v "$bin" >/dev/null || echo "WARN: $bin not on PATH"; done; true
 

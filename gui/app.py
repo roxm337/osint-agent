@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sys
 import time
 from html import escape as html_escape
@@ -58,8 +57,33 @@ from actions import ActionRegistry
 from agents import get_llm_config
 from core.keyvault import KEY_SPECS, KeyVault
 from modules import MODULE_REGISTRY, get_all_module_ids
-from tools.external import tools_available
+from tools.external import (
+    DOCKER_TOOLS,
+    configure_tool_backend,
+    tool_available,
+)
 from tools.tool_manager import TOOL_DEFINITIONS
+
+
+# Container-only tools (baked into docker/Dockerfile.tools) that have no
+# TOOL_DEFINITIONS entry. Shown in Settings → Tools so operators see the
+# full container toolchain, not just the host-installable subset.
+EXTRA_CONTAINER_TOOLS: dict[str, tuple[list[str], str]] = {
+    "jsluice": (["web", "js", "endpoints"], "JS endpoint and secret extraction (Tier-1)"),
+    "gxss": (["web", "xss", "param"], "Reflect candidate parameters for XSS (Tier-1)"),
+    "uro": (["web", "dedup"], "URL dedup and normalisation for fuzz lists (Tier-1)"),
+    "graphql-cop": (["web", "graphql"], "GraphQL security tester (Tier-1)"),
+    "interactsh-client": (["oob", "callback"], "Free OOB callbacks via public interactsh"),
+    "kr": (["web", "api", "fuzzing"], "API route brute force, assetnote wordlists (Tier-2)"),
+    "semgrep": (["web", "sast", "js"], "SAST over JS bundles, repo-local rules (Tier-2)"),
+    "gobuster": (["web", "fuzzing"], "Directory and DNS brute-forcer"),
+    "feroxbuster": (["web", "fuzzing"], "Recursive content discovery"),
+    "assetfinder": (["dns", "subdomain"], "Subdomain discovery via public sources"),
+    "waybackurls": (["web", "recon"], "Historic URLs from the Wayback Machine"),
+    "subzy": (["dns", "takeover"], "Subdomain takeover checker"),
+    "dig": (["dns", "probe"], "DNS lookup utility"),
+    "whois": (["recon", "whois"], "Domain registration lookup"),
+}
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -767,6 +791,29 @@ class MainWindow(QMainWindow):
         target_form.addRow("Mode", self.config_mode_combo)
         layout.addWidget(target_box)
 
+        backend_box = QGroupBox("Toolchain Backend")
+        backend_form = QFormLayout(backend_box)
+        backend_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.tools_backend_combo = QComboBox()
+        self.tools_backend_combo.addItems(["local", "docker"])
+        self.tools_backend_combo.setToolTip(
+            "local: use binaries installed on this machine. "
+            "docker: run every baked binary inside the toolchain image "
+            "(teammates need only Python + Docker)."
+        )
+        self.tools_image_input = QLineEdit()
+        self.tools_image_input.setPlaceholderText("osint-tools:latest")
+        backend_hint = QLabel(
+            "Env OSINT_TOOLS_BACKEND / OSINT_TOOLS_IMAGE wins over this file. "
+            "Build once: docker build -f docker/Dockerfile.tools -t osint-tools:latest ."
+        )
+        backend_hint.setWordWrap(True)
+        backend_hint.setObjectName("opsSecondary")
+        backend_form.addRow("Backend", self.tools_backend_combo)
+        backend_form.addRow("Image", self.tools_image_input)
+        backend_form.addRow("Note", backend_hint)
+        layout.addWidget(backend_box)
+
         detectability_box = QGroupBox("Detectability")
         detectability_form = QFormLayout(detectability_box)
         self.config_default_detectability_combo = QComboBox()
@@ -915,9 +962,23 @@ class MainWindow(QMainWindow):
         self.xss_max_points_spin.setRange(1, 5000)
         self.xss_dalfox_timeout_spin = QSpinBox()
         self.xss_dalfox_timeout_spin.setRange(30, 7200)
+        self.xss_dalfox_blind_oob_check = QCheckBox("Dalfox runs its own OOB session (stays FIRM)")
+        self.xss_dalfox_blind_oob_check.setToolTip(
+            "Uses dalfox --blind-oob on the public mesh instead of the "
+            "framework-owned callback. No pollable session, so findings "
+            "cannot reach CONFIRMED."
+        )
+        self.xss_dalfox_rate_spin = QSpinBox()
+        self.xss_dalfox_rate_spin.setRange(0, 100000)
+        self.xss_dalfox_rate_spin.setSpecialValueText("unlimited")
+        self.xss_dalfox_rate_spin.setToolTip(
+            "Global outbound cap for dalfox in requests/second."
+        )
         xss_form.addRow("", self.xss_browser_confirm_check)
         xss_form.addRow("Max injection points", self.xss_max_points_spin)
         xss_form.addRow("Dalfox timeout", self.xss_dalfox_timeout_spin)
+        xss_form.addRow("", self.xss_dalfox_blind_oob_check)
+        xss_form.addRow("Dalfox rate limit", self.xss_dalfox_rate_spin)
         layout.addWidget(xss_box)
 
         nuclei_box = QGroupBox("Nuclei")
@@ -925,6 +986,57 @@ class MainWindow(QMainWindow):
         self.nuclei_full_cve_check = QCheckBox("Run full CVE pass only on confirmed apex")
         nuclei_form.addRow("", self.nuclei_full_cve_check)
         layout.addWidget(nuclei_box)
+
+        sqli_box = QGroupBox("Blind SQLi (OAST)")
+        sqli_form = QFormLayout(sqli_box)
+        self.sqli_oast_check = QCheckBox("Hand sqlmap an OOB server for blind proof")
+        self.sqli_oast_check.setToolTip(
+            "Promotes only the exact URL that produced a callback. "
+            "Needs oob server_url (wrapper mode) — a callback domain alone is not enough."
+        )
+        sqli_form.addRow("", self.sqli_oast_check)
+        layout.addWidget(sqli_box)
+
+        kr_box = QGroupBox("API Discovery (kiterunner)")
+        kr_form = QFormLayout(kr_box)
+        kr_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.kr_enabled_check = QCheckBox("Brute-force API routes (assetnote wordlists)")
+        self.kr_enabled_check.setChecked(True)
+        self.kr_wordlist_input = QLineEdit()
+        self.kr_wordlist_input.setPlaceholderText("apiroutes-260227")
+        self.kr_wordlist_input.setToolTip(
+            "Remote list name; see `kr wordlist list` for current names."
+        )
+        self.kr_max_routes_spin = QSpinBox()
+        self.kr_max_routes_spin.setRange(1, 20000)
+        self.kr_max_routes_spin.setValue(1500)
+        self.kr_max_routes_spin.setToolTip("Routes tried per target.")
+        self.kr_max_targets_spin = QSpinBox()
+        self.kr_max_targets_spin.setRange(1, 10)
+        self.kr_max_targets_spin.setValue(2)
+        self.kr_max_targets_spin.setToolTip(
+            "Base URL plus api_endpoint origins, capped."
+        )
+        kr_form.addRow("", self.kr_enabled_check)
+        kr_form.addRow("Wordlist", self.kr_wordlist_input)
+        kr_form.addRow("Max routes", self.kr_max_routes_spin)
+        kr_form.addRow("Max targets", self.kr_max_targets_spin)
+        layout.addWidget(kr_box)
+
+        semgrep_box = QGroupBox("Semgrep SAST")
+        semgrep_form = QFormLayout(semgrep_box)
+        semgrep_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.semgrep_enabled_check = QCheckBox("Scan JS bundles (repo-local rules)")
+        self.semgrep_enabled_check.setChecked(True)
+        self.semgrep_enabled_check.setToolTip(
+            "Static only: taint flows file as MEDIUM/TENTATIVE, "
+            "sinks as LOW. Never execution proof."
+        )
+        self.semgrep_rules_input = QLineEdit()
+        self.semgrep_rules_input.setPlaceholderText("rules/semgrep")
+        semgrep_form.addRow("", self.semgrep_enabled_check)
+        semgrep_form.addRow("Rules", self.semgrep_rules_input)
+        layout.addWidget(semgrep_box)
 
         fast_scan_box = QGroupBox("Fast Exposure Scan")
         fast_scan_form = QFormLayout(fast_scan_box)
@@ -947,6 +1059,20 @@ class MainWindow(QMainWindow):
         oob_box = QGroupBox("OOB Callback Infrastructure")
         oob_form = QFormLayout(oob_box)
         oob_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.oob_mode_combo = QComboBox()
+        self.oob_mode_combo.addItem("Disabled", "")
+        self.oob_mode_combo.addItem("public (free interactsh, own assets only)", "public")
+        self.oob_mode_combo.addItem("wrapper (self-hosted shim)", "wrapper")
+        self.oob_mode_combo.setToolTip(
+            "public: multiplexed session, needs only the interactsh-client "
+            "binary (baked into the docker image). wrapper: your own "
+            "interactsh-compatible HTTP shim, needs a domain + wildcard DNS."
+        )
+        self.oob_enabled_check = QCheckBox("Enable OOB checks")
+        self.oob_enabled_check.setChecked(True)
+        self.oob_enabled_check.setToolTip(
+            "Off turns OOB off everywhere without deleting the settings."
+        )
         self.oob_callback_domain_input = QLineEdit()
         self.oob_callback_domain_input.setPlaceholderText("oob.example.com")
         self.oob_server_url_input = QLineEdit()
@@ -959,6 +1085,8 @@ class MainWindow(QMainWindow):
         self.oob_poll_interval_spin.setRange(1, 300)
         self.oob_poll_timeout_spin = QSpinBox()
         self.oob_poll_timeout_spin.setRange(1, 3600)
+        oob_form.addRow("Mode", self.oob_mode_combo)
+        oob_form.addRow("", self.oob_enabled_check)
         oob_form.addRow("Callback domain", self.oob_callback_domain_input)
         oob_form.addRow("Server URL", self.oob_server_url_input)
         oob_form.addRow("Poll URL", self.oob_poll_url_input)
@@ -1051,12 +1179,19 @@ class MainWindow(QMainWindow):
 
         tools_box = QGroupBox("External Tool Readiness")
         tools_layout = QVBoxLayout(tools_box)
-        self.tools_table = QTableWidget(0, 4)
-        self.tools_table.setHorizontalHeaderLabels(["Tool", "Ready", "Categories", "Purpose"])
+        self.tools_backend_label = QLabel("Backend: local")
+        self.tools_backend_label.setWordWrap(True)
+        self.tools_backend_label.setObjectName("opsSecondary")
+        tools_layout.addWidget(self.tools_backend_label)
+        self.tools_table = QTableWidget(0, 5)
+        self.tools_table.setHorizontalHeaderLabels(
+            ["Tool", "Ready", "Runs via", "Categories", "Purpose"]
+        )
         self.tools_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.tools_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.tools_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.tools_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.tools_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.tools_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
         tools_layout.addWidget(self.tools_table)
         tool_buttons = QHBoxLayout()
         self.refresh_tools_button = QPushButton("Refresh Tools")
@@ -2187,8 +2322,10 @@ class MainWindow(QMainWindow):
         if hasattr(self, "pentest_check") and self.pentest_check.isChecked():
             risk = self.risk_combo.currentText() if hasattr(self, "risk_combo") else "LOW"
             engagement = f" | Pentest: {risk}"
+        backend = getattr(self, "_tools_backend_mode", "local")
         self.operation_mode_label.setText(
-            f"Mode: {mode} | Module: {module}{engagement} | Config: {self.config_path.name}"
+            f"Mode: {mode} | Module: {module}{engagement} | "
+            f"Backend: {backend} | Config: {self.config_path.name}"
         )
         ready, llm_message = self._llm_status()
         self.llm_status_label.setText(llm_message)
@@ -2760,6 +2897,13 @@ class MainWindow(QMainWindow):
             self.config_target_domain_input.setText(str(target.get("domain", "")))
             self._set_combo_value(self.config_mode_combo, str(target.get("mode", "passive")))
 
+        tools_cfg = config.get("tools", {}) if isinstance(config.get("tools"), dict) else {}
+        if hasattr(self, "tools_backend_combo"):
+            backend = str(tools_cfg.get("backend", "local") or "local").strip().lower()
+            index = self.tools_backend_combo.findText(backend)
+            self.tools_backend_combo.setCurrentIndex(index if index >= 0 else 0)
+            self.tools_image_input.setText(str(tools_cfg.get("image", "") or ""))
+
         detectability = config.get("detectability", {})
         if hasattr(self, "config_default_detectability_combo"):
             self._set_combo_value(
@@ -2817,10 +2961,41 @@ class MainWindow(QMainWindow):
             self.xss_browser_confirm_check.setChecked(bool(xss.get("browser_confirm", True)))
             self.xss_max_points_spin.setValue(int(xss.get("max_points", 80) or 80))
             self.xss_dalfox_timeout_spin.setValue(int(xss.get("dalfox_timeout", 600) or 600))
+            if hasattr(self, "xss_dalfox_blind_oob_check"):
+                self.xss_dalfox_blind_oob_check.setChecked(bool(xss.get("dalfox_blind_oob", False)))
+                try:
+                    self.xss_dalfox_rate_spin.setValue(int(xss.get("dalfox_rate_limit", 0) or 0))
+                except (TypeError, ValueError):
+                    self.xss_dalfox_rate_spin.setValue(0)
 
         nuclei = config.get("nuclei", {})
         if hasattr(self, "nuclei_full_cve_check"):
             self.nuclei_full_cve_check.setChecked(bool(nuclei.get("full_cve_on_confirmed_apex", True)))
+
+        kr_cfg = ((config.get("modules", {}) or {}).get("content_discovery", {})
+                  or {}).get("kiterunner", {})
+        kr_cfg = kr_cfg if isinstance(kr_cfg, dict) else {}
+        if hasattr(self, "kr_enabled_check"):
+            self.kr_enabled_check.setChecked(bool(kr_cfg.get("enabled", True)))
+            self.kr_wordlist_input.setText(str(kr_cfg.get("wordlist", "") or ""))
+            try:
+                self.kr_max_routes_spin.setValue(int(kr_cfg.get("max_routes", 1500) or 1500))
+            except (TypeError, ValueError):
+                self.kr_max_routes_spin.setValue(1500)
+            try:
+                self.kr_max_targets_spin.setValue(int(kr_cfg.get("max_targets", 2) or 2))
+            except (TypeError, ValueError):
+                self.kr_max_targets_spin.setValue(2)
+
+        sast_cfg = config.get("semgrep", {})
+        sast_cfg = sast_cfg if isinstance(sast_cfg, dict) else {}
+        if hasattr(self, "semgrep_enabled_check"):
+            self.semgrep_enabled_check.setChecked(bool(sast_cfg.get("enabled", True)))
+            self.semgrep_rules_input.setText(str(sast_cfg.get("rules", "") or ""))
+
+        sqli_scan = config.get("modules", {}).get("sqli_scan", {})
+        if hasattr(self, "sqli_oast_check") and isinstance(sqli_scan, dict):
+            self.sqli_oast_check.setChecked(bool(sqli_scan.get("oast", True)))
 
         fast_scan = config.get("fast_scan", {})
         if hasattr(self, "fast_scan_paths_input"):
@@ -2831,6 +3006,13 @@ class MainWindow(QMainWindow):
 
         oob = config.get("oob", {})
         if hasattr(self, "oob_callback_domain_input"):
+            if hasattr(self, "oob_mode_combo"):
+                mode_index = self.oob_mode_combo.findData(str(oob.get("mode", "") or ""))
+                self.oob_mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
+            if hasattr(self, "oob_enabled_check"):
+                # Absent key means enabled (engine default); only an
+                # explicit false disables.
+                self.oob_enabled_check.setChecked(bool(oob.get("enabled", True)))
             self.oob_callback_domain_input.setText(str(oob.get("callback_domain", "")))
             self.oob_server_url_input.setText(str(oob.get("server_url", "")))
             self.oob_poll_url_input.setText(str(oob.get("poll_url", "")))
@@ -2861,6 +3043,13 @@ class MainWindow(QMainWindow):
             config["target"].update({
                 "domain": self.config_target_domain_input.text().strip(),
                 "mode": self.config_mode_combo.currentText(),
+            })
+
+        if hasattr(self, "tools_backend_combo"):
+            config.setdefault("tools", {})
+            config["tools"].update({
+                "backend": self.tools_backend_combo.currentText(),
+                "image": self.tools_image_input.text().strip() or "osint-tools:latest",
             })
 
         if hasattr(self, "config_default_detectability_combo"):
@@ -2923,12 +3112,27 @@ class MainWindow(QMainWindow):
                 "max_points": self.xss_max_points_spin.value(),
                 "dalfox_timeout": self.xss_dalfox_timeout_spin.value(),
             })
+            if hasattr(self, "xss_dalfox_blind_oob_check"):
+                config["xss"].update({
+                    "dalfox_blind_oob": self.xss_dalfox_blind_oob_check.isChecked(),
+                    "dalfox_rate_limit": self.xss_dalfox_rate_spin.value(),
+                })
 
         if hasattr(self, "nuclei_full_cve_check"):
             config.setdefault("nuclei", {})
             config["nuclei"].update({
                 "full_cve_on_confirmed_apex": self.nuclei_full_cve_check.isChecked(),
             })
+
+        if hasattr(self, "sqli_oast_check"):
+            config.setdefault("modules", {})
+            modules_cfg = config["modules"]
+            if not isinstance(modules_cfg, dict):
+                modules_cfg = config["modules"] = {}
+            sqli_cfg = modules_cfg.get("sqli_scan")
+            if not isinstance(sqli_cfg, dict):
+                sqli_cfg = modules_cfg["sqli_scan"] = {}
+            sqli_cfg["oast"] = self.sqli_oast_check.isChecked()
 
         if hasattr(self, "fast_scan_paths_input"):
             config.setdefault("fast_scan", {})
@@ -2942,12 +3146,36 @@ class MainWindow(QMainWindow):
         if hasattr(self, "oob_callback_domain_input"):
             config.setdefault("oob", {})
             config["oob"].update({
+                "mode": self.oob_mode_combo.currentData() if hasattr(self, "oob_mode_combo") else "",
+                "enabled": self.oob_enabled_check.isChecked() if hasattr(self, "oob_enabled_check") else True,
                 "callback_domain": self.oob_callback_domain_input.text().strip(),
                 "server_url": self.oob_server_url_input.text().strip(),
                 "poll_url": self.oob_poll_url_input.text().strip(),
                 "token": self.oob_token_input.text().strip(),
                 "poll_interval": self.oob_poll_interval_spin.value(),
                 "poll_timeout": self.oob_poll_timeout_spin.value(),
+            })
+
+        if hasattr(self, "kr_enabled_check"):
+            config.setdefault("modules", {})
+            modules_cfg = config["modules"]
+            if not isinstance(modules_cfg, dict):
+                modules_cfg = config["modules"] = {}
+            cd_cfg = modules_cfg.get("content_discovery")
+            if not isinstance(cd_cfg, dict):
+                cd_cfg = modules_cfg["content_discovery"] = {}
+            cd_cfg["kiterunner"] = {
+                "enabled": self.kr_enabled_check.isChecked(),
+                "wordlist": self.kr_wordlist_input.text().strip() or "apiroutes-260227",
+                "max_routes": self.kr_max_routes_spin.value(),
+                "max_targets": self.kr_max_targets_spin.value(),
+            }
+
+        if hasattr(self, "semgrep_enabled_check"):
+            config.setdefault("semgrep", {})
+            config["semgrep"].update({
+                "enabled": self.semgrep_enabled_check.isChecked(),
+                "rules": self.semgrep_rules_input.text().strip() or "rules/semgrep",
             })
 
         if self._write_config(config):
@@ -3312,19 +3540,31 @@ class MainWindow(QMainWindow):
     def _refresh_tools_status(self):
         if not hasattr(self, "tools_table"):
             return
-        available = tools_available()
-        tools = sorted(TOOL_DEFINITIONS, key=lambda tool: tool.name)
-        self.tools_table.setRowCount(len(tools))
-        for row, tool in enumerate(tools):
-            ready = available.get(tool.name)
-            if ready is None:
-                ready = shutil.which(tool.name) is not None
-            values = [
-                tool.name,
-                "yes" if ready else "no",
-                ", ".join(tool.categories),
-                tool.description,
-            ]
+        # Effective backend: shell env wins over the config file
+        # (configure_tool_backend reads both; dotenv is loaded via agents).
+        mode = configure_tool_backend(self._read_config())
+        self._tools_backend_mode = mode
+        rows: list[tuple[str, str, str, str]] = [
+            (tool.name, ", ".join(tool.categories), tool.description,
+             "docker" if tool.name in DOCKER_TOOLS else "local")
+            for tool in TOOL_DEFINITIONS
+        ]
+        known = {name for name, _cats, _desc, _via in rows}
+        for name in sorted(DOCKER_TOOLS - known):
+            categories, purpose = EXTRA_CONTAINER_TOOLS.get(name, (["container"], "Toolchain image binary"))
+            rows.append((name, ", ".join(categories), purpose, "docker"))
+        rows.sort(key=lambda row: row[0])
+        if hasattr(self, "tools_backend_label"):
+            if mode == "docker":
+                ready = tool_available("nuclei")
+                state = "image ready" if ready else "image missing — build/pull osint-tools"
+            else:
+                state = "host binaries"
+            self.tools_backend_label.setText(f"Backend: {mode} ({state})")
+        self.tools_table.setRowCount(len(rows))
+        for row, (name, categories, purpose, via) in enumerate(rows):
+            ready = tool_available(name)
+            values = [name, "yes" if ready else "no", via, categories, purpose]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 if col == 1:

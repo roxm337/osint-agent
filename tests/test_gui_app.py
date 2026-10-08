@@ -118,6 +118,13 @@ def test_gui_saves_scanner_settings(tmp_path):
     window.xss_browser_confirm_check.setChecked(True)
     window.xss_max_points_spin.setValue(123)
     window.xss_dalfox_timeout_spin.setValue(456)
+    window.xss_dalfox_blind_oob_check.setChecked(True)
+    window.xss_dalfox_rate_spin.setValue(10)
+    window.kr_enabled_check.setChecked(False)
+    window.kr_wordlist_input.setText("apiroutes-260227")
+    window.kr_max_routes_spin.setValue(500)
+    window.semgrep_enabled_check.setChecked(True)
+    window.semgrep_rules_input.setText("rules/semgrep")
     window.nuclei_full_cve_check.setChecked(False)
     window.fast_scan_paths_input.setPlainText("/.env\n/.git/config")
     window.fast_scan_timeout_spin.setValue(3)
@@ -133,6 +140,11 @@ def test_gui_saves_scanner_settings(tmp_path):
     assert "X-Test: 'yes'" in saved or "X-Test: yes" in saved
     assert "max_points: 123" in saved
     assert "dalfox_timeout: 456" in saved
+    assert "dalfox_blind_oob: true" in saved
+    assert "dalfox_rate_limit: 10" in saved
+    assert "kiterunner:" in saved
+    assert "max_routes: 500" in saved
+    assert "semgrep:" in saved
     assert "full_cve_on_confirmed_apex: false" in saved
     assert "/.env" in saved
     assert "/.git/config" in saved
@@ -141,6 +153,72 @@ def test_gui_saves_scanner_settings(tmp_path):
     assert "max_paths: 12" in saved
     assert "callback_domain: oob.example.test" in saved
     assert "poll_timeout: 44" in saved
+
+    window.close()
+    app.processEvents()
+
+
+def test_gui_saves_toolchain_and_oob_settings(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "tools: {}\n"
+        "oob: {}\n"
+        "modules:\n"
+        "  sqli_scan: {}\n"
+    )
+
+    window = MainWindow()
+    window.config_path = config_path
+    window._load_settings_form()
+    assert window.tools_backend_combo.currentText() == "local"
+    assert window.oob_mode_combo.currentData() == ""
+    assert window.oob_enabled_check.isChecked()
+    assert window.sqli_oast_check.isChecked()
+
+    window.tools_backend_combo.setCurrentText("docker")
+    window.tools_image_input.setText("osint-tools:test")
+    window.oob_mode_combo.setCurrentIndex(window.oob_mode_combo.findData("public"))
+    window.oob_enabled_check.setChecked(False)
+    window.sqli_oast_check.setChecked(False)
+    window._save_settings_form()
+
+    saved = yaml.safe_load(config_path.read_text())
+    assert saved["tools"] == {"backend": "docker", "image": "osint-tools:test"}
+    assert saved["oob"]["mode"] == "public"
+    assert saved["oob"]["enabled"] is False
+    assert saved["modules"]["sqli_scan"]["oast"] is False
+
+    # Reload reads everything back, including the image default fallback.
+    window._load_settings_form()
+    assert window.tools_backend_combo.currentText() == "docker"
+    assert window.tools_image_input.text() == "osint-tools:test"
+    assert window.oob_mode_combo.currentData() == "public"
+    assert not window.oob_enabled_check.isChecked()
+    assert not window.sqli_oast_check.isChecked()
+
+    window.close()
+    app.processEvents()
+
+
+def test_tools_tab_shows_container_toolchain():
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._refresh_tools_status()
+
+    tools = {
+        window.tools_table.item(row, 0).text(): (
+            window.tools_table.item(row, 1).text(),
+            window.tools_table.item(row, 2).text(),
+        )
+        for row in range(window.tools_table.rowCount())
+    }
+    assert {"nuclei", "httpx"} <= set(tools)
+    # Tier-1 / container-only tools are visible with a docker route.
+    for name in ("jsluice", "gxss", "uro", "graphql-cop", "interactsh-client"):
+        assert name in tools, f"missing container tool row: {name}"
+        assert tools[name][1] == "docker"
+    assert window.tools_backend_label.text().startswith("Backend: ")
 
     window.close()
     app.processEvents()

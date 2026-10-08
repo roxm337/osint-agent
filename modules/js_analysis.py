@@ -2,6 +2,7 @@
 
 import re
 from modules.base import BaseModule
+from tools.external import semgrep_scan, tool_available
 from tools.wrappers import curl_with_status, bash
 from core.response_fingerprint import establish_baseline, fingerprint
 from core.surface import script_urls_from_html
@@ -469,6 +470,7 @@ class JSAnalysis(BaseModule):
         source_maps = []
         analyzed = 0
         skipped_catch_all = 0
+        staged_bundles: dict[str, str] = {}
 
         for js_url in target_js:
             result = await curl_with_status(js_url)
@@ -494,6 +496,8 @@ class JSAnalysis(BaseModule):
                 continue
 
             analyzed += 1
+            if len(staged_bundles) < 20:
+                staged_bundles[js_url] = content
 
             # Check for source map URL
             if "sourceMappingURL=" in content:
@@ -777,6 +781,65 @@ class JSAnalysis(BaseModule):
                 ),
             )
 
+        semgrep_flows, semgrep_sinks = await self._semgrep_pass(staged_bundles)
+
+        if semgrep_flows:
+            pairs = sorted({f"{h['rule']} in "
+                            f"{h['source'].split('/')[-1]}:{h['line']}"
+                            for h in semgrep_flows})
+            self.log(f"  {len(semgrep_flows)} semgrep taint flow(s): "
+                     f"{', '.join(pairs[:5])}")
+            self.state.add_finding(
+                title="Semgrep Traced Taint Flows in JavaScript: "
+                      f"{len(semgrep_flows)} flow(s)",
+                severity="MEDIUM",
+                confidence="TENTATIVE",
+                category="Client-Side Attack Surface",
+                description=(
+                    f"{len(semgrep_flows)} semgrep taint rule(s) matched: an "
+                    f"attacker-controlled DOM source reaches a code-execution "
+                    f"or HTML sink in the parsed syntax tree. Same standing as "
+                    f"a regex-traced flow — a prioritised reading list, not a "
+                    f"vulnerability. Confirm execution before escalating."
+                ),
+                evidence=[
+                    f"[{h['rule']}] {h['source'].split('/')[-1]}:{h['line']}: "
+                    f"{h['message'][:150]}"
+                    for h in semgrep_flows[:12]
+                ],
+                remediation=(
+                    "Do not write untrusted values to DOM sinks. Encode for "
+                    "the HTML context, prefer textContent over innerHTML, "
+                    "and enforce CSP."
+                ),
+            )
+
+        if semgrep_sinks:
+            kinds = sorted({h["rule"] for h in semgrep_sinks})
+            self.log(f"  {len(semgrep_sinks)} semgrep sink(s): "
+                     f"{', '.join(kinds[:8])} — inventory only, not reported "
+                     f"as vulnerabilities")
+            self.state.add_finding(
+                title="Semgrep Sink Candidates in JavaScript: "
+                      f"{len(semgrep_sinks)}",
+                severity="LOW",
+                confidence="FIRM",
+                category="Client-Side Attack Surface",
+                description=(
+                    f"{len(semgrep_sinks)} semgrep sink rule(s) matched "
+                    f"(kinds: {kinds}). A sink with no traced source is "
+                    f"inventory: eval() of a constant and innerHTML of a "
+                    f"framework template are normal code. Read the taint "
+                    f"flows first."
+                ),
+                evidence=[
+                    f"[{h['rule']}] {h['source'].split('/')[-1]}:{h['line']}: "
+                    f"{h['message'][:150]}"
+                    for h in semgrep_sinks[:15]
+                ],
+                remediation="No action unless a listed sink takes untrusted input.",
+            )
+
         self.state.add_asset(
             "js_analysis",
             f"js_analysis:{self.domain}",
@@ -791,6 +854,9 @@ class JSAnalysis(BaseModule):
                 "endpoints_found": len(unique_endpoints),
                 "source_maps_found": len(source_maps),
                 "dom_sinks_found": len(unique_dom_sinks),
+                "semgrep_scanned": len(staged_bundles),
+                "semgrep_flows": len(semgrep_flows),
+                "semgrep_sinks": len(semgrep_sinks),
             },
         )
 
@@ -801,3 +867,35 @@ class JSAnalysis(BaseModule):
             f"{len(unique_dom_sinks)} DOM sinks"
         )
         return "done"
+
+    async def _semgrep_pass(self, bundles: dict) -> tuple[list, list]:
+        """SAST over downloaded bundles with repo-local rules.
+
+        Returns (taint_flows, sinks): ERROR-rule hits are the traced
+        flows (MEDIUM/TENTATIVE reading list); WARNING/INFO hits are
+        sink inventory (LOW). Static either way — execution proof, not
+        a rule id, is what escalates. Off in config or missing binary
+        means an empty pair, never a skip of the whole module.
+        """
+        empty: tuple[list, list] = ([], [])
+        if not bundles:
+            return empty
+        sast_cfg = self.config.get("semgrep", {})
+        sast_cfg = sast_cfg if isinstance(sast_cfg, dict) else {}
+        if sast_cfg.get("enabled", True) is False:
+            return empty
+        if not tool_available("semgrep"):
+            self.log("  semgrep pass skipped: binary not installed")
+            return empty
+        rules = str(sast_cfg.get("rules", "rules/semgrep") or "rules/semgrep")
+        self.log(f"  semgrep: {len(bundles)} bundle(s), rules {rules}...")
+        result = await semgrep_scan(bundles, rules=rules, timeout=300)
+        if not result.get("available", True):
+            return empty
+        hits = result.get("results", [])
+        flows = [h for h in hits
+                 if str(h.get("severity", "")).upper() == "ERROR"]
+        sinks = [h for h in hits
+                 if str(h.get("severity", "")).upper() != "ERROR"]
+        self.log(f"  semgrep: {len(flows)} flow(s), {len(sinks)} sink(s)")
+        return flows, sinks

@@ -313,6 +313,17 @@ modules:
   content_discovery:
     enabled: true
 
+    # API-route brute force via kiterunner (assetnote wordlists, downloaded
+    # at scan time — nothing baked into the image). Hits reuse the same
+    # grading as ffuf: a 200 on a sensitive name is MEDIUM, a 401/403 is
+    # INFO, anything else is an asset. Bounded per target so a big API
+    # does not eat the module timeout.
+    kiterunner:
+      enabled: true
+      wordlist: "apiroutes-260227"  # see `kr wordlist list` for current names
+      max_routes: 1500               # routes tried per target (cap 20000)
+      max_targets: 2                 # base URL + api_endpoint origins (cap 10)
+
     # Results are graded by what the status establishes. A 200 on a
     # sensitive-looking path is MEDIUM; a 401/403 is INFO, because access
     # control holding is not a weakness. ffuf runs with -ac, and hits sharing a
@@ -414,6 +425,20 @@ xss:
   max_points: 80
   browser_confirm: true
   dalfox_timeout: 600
+  # Let dalfox run its own interactsh session against the public mesh.
+  # Findings from that session stay FIRM (dalfox saw the callback, the
+  # framework did not poll it). Off by default: the framework-owned blind
+  # pass above confirms via poll and can reach CONFIRMED.
+  dalfox_blind_oob: false
+  # Global outbound cap for dalfox in requests/second (0 = unlimited).
+  dalfox_rate_limit: 0
+
+semgrep:
+  # SAST over downloaded JS bundles with repo-local rules (rules/semgrep/).
+  # Offline and deterministic: no registry, no metrics. Taint flows file as
+  # MEDIUM/TENTATIVE, plain sinks as LOW — static either way, never proof.
+  enabled: true
+  rules: "rules/semgrep"
 
 scoring:
   weights:

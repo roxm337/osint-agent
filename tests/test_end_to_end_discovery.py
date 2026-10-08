@@ -803,7 +803,7 @@ def test_a_message_listener_is_an_entry_point_not_a_sink():
 # ── What counts as a DOM-XSS finding ──────────────────────────────
 
 
-def _analyse_js(monkeypatch, js_body: str):
+def _analyse_js(monkeypatch, js_body: str, semgrep_hits=None):
     """Run JSAnalysis over one fake script and return the state it wrote."""
     import modules.js_analysis as js_mod
     from modules.js_analysis import JSAnalysis
@@ -823,7 +823,13 @@ def _analyse_js(monkeypatch, js_body: str):
                     "headers": "Content-Type: text/html; charset=utf-8"}
         return {"status": 404, "body": "", "headers": ""}
 
+    async def fake_semgrep(sources, rules="rules/semgrep", timeout=300):
+        return {"available": True, "results": list(semgrep_hits or []),
+                "scanned": len(sources), "exit_code": 0, "error": None}
+
     monkeypatch.setattr(js_mod, "curl_with_status", fake_fetch)
+    monkeypatch.setattr(js_mod, "semgrep_scan", fake_semgrep)
+    monkeypatch.setattr(js_mod, "tool_available", lambda name: True)
     result = asyncio.run(
         JSAnalysis(state, {"target": {"domain": "example.com"},
                            "modules": {}}).run())
@@ -862,3 +868,45 @@ def test_a_traced_flow_is_still_reported(monkeypatch):
     assert result == "done"
     titles = [f["title"] for f in state.findings["findings"]]
     assert any("DOM Sink" in t for t in titles), titles
+
+
+def test_semgrep_taint_flow_is_a_tentative_reading_list(monkeypatch):
+    """An ERROR-rule hit is source-reachable in parsed syntax — the same
+    standing as a regex-traced flow: MEDIUM/TENTATIVE, never proof."""
+    result, state = _analyse_js(
+        monkeypatch, "var x = 1; function noop(){return x + 1;} // padding",
+        semgrep_hits=[{
+            "rule": "js-dom-taint-to-innerhtml", "severity": "ERROR",
+            "message": "Attacker-controlled DOM source reaches an HTML sink.",
+            "source": "http://example.com/library.js", "line": 3,
+            "snippet": "el.innerHTML = location.hash;",
+        }])
+
+    assert result == "done"
+    flows = [f for f in state.findings["findings"]
+             if f["title"].startswith("Semgrep Traced Taint Flows")]
+    assert len(flows) == 1
+    assert flows[0]["severity"] == "MEDIUM"
+    assert flows[0]["confidence"] == "TENTATIVE"
+
+
+def test_semgrep_sink_without_flow_is_low_inventory(monkeypatch):
+    """A WARNING-rule hit with no traced source is inventory: LOW/FIRM,
+    the same shelf as the regex sink list."""
+    result, state = _analyse_js(
+        monkeypatch, "var x = 1; function noop(){return x + 1;} // padding",
+        semgrep_hits=[{
+            "rule": "js-eval-call", "severity": "WARNING",
+            "message": "Direct eval().",
+            "source": "http://example.com/library.js", "line": 9,
+            "snippet": "eval(constant)",
+        }])
+
+    assert result == "done"
+    titles = [f["title"] for f in state.findings["findings"]]
+    assert any(t.startswith("Semgrep Sink Candidates") for t in titles)
+    assert not any(t.startswith("Semgrep Traced Taint Flows") for t in titles)
+    sink = [f for f in state.findings["findings"]
+            if f["title"].startswith("Semgrep Sink Candidates")][0]
+    assert sink["severity"] == "LOW"
+    assert sink["confidence"] == "FIRM"

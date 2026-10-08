@@ -31,7 +31,7 @@ DOCKER_TOOLS = frozenset({
     "dalfox", "sqlmap", "corsy", "smuggler",
     "subzy", "assetfinder", "waybackurls", "dig", "whois",
     "jsluice", "gxss", "uro", "gitleaks", "graphql-cop",
-    "interactsh-client",
+    "interactsh-client", "kr", "semgrep",
 })
 
 _BACKEND = {"mode": "local", "image": "osint-tools:latest"}
@@ -58,17 +58,35 @@ def tool_backend() -> str:
 
 
 def _docker_ready() -> bool:
-    """The image resolves locally. Cached per process; restart to re-check."""
+    """The image resolves locally. Cached per process; restart to re-check.
+
+    Tries the configured reference, then the fully-qualified
+    docker.io/library/ form: some Docker Desktop releases resolve short
+    names for run/pull but not for `image inspect`, so the short form
+    alone reports a present image as missing.
+    """
     global _DOCKER_OK
     if _DOCKER_OK is not None:
         return _DOCKER_OK
+    image = _BACKEND["image"]
+    candidates = [image]
+    if "/" not in image:
+        candidates.append(f"docker.io/library/{image}")
     try:
-        proc = subprocess.run(
-            ["docker", "image", "inspect", _BACKEND["image"]],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=15,
+        for candidate in candidates:
+            proc = subprocess.run(
+                ["docker", "image", "inspect", candidate],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=15,
+            )
+            if proc.returncode == 0:
+                _DOCKER_OK = True
+                return True
+        listed = subprocess.run(
+            ["docker", "images", "-q", image],
+            capture_output=True, text=True, timeout=15,
         )
-        _DOCKER_OK = proc.returncode == 0
+        _DOCKER_OK = bool(listed.stdout.strip())
     except Exception:
         _DOCKER_OK = False
     return _DOCKER_OK
@@ -160,6 +178,7 @@ def tools_available() -> dict:
         "nikto", "whatweb", "gobuster", "feroxbuster",
         "hakrawler", "arjun", "paramspider", "gowitness",
         "dalfox", "sqlmap", "corsy", "smuggler", "openredirex",
+        "kr", "semgrep",
     ]
     return {t: tool_available(t) for t in tools}
 
@@ -570,7 +589,13 @@ async def gowitness_scan(targets: List[str], output_dir: str,
 
 
 def parse_dalfox_jsonl(text: str) -> List[dict]:
-    """Parse Dalfox JSON/JSONL output."""
+    """Parse Dalfox JSONL output (v3 shape, v2 tolerant).
+
+    v3 finding lines carry `type` (V/A/R/I tier), `type_description`,
+    `inject_type` and the PoC; v2 lines carried `data`/`poc`. Field
+    fallbacks keep both readable — a finding is kept when any of its
+    URL-carrying fields is present.
+    """
     findings = []
     for line in (text or "").splitlines():
         line = line.strip()
@@ -580,35 +605,60 @@ def parse_dalfox_jsonl(text: str) -> List[dict]:
             item = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(item, dict):
+            continue
+        url = (item.get("url") or item.get("data") or item.get("target")
+               or item.get("poc_url") or item.get("poc") or "")
+        if not url and not item.get("type"):
+            continue
         findings.append({
             "type": item.get("type", item.get("poc_type", "")),
-            "url": item.get("data", item.get("url", "")),
-            "payload": item.get("payload", ""),
-            "evidence": item.get("evidence", item.get("poc", "")),
+            "url": url,
+            "payload": item.get("payload", item.get("poc", "")),
+            "evidence": (item.get("evidence") or item.get("poc")
+                         or item.get("type_description", "")),
+            # v3 tier context, empty on v2 lines: V = exploitable,
+            # A = AST-detected, R = reflected, I = informational.
+            "inject_type": item.get("inject_type", ""),
+            "method": item.get("method", ""),
         })
     return findings
 
 
 async def dalfox_scan(urls: List[str], timeout: int = 600,
-                     blind: Optional[str] = None) -> dict:
-    """Run Dalfox in conservative pipe mode.
+                      blind: Optional[str] = None,
+                      blind_oob: bool = False,
+                      rate_limit: int = 0) -> dict:
+    """Run Dalfox v3 in conservative pipe mode.
+
+    v3 notes: `pipe` stays as a legacy alias for `scan -i pipe`;
+    line-delimited output is `-f jsonl` now (plain `json` emits one
+    document); `--skip-bav` is gone (the V/A/R/I tiers replaced it —
+    `--only-poc v` keeps the exploitable tier); exit 1 means findings,
+    which is normal and not an error here.
 
     `blind` is an out-of-band callback URL (interactsh): dalfox injects
     blind payloads that phone home, and a callback is execution proof
-    for stored/blind contexts the response scan cannot see.
+    for stored/blind contexts the response scan cannot see. `blind_oob`
+    instead lets dalfox run its own interactsh session (`--blind-oob`,
+    public mesh) — no framework callback to poll, so those findings
+    stay FIRM: dalfox saw the callback, we did not.
     """
     if not tool_available("dalfox"):
         return {"available": False, "results": [], "error": "missing"}
 
     args = [
         "dalfox", "pipe",
-        "--silence",
-        "--format", "json",
-        "--skip-bav",
+        "-S",
+        "-f", "jsonl",
         "--only-poc", "v",
     ]
     if blind:
         args.extend(["--blind", blind])
+    if blind_oob:
+        args.append("--blind-oob")
+    if rate_limit and int(rate_limit) > 0:
+        args.extend(["--rate-limit", str(int(rate_limit))])
     result = await run_command(args, timeout=timeout, stdin_data="\n".join(urls))
     return {
         "available": True,
@@ -617,6 +667,97 @@ async def dalfox_scan(urls: List[str], timeout: int = 600,
         "stderr": result["stderr"][:5000],
         "exit_code": result["exit_code"],
         "error": result.get("error"),
+    }
+
+
+def parse_kiterunner_json(text: str) -> List[dict]:
+    """Parse `kr brute/scan -o json` hit lines.
+
+    Hits look like
+    `{"method":"GET","target":"https://h","path":"/api",
+    "responses":[{"uri":"","sc":200,"len":123}]}`; log lines carry
+    `"level"` instead of `"responses"` and are skipped. Only the
+    first response per path is kept — one path, one verdict.
+    """
+    hits = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or '"responses"' not in line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        responses = item.get("responses") or []
+        first = responses[0] if responses else {}
+        target = str(item.get("target", "") or "").rstrip("/")
+        path = str(item.get("path", "") or "")
+        if not target or not path:
+            continue
+        hits.append({
+            "url": target + (path if path.startswith("/") else f"/{path}"),
+            "method": str(item.get("method", "GET") or "GET"),
+            "status": int(first.get("sc") or 0),
+            "length": int(first.get("len") or 0),
+        })
+    return hits
+
+
+async def kiterunner_scan(targets: List[str], timeout: int = 900,
+                          wordlist: str = "apiroutes-260227",
+                          max_routes: int = 1500,
+                          fail_codes: str = "400,401,403,404,426,411",
+                          delay_ms: int = 100,
+                          connections: int = 3) -> dict:
+    """Brute-force API routes with kiterunner (assetnote wordlists).
+
+    `kr brute <target> -A=<wordlist>:<N> -o json`: the wordlist
+    downloads from wordlist.assetnote.io at scan time, so nothing is
+    baked into the image. Bounded by max_routes per target; `--delay`
+    keeps the request rate polite. One invocation per target so a
+    slow host cannot starve the rest.
+    """
+    if not tool_available("kr"):
+        return {"available": False, "results": [], "error": "missing"}
+    try:
+        max_routes = max(1, min(20000, int(max_routes)))
+    except (TypeError, ValueError):
+        max_routes = 1500
+    try:
+        connections = max(1, min(10, int(connections)))
+    except (TypeError, ValueError):
+        connections = 3
+    hits: List[dict] = []
+    exit_codes: List[int] = []
+    errors: List[str] = []
+    for target in targets:
+        args = [
+            "kr", "brute", target,
+            "-A", f"{wordlist}:{max_routes}",
+            "-o", "json",
+            "-q", "--progress=false",
+            "-x", str(connections),
+            "-j", "1",
+            "--delay", f"{max(0, int(delay_ms or 0))}ms",
+            "-t", "10s",
+        ]
+        if fail_codes:
+            args.extend(["--fail-status-codes", str(fail_codes)])
+        result = await run_command(args, timeout=timeout)
+        exit_codes.append(int(result.get("exit_code") or 0))
+        if result.get("error"):
+            errors.append(str(result["error"])[:200])
+        hits.extend(parse_kiterunner_json(result.get("stdout", "")))
+    return {
+        "available": True,
+        "results": hits,
+        "targets": list(targets),
+        "wordlist": wordlist,
+        "max_routes": max_routes,
+        "exit_codes": exit_codes,
+        "error": "; ".join(errors) or None,
     }
 
 
@@ -1068,6 +1209,76 @@ async def jsluice_urls(js_body: str, timeout: int = 60) -> list:
         else:
             found.append(line)
     return found
+
+
+async def semgrep_scan(sources: dict, rules: str = "rules/semgrep",
+                       timeout: int = 300) -> dict:
+    """Run Semgrep SAST over in-memory JS/TS sources.
+
+    Bodies are staged to a temp dir under the repo root (so the docker
+    backend maps it into /work) and scanned with repo-local rules —
+    offline and deterministic: `--metrics off --disable-version-check`,
+    no registry. Returns one entry per rule hit with the source URL it
+    came from. Static by construction: callers must grade these as
+    inventory (LOW) or reading-list (MEDIUM/TENTATIVE), never as
+    execution proof.
+    """
+    if not tool_available("semgrep"):
+        return {"available": False, "results": [], "error": "missing"}
+    if not sources:
+        return {"available": True, "results": [], "error": None}
+    import tempfile
+    tmpdir = ""
+    names: dict[str, str] = {}
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="semgrep-", dir=os.getcwd())
+        for index, (source_url, body) in enumerate(sources.items()):
+            text = body if isinstance(body, str) else str(body or "")
+            if not text or len(text) < 50:
+                continue
+            relname = f"bundle-{index}.js"
+            with open(os.path.join(tmpdir, relname), "w") as handle:
+                handle.write(text[:2_000_000])
+            names[relname] = str(source_url)
+        result = await run_command(
+            ["semgrep", "--config", rules, "--json",
+             "--metrics", "off", "--disable-version-check",
+             "--include=*.js", "--include=*.ts", tmpdir],
+            timeout=timeout)
+    finally:
+        if tmpdir:
+            import shutil as _shutil
+            try:
+                _shutil.rmtree(tmpdir, ignore_errors=True)
+            except OSError:
+                pass
+    findings = []
+    try:
+        data = json.loads(result.get("stdout") or "{}")
+    except (ValueError, TypeError):
+        data = {}
+    errors = (data.get("errors") or []) if isinstance(data, dict) else []
+    for item in (data.get("results") or []):
+        if not isinstance(item, dict):
+            continue
+        relname = str(item.get("path", "") or "").split("/")[-1]
+        extra = item.get("extra") or {}
+        findings.append({
+            "rule": str(item.get("check_id", "") or "").split(".")[-1],
+            "severity": str(extra.get("severity", "INFO") or "INFO").upper(),
+            "message": str(extra.get("message", "") or "")[:300],
+            "source": names.get(relname, relname),
+            "line": int((item.get("start") or {}).get("line") or 0),
+            "snippet": str(extra.get("lines", "") or "")[:400],
+        })
+    return {
+        "available": True,
+        "results": findings,
+        "scanned": len(names),
+        "rule_errors": len(errors),
+        "exit_code": result.get("exit_code"),
+        "error": result.get("error"),
+    }
 
 
 async def graphql_cop_scan(endpoint: str, timeout: int = 180) -> dict:

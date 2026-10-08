@@ -66,6 +66,13 @@ class XSSScan(BaseModule):
                 [point["url"] for point in points[:max_points]],
                 timeout=int(cfg.get("dalfox_timeout", 600)),
                 blind=blind_url,
+                # Dalfox runs its own interactsh session against the public
+                # mesh: no framework callback to poll, so those findings stay
+                # FIRM (dalfox saw the callback, we did not). Off by default
+                # — the framework-owned blind pass above confirms via poll.
+                blind_oob=bool(cfg.get("dalfox_blind_oob", False))
+                and blind_url is None,
+                rate_limit=int(cfg.get("dalfox_rate_limit", 0) or 0),
             )
             dalfox_findings = result.get("results", []) if result.get("available", True) else []
         else:
@@ -121,8 +128,11 @@ class XSSScan(BaseModule):
             if key in seen:
                 continue
             seen.add(key)
+            # v3 reports blind hits via inject_type blind-oob-…; v2 used a
+            # V-blind type. Either marks a phone-home candidate.
             blind_hit = "blind" in str(item.get("type", "")).lower() or \
-                "blind" in str(item.get("evidence", "")).lower()
+                "blind" in str(item.get("evidence", "")).lower() or \
+                "blind" in str(item.get("inject_type", "")).lower()
             if blind_hit and blind_callback and oob_client is not None:
                 confirmed = await self._confirm_blind_callback(
                     oob_client, blind_callback)

@@ -178,7 +178,7 @@ def _reproduce_block(finding: dict) -> list[str]:
         lines.append("")
         lines.append("```bash")
         target = url or "<target URL with parameter>"
-        lines.append(f"dalfox url '{target}' --skip-bav --only-poc v")
+        lines.append(f"dalfox scan -i url '{target}' --only-poc v")
         lines.append("```")
         lines.append("- Browser-executed marker reflection is the bar; "
                      "reflected text alone is a candidate, not proof.")

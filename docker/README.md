@@ -1,9 +1,10 @@
 # Toolchain container — no installs on your machine
 
 One image holds the whole offensive toolchain (nmap, nuclei + templates,
-ffuf, httpx, subfinder, amass, katana, dalfox, sqlmap, wpscan, nikto,
+ffuf, httpx, subfinder, amass, katana, dalfox v3, sqlmap, wpscan, nikto,
 whatweb, gobuster, feroxbuster, theHarvester, trufflehog, gitleaks,
-jsluice, interactsh-client, graphql-cop, testssl.sh, searchsploit, …
+jsluice, kiterunner (kr), semgrep, interactsh-client, graphql-cop,
+testssl.sh, searchsploit, …
 — see `Dockerfile.tools` for the full list). The framework runs
 everything elsewhere unchanged: Python, config, state, and reports
 stay on the host.

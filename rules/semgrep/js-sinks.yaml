@@ -1,0 +1,124 @@
+# Repo-local Semgrep rules for the js_analysis SAST pass.
+#
+# Offline and deterministic: no registry, no metrics, no version check
+# (the wrapper passes --metrics off --disable-version-check). These rules
+# complement the regex inventory in modules/js_analysis.py — semgrep parses
+# real syntax, so `eval(x)` matches and `evaluation` does not.
+#
+# Doctrine: every hit here is static. Nothing below is execution proof.
+# Taint flows (mode: taint) file as MEDIUM/TENTATIVE reading-list items;
+# plain sinks file as LOW/FIRM inventory. Escalation needs a browser or
+# a callback, never a rule id.
+rules:
+  - id: js-eval-call
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Direct eval() of a possibly attacker-controlled string.
+    pattern: eval(...)
+    metadata:
+      category: sink
+      owasp: "A03:2021 - Injection"
+
+  - id: js-new-function
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: new Function() compiles a string as code, like eval.
+    pattern: new Function(...)
+    metadata:
+      category: sink
+      owasp: "A03:2021 - Injection"
+
+  - id: js-innerhtml-assign
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Assignment to innerHTML/outerHTML parses markup as HTML.
+    patterns:
+      - pattern-either:
+          - pattern: $EL.innerHTML = ...
+          - pattern: $EL.outerHTML = ...
+    metadata:
+      category: sink
+      owasp: "A03:2021 - Injection"
+
+  - id: js-document-write
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: document.write() parses its argument as HTML in-page.
+    patterns:
+      - pattern-either:
+          - pattern: document.write(...)
+          - pattern: document.writeln(...)
+    metadata:
+      category: sink
+      owasp: "A03:2021 - Injection"
+
+  - id: js-timer-string
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: setTimeout/setInterval with a string compiles it as code.
+    patterns:
+      - pattern-either:
+          - pattern: setTimeout("...", ...)
+          - pattern: setInterval("...", ...)
+    metadata:
+      category: sink
+      owasp: "A03:2021 - Injection"
+
+  - id: js-postmessage-wildcard
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: postMessage to "*" leaks the payload to any origin.
+    pattern: $WIN.postMessage(..., "*")
+    metadata:
+      category: sink
+      owasp: "A01:2021 - Broken Access Control"
+
+  - id: js-dom-taint-to-innerhtml
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Attacker-controlled DOM source reaches an HTML sink.
+    mode: taint
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: location.hash
+              - pattern: location.search
+              - pattern: location.href
+              - pattern: document.URL
+              - pattern: document.referrer
+              - pattern: |
+                  new URLSearchParams(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $EL.innerHTML = ...
+              - pattern: $EL.outerHTML = ...
+              - pattern: document.write(...)
+              - pattern: $EL.insertAdjacentHTML(...)
+    metadata:
+      category: taint-flow
+      owasp: "A03:2021 - Injection"
+
+  - id: js-dom-taint-to-code-exec
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Attacker-controlled DOM source reaches code compilation.
+    mode: taint
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: location.hash
+              - pattern: location.search
+              - pattern: location.href
+              - pattern: document.URL
+              - pattern: document.referrer
+              - pattern: document.cookie
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: eval(...)
+              - pattern: new Function(...)
+              - pattern: setTimeout("...", ...)
+    metadata:
+      category: taint-flow
+      owasp: "A03:2021 - Injection"

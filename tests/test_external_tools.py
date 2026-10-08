@@ -110,6 +110,39 @@ def test_parse_arjun_json():
     ]
 
 
+def test_docker_ready_falls_back_to_qualified_reference(monkeypatch):
+    """Some Docker Desktop releases resolve short names for run/pull but
+    not for `image inspect` — the short form then reports a present
+    image as missing. The check must try docker.io/library/ next."""
+    import subprocess as _subprocess
+    import tools.external as external
+
+    seen = []
+
+    class _Proc:
+        def __init__(self, rc, out=""):
+            self.returncode = rc
+            self.stdout = out
+
+    def fake_run(args, **kwargs):
+        seen.append(args[-1])
+        if args[-1] == "osint-tools:latest":
+            return _Proc(1)
+        return _Proc(0)
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    external._DOCKER_OK = None
+    external._BACKEND["image"] = "osint-tools:latest"
+
+    try:
+        assert external._docker_ready() is True
+    finally:
+        external._DOCKER_OK = None
+        external.configure_tool_backend({})
+    assert seen[0] == "osint-tools:latest"
+    assert "docker.io/library/osint-tools:latest" in seen
+
+
 def test_parse_dalfox_jsonl():
     results = parse_dalfox_jsonl(
         '{"type":"v","data":"https://example.com/?q=x","payload":"<x>"}\n'
@@ -117,6 +150,163 @@ def test_parse_dalfox_jsonl():
 
     assert results[0]["type"] == "v"
     assert results[0]["payload"] == "<x>"
+
+
+def test_parse_dalfox_jsonl_v3_shape():
+    """v3 lines carry type tiers, inject_type and a url field instead of
+    data; the parser must keep them without dropping the v2 shape above."""
+    results = parse_dalfox_jsonl(
+        '{"type":"V","type_description":"Vulnerable - exploitable",'
+        '"inject_type":"inHTML","method":"GET",'
+        '"url":"https://example.com/?q=x","payload":"<svg>"}\n'
+        '{"type":"R","inject_type":"inHTML-HPP",'
+        '"url":"https://example.com/?p=y"}\n'
+        '{"level":"info","message":"scan complete"}\n'
+    )
+
+    assert len(results) == 2
+    assert results[0]["type"] == "V"
+    assert results[0]["url"] == "https://example.com/?q=x"
+    assert results[0]["inject_type"] == "inHTML"
+    assert results[0]["evidence"] == "Vulnerable - exploitable"
+    assert results[1]["type"] == "R"
+
+
+def test_dalfox_scan_uses_v3_flags(monkeypatch):
+    """v3 renamed the format flag, retired --skip-bav, and reports
+    findings on exit 1 — the invocation must match the new CLI."""
+    import tools.external as external
+
+    calls = {}
+
+    async def fake_run(args, timeout=120, stdin_data=""):
+        calls["args"] = args
+        calls["stdin"] = stdin_data
+        return {"stdout": "", "stderr": "", "exit_code": 1, "error": None}
+
+    monkeypatch.setattr(external, "run_command", fake_run)
+    monkeypatch.setattr(external, "tool_available", lambda name: True)
+
+    result = asyncio.run(external.dalfox_scan(
+        ["https://example.com/?q=x"], timeout=60,
+        blind="http://cb.oob/x", blind_oob=False, rate_limit=5))
+
+    args = calls["args"]
+    assert args[:2] == ["dalfox", "pipe"]
+    assert "-f" in args and "jsonl" in args
+    assert "--format" not in args and "--skip-bav" not in args
+    assert "--blind" in args and "http://cb.oob/x" in args
+    assert "--blind-oob" not in args
+    assert "--rate-limit" in args and "5" in args
+    assert calls["stdin"] == "https://example.com/?q=x"
+    assert result["available"] is True
+    assert result["exit_code"] == 1  # findings, not failure
+
+
+def test_dalfox_scan_blind_oob_flag(monkeypatch):
+    import tools.external as external
+
+    calls = {}
+
+    async def fake_run(args, timeout=120, stdin_data=""):
+        calls["args"] = args
+        return {"stdout": "", "stderr": "", "exit_code": 0, "error": None}
+
+    monkeypatch.setattr(external, "run_command", fake_run)
+    monkeypatch.setattr(external, "tool_available", lambda name: True)
+
+    asyncio.run(external.dalfox_scan(["https://example.com/"], blind_oob=True))
+
+    assert "--blind-oob" in calls["args"]
+    assert "--blind" not in calls["args"]
+
+
+def test_parse_kiterunner_json():
+    from tools.external import parse_kiterunner_json
+
+    text = (
+        '{"level":"info","message":"scan options"}\n'
+        '{"method":"GET","target":"https://h.test","path":"/api",'
+        '"responses":[{"uri":"","sc":200,"len":123}]}\n'
+        '{"method":"POST","target":"https://h.test/","path":"v1/login",'
+        '"responses":[{"uri":"","sc":403,"len":9}]}\n'
+        '{"level":"info","results":0,"message":"scan complete"}\n'
+        "not json at all\n"
+    )
+    hits = parse_kiterunner_json(text)
+
+    assert hits == [
+        {"url": "https://h.test/api", "method": "GET",
+         "status": 200, "length": 123},
+        {"url": "https://h.test/v1/login", "method": "POST",
+         "status": 403, "length": 9},
+    ]
+
+
+def test_kiterunner_scan_builds_bounded_args(monkeypatch):
+    import tools.external as external
+
+    calls = []
+
+    async def fake_run(args, timeout=120, stdin_data=""):
+        calls.append(args)
+        return {"stdout": "", "stderr": "", "exit_code": 0, "error": None}
+
+    monkeypatch.setattr(external, "run_command", fake_run)
+    monkeypatch.setattr(external, "tool_available", lambda name: True)
+
+    result = asyncio.run(external.kiterunner_scan(
+        ["https://a.test", "https://b.test"],
+        wordlist="apiroutes-260227", max_routes=50000, timeout=60))
+
+    assert len(calls) == 2  # one invocation per target
+    assert calls[0][:3] == ["kr", "brute", "https://a.test"]
+    assert "-A" in calls[0]
+    # max_routes clamps at 20000 so a typo cannot schedule millions.
+    assert "apiroutes-260227:20000" in calls[0]
+    assert "-o" in calls[0] and "json" in calls[0]
+    assert result["available"] is True
+    assert result["targets"] == ["https://a.test", "https://b.test"]
+
+
+def test_semgrep_scan_parses_rule_hits(monkeypatch):
+    import json as _json
+    import tools.external as external
+
+    async def fake_run(args, timeout=120, stdin_data=""):
+        assert args[0] == "semgrep"
+        assert "--metrics" in args and "off" in args
+        assert "--disable-version-check" in args
+        payload = {
+            "results": [{
+                "check_id": "rules.js-eval-call",
+                "path": "tmp/bundle-0.js",
+                "start": {"line": 42},
+                "extra": {"severity": "WARNING",
+                          "message": "Direct eval()",
+                          "lines": "eval(x)"},
+            }],
+            "errors": [],
+        }
+        return {"stdout": _json.dumps(payload), "stderr": "",
+                "exit_code": 0, "error": None}
+
+    monkeypatch.setattr(external, "run_command", fake_run)
+    monkeypatch.setattr(external, "tool_available", lambda name: True)
+
+    result = asyncio.run(external.semgrep_scan(
+        {"https://h.test/app.js": "var x = 1; eval(x); " * 10}))
+
+    assert result["available"] is True
+    assert result["scanned"] == 1
+    assert result["results"] == [{
+        "rule": "js-eval-call",
+        "severity": "WARNING",
+        "message": "Direct eval()",
+        "source": "https://h.test/app.js",
+        "line": 42,
+        "snippet": "eval(x)",
+    }]
 
 
 def test_parse_sqlmap_text():

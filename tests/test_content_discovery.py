@@ -55,7 +55,8 @@ def _ffuf_json(hits):
     })
 
 
-def _run(hits, words=("admin", "login", "backup"), module_cfg=None, present=True):
+def _run(hits, words=("admin", "login", "backup"), module_cfg=None, present=True,
+         kr_hits=None):
     import asyncio
 
     state = StateManager(tempfile.mkdtemp())
@@ -69,10 +70,21 @@ def _run(hits, words=("admin", "login", "backup"), module_cfg=None, present=True
         return {"available": present, "exit_code": 0, "stderr": "",
                 "extra_args": extra_args or []}
 
+    async def fake_kr(targets, **kwargs):
+        if kr_hits is None:
+            return {"available": True, "results": [], "exit_codes": [0],
+                    "wordlist": "test", "max_routes": 0, "error": None}
+        return {"available": True, "results": list(kr_hits),
+                "exit_codes": [0] * max(1, len(targets)),
+                "wordlist": "test", "max_routes": 0, "error": None,
+                "targets": list(targets)}
+
     with patch("modules.content_discovery.tool_available",
                return_value=present), \
          patch("modules.content_discovery.ffuf", new=AsyncMock(
-             side_effect=fake_ffuf)):
+             side_effect=fake_ffuf)), \
+         patch("modules.content_discovery.kiterunner_scan", new=AsyncMock(
+             side_effect=fake_kr)):
         result = asyncio.run(module.run())
     return state, result, module
 
@@ -234,8 +246,56 @@ def test_skips_without_ffuf():
 
 
 def test_skips_without_wordlist():
-    state, result, _ = _run([], words=())
+    # The ffuf wordlist gates the ffuf pass only; kiterunner brings its
+    # own remote wordlist. With kr disabled too, nothing can run.
+    state, result, _ = _run([], words=(),
+                            module_cfg={"kiterunner": {"enabled": False}})
     assert result == "skipped"
+
+
+def test_empty_wordlist_still_runs_kiterunner_pass():
+    """kr carries its own wordlist, so an empty ffuf wordlist must not
+    skip the module when kr returns API routes."""
+    state, result, _ = _run(
+        [], words=(),
+        kr_hits=[{"url": "https://example.test/api/admin", "method": "GET",
+                  "status": 200, "length": 900}])
+    assert result == "done"
+    findings = _findings(state)
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "MEDIUM"
+    paths = {a["value"] for a in state.get_assets_by_type("web_path")}
+    assert paths == {"https://example.test/api/admin"}
+
+
+def test_kiterunner_hits_share_the_grading():
+    """A 200 on a sensitive API name via kr is served/MEDIUM; a 403 is
+    protected/INFO; a plain 200 is an asset, not a finding."""
+    state, _, _ = _run(
+        [], kr_hits=[
+            {"url": "https://example.test/api/admin", "method": "GET",
+             "status": 200, "length": 900},
+            {"url": "https://example.test/api/users", "method": "GET",
+             "status": 403, "length": 300},
+            {"url": "https://example.test/api/ping", "method": "GET",
+             "status": 200, "length": 100},
+        ])
+    severities = {f["severity"] for f in _findings(state)}
+    assert severities == {"MEDIUM", "INFO"}
+    by_value = {a["value"]: a for a in state.get_assets_by_type("web_path")}
+    assert set(by_value) == {
+        "https://example.test/api/admin",
+        "https://example.test/api/users",
+        "https://example.test/api/ping",
+    }
+    assert all(a["sources"] == ["kiterunner"] for a in by_value.values())
+
+
+def test_kiterunner_disabled_by_config():
+    # Empty ffuf output, kr disabled → done with zero hits.
+    state, result, _ = _run([], module_cfg={"kiterunner": {"enabled": False}})
+    assert result == "done"
+    assert _findings(state) == []
 
 
 def test_autocalibration_is_requested():
