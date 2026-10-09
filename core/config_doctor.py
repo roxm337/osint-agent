@@ -49,6 +49,10 @@ KNOWN_KEYS: tuple[tuple[str, object, str], ...] = (
      "own-account logic flaws: surface recon plus cart tamper probes"),
     ("modules.business_logic.max_probes", 12,
      "hostile values sent per run (cap 40)"),
+    ("nuclei.max_age_days", 30,
+     "warn past this template age; stale sets miss CVEs"),
+    ("nuclei.update_templates", False,
+     "refresh templates before scanning (downloads, opt-in)"),
     ("oob.mode", "",
      "empty stays dormant, public uses the free interactsh mesh, "
      "wrapper uses a self-hosted shim"),

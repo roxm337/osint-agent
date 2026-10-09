@@ -703,3 +703,136 @@ def test_oob_unconfigured_returns_none():
     state = StateManager(tempfile.mkdtemp())
     module = BaseModule(state, {"target": {"domain": "example.test"}})
     assert module.oob() is None
+
+
+def test_nuclei_templates_info_parses_probe(monkeypatch):
+    import time as _time
+    import tools.wrappers as wrappers
+
+    mtime = int(_time.time()) - 10 * 86400
+
+    async def fake_bash(command, timeout=120):
+        assert "NUCLEI_TEMPLATES_DIR" in command
+        return {"stdout": f"{mtime}|/root/nuclei-templates|14036\n",
+                "stderr": "", "exit_code": 0, "error": None}
+
+    monkeypatch.setattr(wrappers, "bash", fake_bash)
+    monkeypatch.setattr(external, "tool_available", lambda name: True)
+    # Force local execution: a docker _BACKEND left over from an earlier
+    # test would route past the fake into a real container run.
+    monkeypatch.setitem(external._BACKEND, "mode", "local")
+
+    out = asyncio.run(external.nuclei_templates_info())
+
+    assert out["available"] is True
+    assert out["dir"] == "/root/nuclei-templates"
+    assert out["templates"] == 14036
+    assert 9.0 <= out["age_days"] <= 11.0
+
+
+def test_nuclei_templates_info_no_dir(monkeypatch):
+    import tools.wrappers as wrappers
+
+    async def fake_bash(command, timeout=120):
+        return {"stdout": "", "stderr": "", "exit_code": 0, "error": None}
+
+    monkeypatch.setattr(wrappers, "bash", fake_bash)
+    monkeypatch.setattr(external, "tool_available", lambda name: True)
+    monkeypatch.setitem(external._BACKEND, "mode", "local")
+
+    out = asyncio.run(external.nuclei_templates_info())
+
+    assert out["available"] is True
+    assert out["age_days"] is None
+    assert "no template directory" in out["error"]
+
+
+def test_nuclei_templates_info_missing_binary(monkeypatch):
+    monkeypatch.setattr(external, "tool_available", lambda name: False)
+
+    out = asyncio.run(external.nuclei_templates_info())
+
+    assert out == {"available": False, "dir": "", "age_days": None,
+                   "templates": 0}
+
+
+def test_nuclei_update_templates_runs_explicitly(monkeypatch):
+    calls = {}
+
+    async def fake_run(args, timeout=120, stdin_data=""):
+        calls["args"] = args
+        return {"stdout": "updated", "stderr": "", "exit_code": 0,
+                "error": None}
+
+    monkeypatch.setattr(external, "run_command", fake_run)
+    monkeypatch.setattr(external, "tool_available", lambda name: True)
+
+    out = asyncio.run(external.nuclei_update_templates(timeout=60))
+
+    assert calls["args"][:2] == ["nuclei", "-update-templates"]
+    assert "-silent" in calls["args"]
+    assert out["exit_code"] == 0
+
+
+def test_nuclei_stale_templates_warn_but_scan(monkeypatch):
+    """Stale templates warn; they never become a finding — old sets
+    miss things, they do not invent them."""
+    import tempfile
+    import modules.nuclei_scan as nuclei_module
+    from modules.nuclei_scan import NucleiScan
+    from state.manager import StateManager
+
+    async def stale():
+        return {"available": True, "dir": "/t", "age_days": 90.0,
+                "templates": 100}
+
+    async def fail_update(timeout=600):
+        raise AssertionError("refresh must be opt-in")
+
+    monkeypatch.setattr(nuclei_module, "nuclei_templates_info", stale)
+    monkeypatch.setattr(nuclei_module, "nuclei_update_templates", fail_update)
+    logged = []
+    state = StateManager(tempfile.mkdtemp())
+    module = NucleiScan(state, {"target": {"domain": "example.com"},
+                                "nuclei": {}})
+    module.log = logged.append
+
+    out = asyncio.run(module._template_freshness({}))
+
+    assert out["age_days"] == 90.0
+    assert any("stale" in line for line in logged)
+
+
+def test_nuclei_refresh_opt_in_updates_first(monkeypatch):
+    import tempfile
+    import modules.nuclei_scan as nuclei_module
+    from modules.nuclei_scan import NucleiScan
+    from state.manager import StateManager
+
+    calls = []
+
+    async def old():
+        calls.append("info")
+        if len(calls) == 1:
+            return {"available": True, "dir": "/t", "age_days": 90.0,
+                    "templates": 100}
+        return {"available": True, "dir": "/t", "age_days": 0.0,
+                "templates": 200}
+
+    async def update(timeout=600):
+        calls.append("update")
+        return {"available": True, "exit_code": 0, "error": None,
+                "tail": ""}
+
+    monkeypatch.setattr(nuclei_module, "nuclei_templates_info", old)
+    monkeypatch.setattr(nuclei_module, "nuclei_update_templates", update)
+    state = StateManager(tempfile.mkdtemp())
+    module = NucleiScan(state, {"target": {"domain": "example.com"},
+                                "nuclei": {"update_templates": True}})
+
+    out = asyncio.run(module._template_freshness(
+        {"update_templates": True}))
+
+    assert calls == ["info", "update", "info"]
+    assert out["refreshed"] is True
+    assert out["age_days"] == 0.0

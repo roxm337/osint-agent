@@ -34,6 +34,7 @@ def test_covered_keys_stay_silent():
             "ssrf_scan": {"enabled": True, "max_points": 6},
             "business_logic": {"enabled": True, "max_probes": 12},
         },
+        "nuclei": {"max_age_days": 30, "update_templates": False},
         "xss": {"dalfox_blind_oob": False, "dalfox_rate_limit": 0},
         "oob": {"mode": "public", "enabled": True},
         "crawl": {"browser": {"enabled": True, "depth": 1,

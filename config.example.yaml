@@ -423,6 +423,12 @@ fast_scan:
 
 nuclei:
   full_cve_on_confirmed_apex: true
+  # Templates freeze at image build: the module logs their age into
+  # evidence and warns past max_age_days (a stale set misses CVEs, it
+  # never invents them). update_templates refreshes first — opt-in
+  # because it downloads hundreds of MB from GitHub mid-engagement.
+  max_age_days: 30
+  update_templates: false
 
 oob:
   # Configure real callback infrastructure for blind SSRF/XXE/SQLi/RCE checks.

@@ -984,7 +984,18 @@ class MainWindow(QMainWindow):
         nuclei_box = QGroupBox("Nuclei")
         nuclei_form = QFormLayout(nuclei_box)
         self.nuclei_full_cve_check = QCheckBox("Run full CVE pass only on confirmed apex")
+        self.nuclei_update_check = QCheckBox("Refresh templates before scanning")
+        self.nuclei_update_check.setToolTip(
+            "Downloads hundreds of MB from GitHub; off by default."
+        )
+        self.nuclei_max_age_spin = QSpinBox()
+        self.nuclei_max_age_spin.setRange(1, 365)
+        self.nuclei_max_age_spin.setValue(30)
+        self.nuclei_max_age_spin.setSuffix(" d")
+        self.nuclei_max_age_spin.setToolTip("Warn past this template age.")
         nuclei_form.addRow("", self.nuclei_full_cve_check)
+        nuclei_form.addRow("", self.nuclei_update_check)
+        nuclei_form.addRow("Max template age", self.nuclei_max_age_spin)
         layout.addWidget(nuclei_box)
 
         sqli_box = QGroupBox("Blind SQLi (OAST)")
@@ -3029,6 +3040,12 @@ class MainWindow(QMainWindow):
         nuclei = config.get("nuclei", {})
         if hasattr(self, "nuclei_full_cve_check"):
             self.nuclei_full_cve_check.setChecked(bool(nuclei.get("full_cve_on_confirmed_apex", True)))
+            if hasattr(self, "nuclei_update_check"):
+                self.nuclei_update_check.setChecked(bool(nuclei.get("update_templates", False)))
+                try:
+                    self.nuclei_max_age_spin.setValue(int(nuclei.get("max_age_days", 30) or 30))
+                except (TypeError, ValueError):
+                    self.nuclei_max_age_spin.setValue(30)
 
         kr_cfg = ((config.get("modules", {}) or {}).get("content_discovery", {})
                   or {}).get("kiterunner", {})
@@ -3214,6 +3231,11 @@ class MainWindow(QMainWindow):
             config["nuclei"].update({
                 "full_cve_on_confirmed_apex": self.nuclei_full_cve_check.isChecked(),
             })
+            if hasattr(self, "nuclei_update_check"):
+                config["nuclei"].update({
+                    "update_templates": self.nuclei_update_check.isChecked(),
+                    "max_age_days": self.nuclei_max_age_spin.value(),
+                })
 
         if hasattr(self, "sqli_oast_check"):
             config.setdefault("modules", {})

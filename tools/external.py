@@ -337,6 +337,82 @@ async def ffuf(url_template: str, wordlist: str, output_file: str,
     }
 
 
+async def nuclei_templates_info() -> dict:
+    """Where the templates live and how stale they are.
+
+    No git metadata survives in the image (and host checkouts often
+    lack it too), so directory mtime is the freshness signal. Runs on
+    whichever side the backend selects — GNU stat in the container,
+    BSD stat on a macOS host — trying each in turn.
+    """
+    if not tool_available("nuclei"):
+        return {"available": False, "dir": "", "age_days": None,
+                "templates": 0}
+    from tools.wrappers import bash as _bash
+    probe = (
+        "for d in \"$NUCLEI_TEMPLATES_DIR\" \"$HOME/nuclei-templates\" "
+        "\"$HOME/.local/nuclei-templates\"; do "
+        "[ -d \"$d\" ] || continue; "
+        "mt=$(stat -c %Y \"$d\" 2>/dev/null || stat -f %m \"$d\" 2>/dev/null); "
+        "n=$(find \"$d\" -name '*.yaml' 2>/dev/null | wc -l); "
+        "echo \"$mt|$d|$n\"; break; done"
+    )
+    stdout = ""
+    try:
+        # stat/find are not baked binaries, so the shell helper would
+        # run them on the host even in docker mode. Route explicitly,
+        # mirroring the interactsh session spawn below.
+        import asyncio as _asyncio
+        if _BACKEND["mode"] == "docker" and _docker_ready():
+            proc = await _asyncio.create_subprocess_exec(
+                *docker_run_args(["sh", "-c", probe]),
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.STDOUT,
+            )
+            out, _ = await _asyncio.wait_for(proc.communicate(), 60)
+            stdout = out.decode("utf-8", errors="replace")
+        else:
+            result = await _bash(probe)
+            stdout = str(result.get("stdout", "") or "")
+    except Exception as exc:
+        return {"available": False, "dir": "", "age_days": None,
+                "templates": 0, "error": str(exc)[:200]}
+    import time as _time
+    for line in stdout.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) != 3:
+            continue
+        try:
+            mtime = int(parts[0])
+            count = int(parts[2])
+        except (TypeError, ValueError):
+            continue
+        age = max(0.0, (_time.time() - mtime) / 86400.0)
+        return {"available": True, "dir": parts[1],
+                "age_days": round(age, 1), "templates": count}
+    return {"available": True, "dir": "", "age_days": None, "templates": 0,
+            "error": "no template directory found"}
+
+
+async def nuclei_update_templates(timeout: int = 600) -> dict:
+    """Refresh templates explicitly (`nuclei -update-templates`).
+
+    Scans pass -duc precisely because an implicit update burns minutes
+    on a cold run, so refresh is a separate, operator-approved step —
+    never a side effect of scanning.
+    """
+    if not tool_available("nuclei"):
+        return {"available": False, "error": "missing"}
+    result = await run_command(
+        ["nuclei", "-update-templates", "-silent"], timeout=timeout)
+    return {
+        "available": True,
+        "exit_code": result.get("exit_code"),
+        "error": result.get("error"),
+        "tail": (result.get("stdout", "") or "")[-2000:],
+    }
+
+
 async def nuclei_scan(target_url: str,
                       rate_limit: int = 10,
                       timeout: int = 600,

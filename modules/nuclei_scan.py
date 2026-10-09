@@ -3,7 +3,8 @@
 import time
 
 from modules.base import BaseModule
-from tools.external import nuclei_scan, nuclei_multi, tool_available
+from tools.external import (nuclei_scan, nuclei_multi, nuclei_templates_info,
+                            nuclei_update_templates, tool_available)
 
 
 SEVERITY_MAP = {
@@ -65,6 +66,9 @@ class NucleiScan(BaseModule):
         if not tool_available("nuclei"):
             self.state.skip_module(self.id, "nuclei not installed")
             return "skipped"
+
+        nuclei_cfg = self.config.get("nuclei", {})
+        template_info = await self._template_freshness(nuclei_cfg)
 
         target_url = self.base_url
         rate_limit = self.config.get("rate_limits", {}).get("scan", {}).get("per_minute", 10)
@@ -233,6 +237,10 @@ class NucleiScan(BaseModule):
                 "by_severity": finding_counts,
                 "tags_used": sorted(set(tags_used)),
                 "detected_tech": sorted(detected_tech),
+                "templates_dir": template_info.get("dir", ""),
+                "templates_count": template_info.get("templates", 0),
+                "templates_age_days": template_info.get("age_days"),
+                "templates_refreshed": template_info.get("refreshed", False),
             },
         )
         self.state.complete_module(self.id)
@@ -359,3 +367,48 @@ class NucleiScan(BaseModule):
             if asset.get("value") == target_url and asset.get("confidence") == "CONFIRMED":
                 return True
         return False
+
+    async def _template_freshness(self, nuclei_cfg: dict) -> dict:
+        """Report template age; refresh first only when asked.
+
+        Templates freeze at image build, so a month-old image scans
+        with a month-old CVE list and nothing says so. The age lands
+        in evidence either way; a stale set logs a warning, not a
+        finding — old templates miss things, they do not invent them.
+        Refresh is opt-in: it downloads hundreds of megabytes and
+        phones home to GitHub, which some engagements do not want.
+        """
+        info = await nuclei_templates_info()
+        if not info.get("available", True):
+            self.log("  templates: status unknown "
+                     f"({info.get('error', 'nuclei missing')})")
+            return info
+        try:
+            max_age = float(nuclei_cfg.get("max_age_days", 30) or 30)
+        except (TypeError, ValueError):
+            max_age = 30.0
+        if nuclei_cfg.get("update_templates") is True:
+            self.log("  templates: refresh requested, updating...")
+            try:
+                updated = await nuclei_update_templates(timeout=600)
+            except Exception as exc:
+                self.log(f"  templates: refresh failed: {exc}")
+                updated = {"available": False}
+            if updated.get("available", True) and \
+                    updated.get("exit_code", 0) == 0:
+                info = await nuclei_templates_info()
+                info["refreshed"] = True
+                self.log(f"  templates: refreshed "
+                         f"({info.get('templates', 0)} templates)")
+            else:
+                self.log("  templates: refresh failed, scanning with "
+                         "what is installed")
+        age = info.get("age_days")
+        if age is not None and age > max_age:
+            self.log(f"  templates: {age:.0f} days old "
+                     f"(>{max_age:.0f}d) — CVE coverage is stale; set "
+                     f"nuclei.update_templates: true or rebuild the image")
+        else:
+            self.log(f"  templates: {info.get('templates', 0)} installed, "
+                     f"age {age if age is not None else '?'} days")
+        return info
