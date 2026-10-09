@@ -298,6 +298,39 @@ def test_kiterunner_disabled_by_config():
     assert _findings(state) == []
 
 
+def test_kiterunner_rate_knobs_reach_the_scanner():
+    """delay_ms/connections exist so live scopes can run kr politely;
+    pin that the module actually passes them through."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    state = StateManager(tempfile.mkdtemp())
+    module = ContentDiscovery(state, _config(
+        module_cfg={"kiterunner": {"enabled": True, "max_routes": 10,
+                                  "delay_ms": 1000, "connections": 1}}))
+    module.target = "https://example.test"
+    seen = {}
+
+    async def fake_kr(targets, **kwargs):
+        seen.update(kwargs)
+        return {"available": True, "results": [], "exit_codes": [0],
+                "wordlist": "test", "max_routes": 0, "error": None,
+                "targets": list(targets)}
+
+    async def fake_ffuf(*args, **kwargs):
+        return {"available": True, "exit_code": 0, "stderr": ""}
+
+    with patch("modules.content_discovery.tool_available",
+               return_value=True), \
+         patch("modules.content_discovery.ffuf", new=AsyncMock(
+             side_effect=fake_ffuf)), \
+         patch("modules.content_discovery.kiterunner_scan", new=AsyncMock(
+             side_effect=fake_kr)):
+        asyncio.run(module.run())
+    assert seen.get("delay_ms") == 1000
+    assert seen.get("connections") == 1
+
+
 def test_autocalibration_is_requested():
     """The fix is partly in how ffuf is invoked, so pin the argument."""
     state = StateManager(tempfile.mkdtemp())
