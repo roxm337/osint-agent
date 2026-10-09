@@ -68,6 +68,10 @@ ALLOWLIST = {
     # routes to the proof branches; it never files on its own.
     "origin_discovery.py": "proves origin by byte-identical body or domain "
                            "certificate; status literals only select the branch",
+    # Cart tampering: the verdict is a before/after total comparison, so a
+    # 200 only means 'there is JSON to compare'. Same shape as mass_assignment.
+    "business_logic.py": "oracle is the cart-total differential; status "
+                         "literals only route to the proof branches",
 }
 
 # A finding being filed is the thing that must be gated.

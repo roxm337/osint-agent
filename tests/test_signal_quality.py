@@ -1066,7 +1066,8 @@ def test_browser_sinks_are_inventory_not_findings(monkeypatch):
     import modules.browser_crawl as crawl_module
     from modules.browser_crawl import BrowserCrawl
 
-    async def fake_render(url, config, wait_ms=1500):
+    async def fake_render(url, config, wait_ms=1500, cookies=None,
+                          headers=None):
         return {"links": [], "forms": [], "scripts": [], "source_maps": [],
                 "dom_sinks": [
                     {"sink": "innerHTML", "source": url,
