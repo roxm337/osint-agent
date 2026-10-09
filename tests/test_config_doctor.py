@@ -29,7 +29,7 @@ def test_covered_keys_stay_silent():
         "modules": {
             "content_discovery": {"kiterunner": {
                 "enabled": True, "wordlist": "w", "max_routes": 5,
-                "max_targets": 1}},
+                "max_targets": 1, "delay_ms": 100, "connections": 1}},
             "sqli_scan": {"oast": True},
             "ssrf_scan": {"enabled": True, "max_points": 6},
             "business_logic": {"enabled": True, "max_probes": 12},

@@ -327,6 +327,17 @@ class ContentDiscovery(BaseModule):
             max_targets = max(1, min(10, int(kr_cfg.get("max_targets", 2))))
         except (TypeError, ValueError):
             max_targets = 2
+        # Polite defaults for live scopes: --delay spaces requests to one
+        # host, -x caps parallel connections. delay 1000ms + 1 connection
+        # is ~1 req/s; the 100ms/3-conn default is a lab setting.
+        try:
+            delay_ms = max(0, min(60000, int(kr_cfg.get("delay_ms", 100))))
+        except (TypeError, ValueError):
+            delay_ms = 100
+        try:
+            connections = max(1, min(10, int(kr_cfg.get("connections", 3))))
+        except (TypeError, ValueError):
+            connections = 3
 
         targets = [base_url]
         for asset in self.state.get_assets_by_type("api_endpoint"):
@@ -345,12 +356,15 @@ class ContentDiscovery(BaseModule):
         targets = targets[:max_targets]
 
         self.log(f"  kiterunner: {len(targets)} target(s), "
-                 f"{max_routes} routes each ({wordlist})...")
+                 f"{max_routes} routes each ({wordlist}, "
+                 f"{delay_ms}ms delay, {connections} conn)...")
         result = await kiterunner_scan(
             targets,
             timeout=900,
             wordlist=wordlist,
             max_routes=max_routes,
+            delay_ms=delay_ms,
+            connections=connections,
         )
         if not result.get("available", True):
             return None

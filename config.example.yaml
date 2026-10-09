@@ -323,6 +323,10 @@ modules:
       wordlist: "apiroutes-260227"  # see `kr wordlist list` for current names
       max_routes: 1500               # routes tried per target (cap 20000)
       max_targets: 2                 # base URL + api_endpoint origins (cap 10)
+      # Polite knobs for live scopes (delay 1000 + connections 1 ≈ 1 req/s);
+      # the defaults below are a lab setting.
+      delay_ms: 100
+      connections: 3                 # parallel connections per host (cap 10)
 
     # Results are graded by what the status establishes. A 200 on a
     # sensitive-looking path is MEDIUM; a 401/403 is INFO, because access
