@@ -1055,6 +1055,31 @@ class MainWindow(QMainWindow):
         ssrf_form.addRow("Max points", self.ssrf_max_points_spin)
         layout.addWidget(ssrf_box)
 
+        crawl_box = QGroupBox("Browser Crawl")
+        crawl_form = QFormLayout(crawl_box)
+        crawl_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.crawl_enabled_check = QCheckBox("Render pages (one context per identity)")
+        self.crawl_enabled_check.setChecked(True)
+        self.crawl_enabled_check.setToolTip(
+            "Verified identities render authenticated; anonymous always runs."
+        )
+        self.crawl_max_pages_spin = QSpinBox()
+        self.crawl_max_pages_spin.setRange(1, 50)
+        self.crawl_max_pages_spin.setValue(8)
+        self.crawl_max_pages_spin.setToolTip("Pages rendered per context.")
+        self.crawl_depth_spin = QSpinBox()
+        self.crawl_depth_spin.setRange(0, 3)
+        self.crawl_depth_spin.setValue(1)
+        self.crawl_depth_spin.setToolTip("Same-origin link-following depth.")
+        self.crawl_max_identities_spin = QSpinBox()
+        self.crawl_max_identities_spin.setRange(0, 5)
+        self.crawl_max_identities_spin.setValue(2)
+        crawl_form.addRow("", self.crawl_enabled_check)
+        crawl_form.addRow("Max pages", self.crawl_max_pages_spin)
+        crawl_form.addRow("Depth", self.crawl_depth_spin)
+        crawl_form.addRow("Max identities", self.crawl_max_identities_spin)
+        layout.addWidget(crawl_box)
+
         fast_scan_box = QGroupBox("Fast Exposure Scan")
         fast_scan_form = QFormLayout(fast_scan_box)
         fast_scan_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
@@ -3020,6 +3045,19 @@ class MainWindow(QMainWindow):
             except (TypeError, ValueError):
                 self.ssrf_max_points_spin.setValue(6)
 
+        crawl_cfg = ((config.get("crawl", {}) or {}).get("browser", {}) or {})
+        crawl_cfg = crawl_cfg if isinstance(crawl_cfg, dict) else {}
+        if hasattr(self, "crawl_enabled_check"):
+            self.crawl_enabled_check.setChecked(bool(crawl_cfg.get("enabled", True)))
+            for widget, key, default in (
+                    (self.crawl_max_pages_spin, "max_targets", 8),
+                    (self.crawl_depth_spin, "depth", 1),
+                    (self.crawl_max_identities_spin, "max_identities", 2)):
+                try:
+                    widget.setValue(int(crawl_cfg.get(key, default) or default))
+                except (TypeError, ValueError):
+                    widget.setValue(default)
+
         sqli_scan = config.get("modules", {}).get("sqli_scan", {})
         if hasattr(self, "sqli_oast_check") and isinstance(sqli_scan, dict):
             self.sqli_oast_check.setChecked(bool(sqli_scan.get("oast", True)))
@@ -3216,6 +3254,21 @@ class MainWindow(QMainWindow):
             ssrf_cfg.update({
                 "enabled": self.ssrf_enabled_check.isChecked(),
                 "max_points": self.ssrf_max_points_spin.value(),
+            })
+
+        if hasattr(self, "crawl_enabled_check"):
+            config.setdefault("crawl", {})
+            crawl_cfg = config["crawl"]
+            if not isinstance(crawl_cfg, dict):
+                crawl_cfg = config["crawl"] = {}
+            browser_cfg = crawl_cfg.get("browser")
+            if not isinstance(browser_cfg, dict):
+                browser_cfg = crawl_cfg["browser"] = {}
+            browser_cfg.update({
+                "enabled": self.crawl_enabled_check.isChecked(),
+                "max_targets": self.crawl_max_pages_spin.value(),
+                "depth": self.crawl_depth_spin.value(),
+                "max_identities": self.crawl_max_identities_spin.value(),
             })
 
         if self._write_config(config):

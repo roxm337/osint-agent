@@ -127,6 +127,10 @@ def test_gui_saves_scanner_settings(tmp_path):
     window.semgrep_rules_input.setText("rules/semgrep")
     window.ssrf_enabled_check.setChecked(True)
     window.ssrf_max_points_spin.setValue(9)
+    window.crawl_enabled_check.setChecked(True)
+    window.crawl_max_pages_spin.setValue(12)
+    window.crawl_depth_spin.setValue(2)
+    window.crawl_max_identities_spin.setValue(3)
     window.nuclei_full_cve_check.setChecked(False)
     window.fast_scan_paths_input.setPlainText("/.env\n/.git/config")
     window.fast_scan_timeout_spin.setValue(3)
@@ -149,6 +153,10 @@ def test_gui_saves_scanner_settings(tmp_path):
     assert "semgrep:" in saved
     assert "ssrf_scan:" in saved
     assert "max_points: 9" in saved
+    assert "browser:" in saved
+    assert "max_targets: 12" in saved
+    assert "depth: 2" in saved
+    assert "max_identities: 3" in saved
     assert "full_cve_on_confirmed_apex: false" in saved
     assert "/.env" in saved
     assert "/.git/config" in saved

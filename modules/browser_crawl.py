@@ -1,10 +1,27 @@
-"""Stage 4: Browser-rendered crawling for JavaScript-heavy applications."""
+"""Stage 4: Browser-rendered crawling for JavaScript-heavy applications.
+
+Two upgrades over the original single-context render pass:
+
+- Authenticated contexts. The crawl used to replay only the static
+  `auth.cookies`/`auth.headers` with no idea whether the session was
+  alive — an expired cookie meant a logged-out crawl mislabelled as
+  authenticated. Now every verified AuthHarness identity (static
+  config sessions, scripted logins, or sessions auth_audit captured
+  mid-run) gets its own browser context with its live cookies, plus
+  the anonymous baseline. Each context's evidence says which identity
+  rendered it and whether that identity verified.
+- Depth. Same-origin links are followed to a configured depth with a
+  per-context page cap, so multi-page flows behind a login are
+  reachable. Cross-origin links are recorded, never followed: the
+  crawl stays on the target it was authorised for.
+"""
 
 from __future__ import annotations
 
 import re
 from urllib.parse import urljoin, urlparse
 
+from core.auth_harness import AuthHarness
 from modules.base import BaseModule
 from modules.js_analysis import extract_dom_sinks
 
@@ -21,38 +38,83 @@ class BrowserCrawl(BaseModule):
             self.state.skip_module(self.id, "playwright not installed")
             return "skipped"
 
-        targets = self._targets() or [self.base_url]
         crawl_cfg = self.config.get("crawl", {}).get("browser", {})
-        max_targets = int(crawl_cfg.get("max_targets", 8))
+        if crawl_cfg.get("enabled", True) is False:
+            self.state.skip_module(self.id, "disabled in config")
+            return "skipped"
+        try:
+            max_pages = max(1, min(50, int(crawl_cfg.get("max_targets", 8))))
+        except (TypeError, ValueError):
+            max_pages = 8
+        try:
+            depth = max(0, min(3, int(crawl_cfg.get("depth", 1) or 0)))
+        except (TypeError, ValueError):
+            depth = 1
+        try:
+            max_identities = max(0, min(5, int(crawl_cfg.get("max_identities", 2))))
+        except (TypeError, ValueError):
+            max_identities = 2
         wait_ms = int(crawl_cfg.get("wait_ms", 1500))
+
+        seeds = self._targets() or [self.base_url]
+
+        # Verified sessions only: an unverified identity is a cookie that
+        # may have expired, and rendering as it proves nothing about the
+        # authenticated surface. Anonymous always runs as the baseline.
+        harness = AuthHarness(self.config)
+        harness.adopt_discovered(self.state, log=self.log)
+        verified = []
+        try:
+            verified = await harness.establish_all(self.base_url)
+        except Exception as exc:
+            self.log(f"  identity establishment failed: {exc}")
+        contexts = [("anonymous", None, None, False)]
+        for identity in (verified or [])[:max_identities]:
+            cookies = dict(identity.cookies or {})
+            headers = dict((identity.headers or {}))
+            if identity.bearer_token and "Authorization" not in headers:
+                headers["Authorization"] = f"Bearer {identity.bearer_token}"
+            contexts.append((identity.name, cookies, headers, True))
+        self.log(f"  crawl contexts: "
+                 f"{', '.join(name for name, *_ in contexts)}")
 
         discovered: set[str] = set()
         js_urls: set[str] = set()
         source_maps: set[str] = set()
         dom_sinks: list[dict] = []
         evidence_refs = []
+        context_stats: list[dict] = []
 
-        for target in targets[:max_targets]:
-            rendered = await _render_page(target, self.config, wait_ms=wait_ms)
-            discovered.update(rendered.get("links", []))
-            discovered.update(rendered.get("forms", []))
-            js_urls.update(rendered.get("scripts", []))
-            source_maps.update(rendered.get("source_maps", []))
-            dom_sinks.extend(rendered.get("dom_sinks", []))
-
+        for name, cookies, headers, authenticated in contexts:
+            rendered = await self._crawl_context(
+                name, seeds, depth, max_pages, wait_ms, cookies, headers)
+            discovered.update(rendered["links"])
+            discovered.update(rendered["forms"])
+            js_urls.update(rendered["scripts"])
+            source_maps.update(rendered["source_maps"])
+            dom_sinks.extend(rendered["dom_sinks"])
+            context_stats.append({
+                "identity": name,
+                "authenticated": authenticated,
+                "pages": rendered["pages"],
+                "links": len(rendered["links"]),
+                "scripts": len(rendered["scripts"]),
+            })
             evidence_refs.append(
                 self.state.add_evidence(
                     self.id,
                     "browser_render",
-                    target,
+                    self.base_url,
                     {
-                        "target": target,
-                        "links": sorted(rendered.get("links", []))[:200],
-                        "scripts": sorted(rendered.get("scripts", []))[:100],
-                        "forms": sorted(rendered.get("forms", []))[:100],
-                        "source_maps": sorted(rendered.get("source_maps", []))[:50],
-                        "dom_sinks": rendered.get("dom_sinks", [])[:50],
-                        "error": rendered.get("error"),
+                        "identity": name,
+                        "authenticated": authenticated,
+                        "pages_rendered": rendered["pages"],
+                        "links": sorted(rendered["links"])[:200],
+                        "scripts": sorted(rendered["scripts"])[:100],
+                        "forms": sorted(rendered["forms"])[:100],
+                        "source_maps": sorted(rendered["source_maps"])[:50],
+                        "dom_sinks": rendered["dom_sinks"][:50],
+                        "errors": rendered["errors"][:10],
                     },
                 )
             )
@@ -122,7 +184,7 @@ class BrowserCrawl(BaseModule):
             confidence="FIRM",
             sources=[self.id],
             attrs={
-                "targets": targets[:max_targets],
+                "contexts": context_stats,
                 "urls": len(http_urls),
                 "js_files": len(js_urls),
                 "source_maps": len(source_maps),
@@ -132,9 +194,53 @@ class BrowserCrawl(BaseModule):
         self.state.complete_module(self.id)
         self.log(
             f"Rendered crawl: {len(http_urls)} URLs | {len(js_urls)} JS | "
-            f"{len(source_maps)} source maps | {len(dom_sinks)} DOM sinks"
+            f"{len(source_maps)} source maps | {len(dom_sinks)} DOM sinks | "
+            f"{len(context_stats)} context(s)"
         )
         return "done"
+
+    async def _crawl_context(self, name: str, seeds: list, depth: int,
+                             max_pages: int, wait_ms: int,
+                             cookies: dict | None,
+                             headers: dict | None) -> dict:
+        """BFS render queue for one identity: same-origin links followed
+        to `depth`, total pages capped. Cross-origin links are recorded
+        as discovered assets by the caller, never rendered here."""
+        base_host = _hostname(self.base_url)
+        queue: list[tuple[str, int]] = [(s, 0) for s in seeds[:max_pages]]
+        visited: set[str] = set()
+        links: set[str] = set()
+        forms: set[str] = set()
+        scripts: set[str] = set()
+        source_maps: set[str] = set()
+        sinks: list = []
+        pages: list[str] = []
+        errors: list[str] = []
+        while queue and len(pages) < max_pages:
+            url, level = queue.pop(0)
+            if url in visited:
+                continue
+            visited.add(url)
+            rendered = await _render_page(url, self.config, wait_ms=wait_ms,
+                                          cookies=cookies, headers=headers)
+            if rendered.get("error"):
+                errors.append(f"{url}: {rendered['error']}"[:200])
+                continue
+            pages.append(url)
+            links.update(rendered.get("links", []))
+            forms.update(rendered.get("forms", []))
+            scripts.update(rendered.get("scripts", []))
+            source_maps.update(rendered.get("source_maps", []))
+            sinks.extend(rendered.get("dom_sinks", []))
+            if level < depth:
+                for link in rendered.get("links", []):
+                    if (link not in visited
+                            and _hostname(link) == base_host
+                            and len(pages) + len(queue) < max_pages * 2):
+                        queue.append((link, level + 1))
+        return {"links": links, "forms": forms, "scripts": scripts,
+                "source_maps": source_maps, "dom_sinks": sinks,
+                "pages": pages, "errors": errors}
 
     async def _confirm_source_maps(self, map_urls: list) -> None:
         """Fetch candidate maps: JSON with sources is exposure.
@@ -200,7 +306,9 @@ async def _playwright_available() -> bool:
         return False
 
 
-async def _render_page(url: str, config: dict, wait_ms: int = 1500) -> dict:
+async def _render_page(url: str, config: dict, wait_ms: int = 1500,
+                     cookies: dict | None = None,
+                     headers: dict | None = None) -> dict:
     from playwright.async_api import async_playwright
 
     links: set[str] = set()
@@ -208,8 +316,17 @@ async def _render_page(url: str, config: dict, wait_ms: int = 1500) -> dict:
     forms: set[str] = set()
     source_maps: set[str] = set()
     dom_sinks: list[dict] = []
-    auth_headers = _auth_headers(config)
-    auth_cookies = _auth_cookies(config, url)
+    # Explicit session material wins (per-identity contexts); None falls
+    # back to the static config session, preserving old callers.
+    auth_headers = dict(headers) if headers is not None else _auth_headers(config)
+    if cookies is None:
+        auth_cookies = _auth_cookies(config, url)
+    else:
+        domain = _hostname(url)
+        auth_cookies = [
+            {"name": str(k), "value": str(v), "domain": domain, "path": "/"}
+            for k, v in cookies.items() if k and v is not None
+        ]
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)

@@ -454,6 +454,20 @@ semgrep:
   enabled: true
   rules: "rules/semgrep"
 
+crawl:
+  browser:
+    # Rendered crawling: one context per verified identity (static
+    # sessions, scripted logins, or sessions captured mid-run) plus the
+    # anonymous baseline. Only verified sessions render as authenticated;
+    # an expired cookie is never mislabelled. Same-origin links are
+    # followed to `depth` with a per-context page cap; cross-origin
+    # links are recorded, never rendered.
+    enabled: true
+    max_targets: 8               # pages rendered per context (cap 50)
+    depth: 1                     # link-following depth, same-origin only (cap 3)
+    max_identities: 2            # verified identities rendered (cap 5)
+    wait_ms: 1500
+
 scoring:
   weights:
     cvss: 0.4

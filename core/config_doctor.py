@@ -39,6 +39,12 @@ KNOWN_KEYS: tuple[tuple[str, object, str], ...] = (
      "generic SSRF: OOB-graded probes of URL-bearing parameters"),
     ("modules.ssrf_scan.max_points", 6,
      "URL parameters probed per run (cap 30)"),
+    ("crawl.browser.enabled", True,
+     "rendered crawling, one context per verified identity"),
+    ("crawl.browser.depth", 1,
+     "same-origin link-following depth (cap 3)"),
+    ("crawl.browser.max_identities", 2,
+     "verified identities rendered per run (cap 5)"),
     ("oob.mode", "",
      "empty stays dormant, public uses the free interactsh mesh, "
      "wrapper uses a self-hosted shim"),

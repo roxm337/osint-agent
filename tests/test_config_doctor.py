@@ -35,6 +35,8 @@ def test_covered_keys_stay_silent():
         },
         "xss": {"dalfox_blind_oob": False, "dalfox_rate_limit": 0},
         "oob": {"mode": "public", "enabled": True},
+        "crawl": {"browser": {"enabled": True, "depth": 1,
+                              "max_identities": 2}},
     }
 
     assert doctor(config) == []
