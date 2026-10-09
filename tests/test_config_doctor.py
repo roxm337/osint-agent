@@ -31,6 +31,7 @@ def test_covered_keys_stay_silent():
                 "enabled": True, "wordlist": "w", "max_routes": 5,
                 "max_targets": 1}},
             "sqli_scan": {"oast": True},
+            "ssrf_scan": {"enabled": True, "max_points": 6},
         },
         "xss": {"dalfox_blind_oob": False, "dalfox_rate_limit": 0},
         "oob": {"mode": "public", "enabled": True},

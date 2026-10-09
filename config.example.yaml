@@ -346,6 +346,20 @@ modules:
     # for the exact URL that produced a callback.
     oast: true
 
+  ssrf_scan:
+    # Generic server-side request forgery: URL-bearing parameters get a
+    # path-tagged OOB callback each. An HTTP callback is HIGH/CONFIRMED;
+    # DNS-only is MEDIUM/FIRM (egress without proving a full fetch);
+    # a fetch error naming our domain is MEDIUM/FIRM (attempted);
+    # silence files one aggregate LOW. Without an OOB channel nothing is
+    # probed — candidates file as one aggregate LOW instead.
+    # The target is only ever asked to fetch OUR callback URL: cloud
+    # metadata addresses are never requested, so instance credentials
+    # cannot land in evidence on a hit.
+    enabled: true
+    max_points: 6                # URL parameters probed per run (cap 30)
+    # params: ["url", "src"]     # override the built-in URL-param names
+
   auth_audit:
     # Lab packs (knowledge/*.yaml) inject extra paths and credentials here
     # for known targets. Module defaults stay generic; target knowledge

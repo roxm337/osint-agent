@@ -45,6 +45,7 @@ from .mass_assignment import MassAssignment
 from .prototype_pollution import PrototypePollution
 from .xss_scan import XSSScan
 from .sqli_scan import SQLiScan
+from .ssrf_scan import SSRFScan
 from .nosql_scan import NoSQLScan
 from .ssti_scan import SSTIScan
 from .dom_xss_scan import DomXSSScan
@@ -350,6 +351,13 @@ MODULE_REGISTRY = {
     },
     "sqli_scan": {
         "class": SQLiScan,
+        "stage": 5,
+        "detectability": "high",
+        "depends_on": ["parameter_discovery"],
+        "active": True,
+    },
+    "ssrf_scan": {
+        "class": SSRFScan,
         "stage": 5,
         "detectability": "high",
         "depends_on": ["parameter_discovery"],

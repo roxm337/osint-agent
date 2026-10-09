@@ -1038,6 +1038,23 @@ class MainWindow(QMainWindow):
         semgrep_form.addRow("Rules", self.semgrep_rules_input)
         layout.addWidget(semgrep_box)
 
+        ssrf_box = QGroupBox("SSRF Scan")
+        ssrf_form = QFormLayout(ssrf_box)
+        ssrf_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.ssrf_enabled_check = QCheckBox("Probe URL parameters (OOB-graded)")
+        self.ssrf_enabled_check.setChecked(True)
+        self.ssrf_enabled_check.setToolTip(
+            "HTTP callback files HIGH/CONFIRMED, DNS-only MEDIUM/FIRM. "
+            "Without an OOB channel nothing is probed."
+        )
+        self.ssrf_max_points_spin = QSpinBox()
+        self.ssrf_max_points_spin.setRange(1, 30)
+        self.ssrf_max_points_spin.setValue(6)
+        self.ssrf_max_points_spin.setToolTip("URL parameters probed per run.")
+        ssrf_form.addRow("", self.ssrf_enabled_check)
+        ssrf_form.addRow("Max points", self.ssrf_max_points_spin)
+        layout.addWidget(ssrf_box)
+
         fast_scan_box = QGroupBox("Fast Exposure Scan")
         fast_scan_form = QFormLayout(fast_scan_box)
         fast_scan_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
@@ -2993,6 +3010,16 @@ class MainWindow(QMainWindow):
             self.semgrep_enabled_check.setChecked(bool(sast_cfg.get("enabled", True)))
             self.semgrep_rules_input.setText(str(sast_cfg.get("rules", "") or ""))
 
+        ssrf_cfg = ((config.get("modules", {}) or {}).get("ssrf_scan", {})
+                    or {})
+        ssrf_cfg = ssrf_cfg if isinstance(ssrf_cfg, dict) else {}
+        if hasattr(self, "ssrf_enabled_check"):
+            self.ssrf_enabled_check.setChecked(bool(ssrf_cfg.get("enabled", True)))
+            try:
+                self.ssrf_max_points_spin.setValue(int(ssrf_cfg.get("max_points", 6) or 6))
+            except (TypeError, ValueError):
+                self.ssrf_max_points_spin.setValue(6)
+
         sqli_scan = config.get("modules", {}).get("sqli_scan", {})
         if hasattr(self, "sqli_oast_check") and isinstance(sqli_scan, dict):
             self.sqli_oast_check.setChecked(bool(sqli_scan.get("oast", True)))
@@ -3176,6 +3203,19 @@ class MainWindow(QMainWindow):
             config["semgrep"].update({
                 "enabled": self.semgrep_enabled_check.isChecked(),
                 "rules": self.semgrep_rules_input.text().strip() or "rules/semgrep",
+            })
+
+        if hasattr(self, "ssrf_enabled_check"):
+            config.setdefault("modules", {})
+            modules_cfg = config["modules"]
+            if not isinstance(modules_cfg, dict):
+                modules_cfg = config["modules"] = {}
+            ssrf_cfg = modules_cfg.get("ssrf_scan")
+            if not isinstance(ssrf_cfg, dict):
+                ssrf_cfg = modules_cfg["ssrf_scan"] = {}
+            ssrf_cfg.update({
+                "enabled": self.ssrf_enabled_check.isChecked(),
+                "max_points": self.ssrf_max_points_spin.value(),
             })
 
         if self._write_config(config):

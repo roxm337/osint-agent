@@ -58,8 +58,14 @@ class XSSScan(BaseModule):
                 try:
                     corr_id = await oob_client.register_callback(
                         f"xss-blind:{self.domain}")
-                    blind_url = oob_client.callback_url(corr_id, "/xss")
-                    blind_callback = corr_id
+                    if not corr_id:
+                        # No session, no callback: callback_url("") builds
+                        # an unregistered.oob.invalid URL that is truthy,
+                        # and the blind pass would burn requests on it.
+                        self.log("  OOB registration failed, blind pass skipped")
+                    else:
+                        blind_url = oob_client.callback_url(corr_id, "/xss")
+                        blind_callback = corr_id
                 except Exception as exc:
                     self.log(f"  OOB registration failed, blind pass skipped: {exc}")
             result = await dalfox_scan(

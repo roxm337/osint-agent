@@ -35,6 +35,10 @@ KNOWN_KEYS: tuple[tuple[str, object, str], ...] = (
      "global outbound cap for dalfox in requests/second (0 = unlimited)"),
     ("modules.sqli_scan.oast", True,
      "hands sqlmap an interactsh server so blind injections get proof"),
+    ("modules.ssrf_scan.enabled", True,
+     "generic SSRF: OOB-graded probes of URL-bearing parameters"),
+    ("modules.ssrf_scan.max_points", 6,
+     "URL parameters probed per run (cap 30)"),
     ("oob.mode", "",
      "empty stays dormant, public uses the free interactsh mesh, "
      "wrapper uses a self-hosted shim"),

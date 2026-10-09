@@ -261,6 +261,9 @@ class RestAPIAudit(BaseModule):
             return
         try:
             corr_id = await client.register_callback(f"yoast-file-size:{endpoint_url}")
+            if not corr_id:
+                self.log("  OOB registration failed: no session, probe skipped")
+                return
             callback = client.callback_url(corr_id, "/yoast")
         except Exception as exc:
             self.log(f"  OOB registration failed: {exc}")

@@ -121,7 +121,12 @@ class BaseModule:
         if isinstance(cfg, dict) and str(cfg.get("mode", "")).lower() == "public":
             from tools.external import PublicInteractshClient
             client = PublicInteractshClient(
-                server=str(cfg.get("server_url") or "https://interactsh.com"),
+                # Default is the public mesh, NOT interactsh.com (the
+                # project website — it serves no OAST traffic). An
+                # explicit server_url still wins for private meshes.
+                server=str(cfg.get("server_url")
+                           or "oast.pro,oast.live,oast.site,oast.online,"
+                              "oast.fun,oast.me"),
                 poll_interval=float(cfg.get("poll_interval", 2.0) or 2.0),
                 poll_timeout=float(cfg.get("poll_timeout", 30.0) or 30.0),
             )
