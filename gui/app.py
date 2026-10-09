@@ -1080,6 +1080,22 @@ class MainWindow(QMainWindow):
         crawl_form.addRow("Max identities", self.crawl_max_identities_spin)
         layout.addWidget(crawl_box)
 
+        logic_box = QGroupBox("Business Logic")
+        logic_form = QFormLayout(logic_box)
+        logic_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.logic_enabled_check = QCheckBox("Probe own-account cart logic")
+        self.logic_enabled_check.setChecked(True)
+        self.logic_enabled_check.setToolTip(
+            "Differential proof only; every probe restored. "
+            "Needs a verified identity."
+        )
+        self.logic_max_probes_spin = QSpinBox()
+        self.logic_max_probes_spin.setRange(1, 40)
+        self.logic_max_probes_spin.setValue(12)
+        logic_form.addRow("", self.logic_enabled_check)
+        logic_form.addRow("Max probes", self.logic_max_probes_spin)
+        layout.addWidget(logic_box)
+
         fast_scan_box = QGroupBox("Fast Exposure Scan")
         fast_scan_form = QFormLayout(fast_scan_box)
         fast_scan_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
@@ -3058,6 +3074,16 @@ class MainWindow(QMainWindow):
                 except (TypeError, ValueError):
                     widget.setValue(default)
 
+        logic_cfg = ((config.get("modules", {}) or {}).get("business_logic", {})
+                     or {})
+        logic_cfg = logic_cfg if isinstance(logic_cfg, dict) else {}
+        if hasattr(self, "logic_enabled_check"):
+            self.logic_enabled_check.setChecked(bool(logic_cfg.get("enabled", True)))
+            try:
+                self.logic_max_probes_spin.setValue(int(logic_cfg.get("max_probes", 12) or 12))
+            except (TypeError, ValueError):
+                self.logic_max_probes_spin.setValue(12)
+
         sqli_scan = config.get("modules", {}).get("sqli_scan", {})
         if hasattr(self, "sqli_oast_check") and isinstance(sqli_scan, dict):
             self.sqli_oast_check.setChecked(bool(sqli_scan.get("oast", True)))
@@ -3269,6 +3295,19 @@ class MainWindow(QMainWindow):
                 "max_targets": self.crawl_max_pages_spin.value(),
                 "depth": self.crawl_depth_spin.value(),
                 "max_identities": self.crawl_max_identities_spin.value(),
+            })
+
+        if hasattr(self, "logic_enabled_check"):
+            config.setdefault("modules", {})
+            modules_cfg = config["modules"]
+            if not isinstance(modules_cfg, dict):
+                modules_cfg = config["modules"] = {}
+            logic_cfg = modules_cfg.get("business_logic")
+            if not isinstance(logic_cfg, dict):
+                logic_cfg = modules_cfg["business_logic"] = {}
+            logic_cfg.update({
+                "enabled": self.logic_enabled_check.isChecked(),
+                "max_probes": self.logic_max_probes_spin.value(),
             })
 
         if self._write_config(config):

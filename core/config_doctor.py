@@ -45,6 +45,10 @@ KNOWN_KEYS: tuple[tuple[str, object, str], ...] = (
      "same-origin link-following depth (cap 3)"),
     ("crawl.browser.max_identities", 2,
      "verified identities rendered per run (cap 5)"),
+    ("modules.business_logic.enabled", True,
+     "own-account logic flaws: surface recon plus cart tamper probes"),
+    ("modules.business_logic.max_probes", 12,
+     "hostile values sent per run (cap 40)"),
     ("oob.mode", "",
      "empty stays dormant, public uses the free interactsh mesh, "
      "wrapper uses a self-hosted shim"),

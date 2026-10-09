@@ -42,6 +42,7 @@ from .git_exposure import GitExposure
 from .secret_validation import SecretValidation
 from .idor_differ import IdorDiffer
 from .mass_assignment import MassAssignment
+from .business_logic import BusinessLogic
 from .prototype_pollution import PrototypePollution
 from .xss_scan import XSSScan
 from .sqli_scan import SQLiScan
@@ -410,6 +411,13 @@ MODULE_REGISTRY = {
         "stage": 5,
         "detectability": "medium",
         "depends_on": ["idor_differ"],
+        "active": True,
+    },
+    "business_logic": {
+        "class": BusinessLogic,
+        "stage": 5,
+        "detectability": "medium",
+        "depends_on": ["parameter_discovery"],
         "active": True,
     },
     "prototype_pollution": {

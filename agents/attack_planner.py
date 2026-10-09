@@ -327,6 +327,8 @@ def _module_for_category(category: str) -> str:
         return "xss_scan"
     if "ssrf" in lowered or "server-side request" in lowered:
         return "ssrf_scan"
+    if "logic" in lowered or "cart" in lowered or "checkout" in lowered:
+        return "business_logic"
     if "sql" in lowered or "injection" in lowered:
         return "sqli_scan"
     if "cloud" in lowered or "bucket" in lowered:

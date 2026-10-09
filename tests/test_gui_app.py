@@ -127,6 +127,8 @@ def test_gui_saves_scanner_settings(tmp_path):
     window.semgrep_rules_input.setText("rules/semgrep")
     window.ssrf_enabled_check.setChecked(True)
     window.ssrf_max_points_spin.setValue(9)
+    window.logic_enabled_check.setChecked(True)
+    window.logic_max_probes_spin.setValue(15)
     window.crawl_enabled_check.setChecked(True)
     window.crawl_max_pages_spin.setValue(12)
     window.crawl_depth_spin.setValue(2)
@@ -153,6 +155,8 @@ def test_gui_saves_scanner_settings(tmp_path):
     assert "semgrep:" in saved
     assert "ssrf_scan:" in saved
     assert "max_points: 9" in saved
+    assert "business_logic:" in saved
+    assert "max_probes: 15" in saved
     assert "browser:" in saved
     assert "max_targets: 12" in saved
     assert "depth: 2" in saved

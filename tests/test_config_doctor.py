@@ -32,6 +32,7 @@ def test_covered_keys_stay_silent():
                 "max_targets": 1}},
             "sqli_scan": {"oast": True},
             "ssrf_scan": {"enabled": True, "max_points": 6},
+            "business_logic": {"enabled": True, "max_probes": 12},
         },
         "xss": {"dalfox_blind_oob": False, "dalfox_rate_limit": 0},
         "oob": {"mode": "public", "enabled": True},

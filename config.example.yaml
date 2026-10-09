@@ -370,6 +370,19 @@ modules:
     # Set true only to prove missing-current-password flaws by writing.
     test_password_change: false
 
+  business_logic:
+    # Own-account logic flaws in two halves. The surface half is
+    # read-only and always on: it reports which privilege-bearing
+    # fields exist on the caller's own record (INFO recon for the
+    # mass_assignment write test). The tamper half replays hostile
+    # quantity/price/discount values at the caller's own cart and
+    # compares totals — proof is differential, and every probe is
+    # restored and the restore verified. Needs a verified identity;
+    # no checkout is ever completed.
+    enabled: true
+    max_probes: 12               # hostile values sent per run (cap 40)
+    # endpoints: ["/api/cart"]   # discovered api_endpoints win when present
+
 misconfig:
   concurrency: 12
   timeout: 5
