@@ -200,6 +200,8 @@ class HeadersAudit(BaseModule):
             if "TRACE" in allowed or "TRACK" in allowed:
                 # TRACE echo check: does the server reflect the request?
                 echo = await self._trace_echo(origin)
+                echo_note = (" and echoes request content "
+                             "(cross-site tracing primitive)" if echo else "")
                 self.state.add_finding(
                     title=f"HTTP TRACE Enabled: {origin}",
                     severity="MEDIUM" if echo else "LOW",
@@ -207,8 +209,7 @@ class HeadersAudit(BaseModule):
                     category="Hardening Deficiency",
                     description=(
                         f"{origin} answers TRACE"
-                        f"{' and echoes request content (cross-site tracing '
-                          'primitive)' if echo else ''}. "
+                        f"{echo_note}. "
                         f"Allowed: {allow or 'TRACE/TRACK advertised'}."),
                     evidence=[f"Origin: {origin}", f"Allow: {allow}"]
                     + (["TRACE body echoed the request"] if echo else []),

@@ -192,8 +192,9 @@ class EmailHarvest(BaseModule):
                 attrs={"source": "team page scrape"},
             )
         for phone in sorted(all_phones)[:30]:
+            digits = re.sub(r"\D", "", phone)
             self.state.add_asset(
-                "phone", f"phone:{re.sub(r'\\D', '', phone)}", phone,
+                "phone", f"phone:{digits}", phone,
                 confidence="TENTATIVE",
                 sources=["page scrape"],
                 attrs={},
